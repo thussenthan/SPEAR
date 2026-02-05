@@ -58,7 +58,16 @@ class TrainingConfig:
     train_fraction: float = 0.7
     val_fraction: float = 0.15
     test_fraction: float = 0.15
-    batch_size: int = 256
+    batch_size: int = 512
+    # Cap for the effective batch size in multi-output mode.
+    # When predicting many targets at once, the training loop may expand the
+    # per-step workload beyond batch_size (e.g., batch_size × outputs). This
+    # cap limits that effective size to control memory/compute; lower it if you
+    # see OOMs or slowdowns, raise it to use more throughput when resources allow.
+    # Rule of thumb: start in the 10_000–50_000 range (e.g., ~batch_size × 50–100)
+    # on a 16–24 GB GPU; halve this on smaller GPUs or if you hit OOMs, and
+    # increase gradually if utilization is low and memory headroom is available.
+    effective_batch_cap: int = 48_000
     epochs: int = 100
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
@@ -95,16 +104,20 @@ class TrainingConfig:
     atac_layer: Optional[str] = "tfidf"
     rna_expression_layer: Optional[str] = "log1p_cpm"
     resource_sample_seconds: float = 60.0
+    multioutput_feature_basis: str = "bin"
 
     # Feature importance configuration for torch models in multi-output mode
     # Enabled by default to always record FI; set samples=None to use all available samples
-    enable_feature_importance: bool = True
+    enable_feature_importance: bool = False
     feature_importance_samples: Optional[int] = None
-    feature_importance_batch_size: int = 128
-    enable_shap: bool = True
+    feature_importance_batch_size: int = 256
+    enable_shap: bool = False
     shap_max_samples: Optional[int] = 500
     shap_background_samples: int = 100
-    export_raw_predictions: bool = True
+    export_raw_predictions: bool = False
+    # When False, keep sparse feature matrices during cell-wise prep to reduce memory.
+    # Note: smoothing/pseudobulk or non-sparse scalers will still force densification.
+    force_dense_features: bool = True
 
     def validate(self) -> None:
         total = self.train_fraction + self.val_fraction + self.test_fraction
@@ -114,6 +127,8 @@ class TrainingConfig:
             raise ValueError("k_folds must be at least 2")
         if self.window_bp <= 0 or self.bin_size_bp <= 0:
             raise ValueError("window_bp and bin_size_bp must be positive")
+        if self.effective_batch_cap <= 0:
+            raise ValueError("effective_batch_cap must be positive")
         if self.smoothing_k < 1:
             raise ValueError("smoothing_k must be >= 1")
         if self.smoothing_pca_components < 1:
@@ -122,6 +137,8 @@ class TrainingConfig:
             raise ValueError("pseudobulk_group_size must be >= 1")
         if self.pseudobulk_pca_components < 1:
             raise ValueError("pseudobulk_pca_components must be >= 1")
+        if self.multioutput_feature_basis not in {"bin", "peak"}:
+            raise ValueError("multioutput_feature_basis must be 'bin' or 'peak'")
         if not (0.0 <= self.min_expression_fraction <= 1.0):
             raise ValueError("min_expression_fraction must be within [0, 1]")
         if self.rf_n_estimators is not None and self.rf_n_estimators <= 0:
@@ -157,6 +174,24 @@ class TrainingConfig:
 
 
 @dataclass
+class WandbConfig:
+    enabled: bool = False
+    project: str = "SPEAR"
+    entity: Optional[str] = None
+    run_name: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
+    group: Optional[str] = None
+    job_type: Optional[str] = None
+    log_artifacts: bool = True
+    log_tables: bool = True
+    log_media: bool = True
+    log_predictions_table: bool = True
+    sweep_overrides: bool = False
+    table_max_rows: int = 5000
+    media_max_items: int = 50
+
+
+@dataclass
 class ModelConfig:
     model_names: List[str] = field(
         default_factory=lambda: [
@@ -176,6 +211,7 @@ class PipelineConfig:
     paths: PathsConfig
     training: TrainingConfig = field(default_factory=TrainingConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
     genes: Optional[List[str]] = None
     chromosomes: Optional[List[str]] = None
     max_genes: Optional[int] = None
@@ -184,6 +220,7 @@ class PipelineConfig:
     # Default to cell-wise multi-output unless explicitly turned off
     multi_output: bool = True
     run_name: Optional[str] = None
+    cache_dir: Optional[Path] = None
 
 
     def ensure_directories(self) -> None:

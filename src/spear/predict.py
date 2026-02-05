@@ -9,6 +9,7 @@ import joblib
 import numpy as np
 import torch
 import pandas as pd
+import scipy.sparse as sp
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
@@ -173,6 +174,8 @@ def predict(
         raise FileNotFoundError("No saved model artifact found (.pt or .pkl)")
 
     X = feature_data.X
+    if sp.issparse(X):
+        X = X.toarray().astype(np.float32)
     if training.enable_smoothing and training.smoothing_k > 1:
         X = _knn_smooth_features(
             X,

@@ -1,61 +1,12 @@
-# Core project assets not meant for version control
+# Large/local data & scratch
 data/
 jobs/
-todo.md
-output/
-results/
 work/
-archive/
-analysis/param_count.csv
 
-# Python cache and build artefacts
+# Local editor settings
+.vscode/
+
+# Python and notebooks
 __pycache__/
 *.py[cod]
-*$py.class
-build/
-dist/
-*.egg-info/
-.eggs/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.nox/
-.tox/
-.coverage*
-htmlcov/
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-.pixi/
-.pdm-python
-
-# Logs and local configs
-*.log
-slurm-*.out
-slurm-*.err
-.env
-.env.*
-.python-version
-
-# Notebook cruft
 .ipynb_checkpoints/
-analysis/figs/
-analysis/reports/
-analysis/* copy*.ipynb
-
-# Experiment artefacts
-wandb/
-mlruns/
-lightning_logs/
-
-# Editors and OS files
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db

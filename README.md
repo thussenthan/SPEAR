@@ -1,16 +1,31 @@
-# SPEAR: <u>S</u>ingle-cell-based <u>P</u>rediction of Gene <u>E</u>xpression from Chromatin <u>A</u>ccessibility <u>R</u>eadouts
+# SPEAR: **S**ingle-cell-based **P**rediction of Gene **E**xpression from Chromatin **A**ccessibility **R**eadouts
 
-<div align="center">
-  <img src="docs/images/spear_logo.png" alt="SPEAR Logo" width="400"/>
-</div>
+![SPEAR Logo](docs/images/spear_logo.png)
 
-## SPEAR Framework Overview
-
-![SPEAR framework figure](docs/images/SPEAR%20Framework%20Figure_transparent%20background.png)
+## Overview
 
 SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts) is an end-to-end machine-learning framework for training and evaluating multi-omics integration models. The toolkit focuses on predicting the full RNA gene expression vector for every cell directly from its paired single-cell ATAC accessibility profile, pairing reproducible preprocessing with a modular model zoo, batchable CLI entry points, and plotting notebooks for downstream analysis.
 
-## Key Features
+## Inputs
+
+- Paired ATAC/RNA `h5ad` files with overlapping barcodes.
+- A reference GTF containing gene annotations.
+- Gene manifests or explicit gene lists.
+- Optional JSON configuration via `--config-json`.
+
+## Outputs
+
+- Run artifacts under `output/results/` (metrics, predictions, histories, model files).
+- Logs under `output/logs`.
+- Figures under `analysis/figs`.
+
+## Usage
+
+### SPEAR Framework Overview
+
+![SPEAR framework figure](docs/images/SPEAR%20Framework%20Figure_transparent%20background.png)
+
+### Key Features
 
 ### Project Goals
 
@@ -26,7 +41,7 @@ SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibil
 - **k-NN smoothing:** Each cell is smoothed by averaging with its k nearest neighbors (default k=19 for `smoothing_k=20`) using PCA-informed nearest-neighbor search to reduce sparsity while maintaining dataset size.
 - **Optional pseudobulk aggregation:** PCA-informed, group-aware pooling within each sample when `pseudobulk_group_size > 1`.
 - **Group-aware splitting:** 70/15/15 train/val/test splits with `GroupShuffleSplit` keyed by `group_key` (default `sample`; falls back to random when insufficient groups), plus 5-fold cross-validation using `GroupKFold` when possible.
-- **Model zoo:** CNN, RNN, LSTM, Transformer, Graph (implicit message passing), PyTorch MLP, Random Forest, Extra Trees, HistGradientBoosting, XGBoost, CatBoost, SVR, Ridge, Elastic Net, Lasso, and OLS. Each model is defined in `spear.models` and accessible through the CLI.
+- **Model zoo:** CNN, ResNet, RNN, LSTM, Transformer, Graph (implicit message passing), PyTorch MLP, Random Forest, Extra Trees, HistGradientBoosting, XGBoost, CatBoost, SVR, Ridge, Elastic Net, Lasso, and OLS. Each model is defined in `spear.models` and accessible through the CLI.
 - **Unified diagnostics:** `analysis/spear_results_analysis.ipynb` replaces prior plotting scripts, generating per-gene Pearson summaries, violin plots, top-genes scatter plots, RMSE comparisons, prediction-vs-truth charts, and epoch history curves directly from run outputs.
 
 ### Datasets
@@ -34,7 +49,7 @@ SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibil
 - Mouse embryonic multiome (GSE205117): `docs/mouse_esc_dataset.md`
 - Human hemogenic endothelium multiome (GSE270141): `docs/endothelial_dataset.md`
 
-## Repository Layout
+### Repository Layout
 
 ```text
 analysis/figs/               # Notebook outputs and generated figures
@@ -45,7 +60,7 @@ scripts/                     # Minimal helper scripts (data prep only)
 todo.md                      # Running task list
 ```
 
-## Installation
+### Installation
 
 1. Create/activate your environment (Python ≥ 3.10).
 2. Install the Python requirements and the package in editable mode:
@@ -58,13 +73,13 @@ pip install -e .
 > Torch and XGBoost wheels can be large on HPC systems—consider using `pip install --no-cache-dir` if disk quotas are tight.
 > Data files are not published with this repository; fetch or generate them locally before running the pipeline.
 
-## Data Requirements
+### Data Requirements
 
 - Paired ATAC/RNA `h5ad` files with overlapping barcodes.
 - A reference GTF containing gene annotations.
 - See `docs/mouse_esc_dataset.md` and `docs/endothelial_dataset.md` for dataset-specific provenance and storage conventions.
 
-## Running the Pipeline
+### Running the Pipeline
 
 The CLI exposes all data preparation and model training settings. Basic example (either `spear` or `python -m spear.cli`):
 
@@ -85,11 +100,31 @@ More flags and defaults are documented in `docs/config_reference.md`.
 Environment / CLI highlights:
 
 - `--gene-manifest` guarantees that every model trains on the same gene subset.
+- `--cache-dir` enables on-disk reuse of preprocessing (recommended for repeated model runs).
 - `--chromosomes genome-wide` explicitly disables chromosome filtering; provide a list to restrict loci.
 - `--run-name` customises the output directory name.
 - `--device` supports `cuda`, `cpu`, or `auto` (prefers CUDA when available; falls back otherwise).
 - `--disable-pseudobulk` is a quick toggle to benchmark true single-cell training (equivalent to setting `--pseudobulk-group-size 1`).
 - `--atac-layer` lets you swap CPM for alternative ATAC transforms such as `tfidf` or disable normalisation entirely.
+
+### Generate Gene Manifests
+
+Generate the 1000-gene manifests used in this repo with the helper script:
+
+```bash
+PYTHONPATH=src python scripts/select_random_genes.py \
+  --base-dir /gpfs/Home/tqw5435/uzun/spear \
+  --gene-count 1000 \
+  --gtf-path /gpfs/Home/tqw5435/uzun/spear/data/references/GCF_000001635.27_genomic.gtf \
+  --output /gpfs/Home/tqw5435/uzun/spear/data/embryonic/manifests/1000_random_genes.csv
+
+PYTHONPATH=src python scripts/select_random_genes.py \
+  --base-dir /gpfs/Home/tqw5435/uzun/spear \
+  --gene-count 1000 \
+  --rna-path '/gpfs/Home/tqw5435/uzun/spear/data/endothelial/processed/combined_RNA_qc_<15%mito.h5ad' \
+  --gtf-path /gpfs/Home/tqw5435/uzun/spear/data/references/gencode.v44.annotation.gtf.gz \
+  --output /gpfs/Home/tqw5435/uzun/spear/data/endothelial/manifests/1000_random_genes.csv
+```
 
 ### Example runs
 
@@ -99,9 +134,22 @@ spear --per-gene --models ridge lasso ols --device cpu --run-name per_gene_basel
 
 # Multi-output torch run with smaller smoothing and no pseudobulk
 spear --models mlp transformer --smoothing-k 5 --disable-pseudobulk --run-name multi_output_no_bulk
+
+Optional experiment tracking is available via Weights & Biases. Enable it with `--wandb` after installing `wandb`
+and exporting `WANDB_API_KEY` (or configuring `~/.netrc`). If the key or login is missing, SPEAR will skip W&B
+logging without failing the run.
+
+Quick setup:
+1. Install: `pip install wandb`
+2. Export your API key: `export WANDB_API_KEY=...`
+3. Run with W&B enabled: `spear ... --wandb --wandb-project SPEAR`
+
+By default, SPEAR logs summary metrics, tables, and key plots to W&B (with row/media caps). Use
+`--wandb-no-artifacts`, `--wandb-no-tables`, `--wandb-no-media`, or `--wandb-no-predictions-table`
+to trim logging.
 ```
 
-## Results & Visualization
+### Results & Visualization
 
 1. Run the CLI to generate metrics, predictions, histories, and fitted artifacts.
 2. Open `analysis/spear_results_analysis.ipynb` and execute the cells. Adjust `RUN_INCLUDE_GLOBS` at the top of the notebook if you want to focus on specific runs.
@@ -115,7 +163,7 @@ Run artifacts are written under `output/results/spear_results/<run_name>/` with 
 
 ### Feature Importance & SHAP Artifacts
 
-Multi-output torch runs can emit feature-importance and SHAP summaries under each model directory. Non-torch models do not produce SHAP outputs in the current pipeline.
+Multi-output torch runs can emit feature-importance and SHAP summaries under each model directory when enabled via `--enable-feature-importance` and `--enable-shap`. Non-torch models do not produce SHAP outputs in the current pipeline.
 
 - `feature_importances_mean.csv`, `feature_importances_raw.npz`, `feature_importance_per_gene_summary.csv`
 - `feature_importance_mean.png`, `feature_importance_vs_tss_distance.png`
@@ -123,11 +171,12 @@ Multi-output torch runs can emit feature-importance and SHAP summaries under eac
 
 Use `scripts/plot_feature_importance_vs_tss.py` to build a publication-ready panel from these outputs.
 
-## Supported Models
+### Supported Models
 
 The following identifiers can be supplied to `--models` (and combined arbitrarily):
 
 - `cnn`
+- `resnet`
 - `rnn`
 - `lstm`
 - `transformer`
@@ -156,7 +205,7 @@ SVR defaults to a linear kernel with configurable hyperparameters via `TrainingC
 
 All dependencies (runtime, dev, and notebooks) are listed in `requirements.txt`.
 
-## Preprocessing Details
+### Preprocessing Details
 
 1. **AnnData loading:** ATAC and RNA `h5ad` matrices are loaded through `anndata`, subset to shared barcodes, and aligned to a common ordering.
 2. **Modal layers:**
@@ -171,7 +220,7 @@ All dependencies (runtime, dev, and notebooks) are listed in `requirements.txt`.
 8. **Splitting:** Train/val/test fractions default to 0.70/0.15/0.15 with `GroupShuffleSplit` by `group_key` (fallback to random splits when too few groups).
 9. **Cross-validation:** Within the training split, models run 5-fold CV grouped by `group_key` when possible (else shuffled KFold) before fitting on the full training set.
 
-## Inference on New ATAC Data
+### Inference on New ATAC Data
 
 Use the inference helper to generate predictions from a trained run directory:
 
@@ -183,9 +232,16 @@ python -m spear.predict \
   --output /path/to/predictions_inference.csv
 ```
 
-## Troubleshooting
+### Troubleshooting
 
 - Missing data paths: confirm `--atac-path`, `--rna-path`, and `--gtf-path` or the default `data/` layout.
+
+## References
+
+- `docs/config_reference.md`
+- `docs/master_runbook.md`
+- `docs/mouse_esc_dataset.md`
+- `docs/endothelial_dataset.md`
 - Barcode mismatch: ensure ATAC/RNA `obs_names` overlap and refer to the same cells.
 - Memory pressure: reduce `--max-genes`, increase `--bin-size-bp`, or use chunking to shrink feature matrices.
 
@@ -197,4 +253,4 @@ python -m spear.predict \
 
 ## Citation
 
-If you use SPEAR, cite the original data sources and this repository (https://github.com/UzunLab/SPEAR). A formal software citation can be added once a DOI is available.
+If you use SPEAR, cite the original data sources and this repository ([https://github.com/UzunLab/SPEAR](https://github.com/UzunLab/SPEAR)). A formal software citation can be added once a DOI is available.

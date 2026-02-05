@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class _MaxLevelFilter(logging.Filter):
@@ -90,6 +90,11 @@ try:  # Optional GPU visibility
 except ImportError:  # pragma: no cover - optional dependency
     torch = None  # type: ignore
 
+try:  # Optional GPU utilization via NVML
+    import pynvml  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    pynvml = None  # type: ignore
+
 
 @dataclass
 class _ResourceSample:
@@ -99,6 +104,43 @@ class _ResourceSample:
     thread_count: int
     gpu_memory_gib: float
     gpu_reserved_gib: float
+    gpu_util_percent: float
+
+
+_NVML_INITIALIZED = False
+_NVML_DEVICE_HANDLES: List[Any] = []
+_NVML_DEVICE_HANDLES_LOCK = threading.Lock()
+
+
+def _get_gpu_utilization_percent() -> float:
+    global _NVML_INITIALIZED
+    if pynvml is None or torch is None:
+        return float("nan")
+    try:
+        if not torch.cuda.is_available():
+            return float("nan")
+        device_count = torch.cuda.device_count()
+        if device_count <= 0:
+            return float("nan")
+        with _NVML_DEVICE_HANDLES_LOCK:
+            if not _NVML_INITIALIZED:
+                pynvml.nvmlInit()
+                _NVML_INITIALIZED = True
+                handles: List[Any] = []
+                for idx in range(device_count):
+                    handles.append(pynvml.nvmlDeviceGetHandleByIndex(idx))
+                _NVML_DEVICE_HANDLES.clear()
+                _NVML_DEVICE_HANDLES.extend(handles)
+            handles_snapshot = list(_NVML_DEVICE_HANDLES)
+        utils = []
+        for handle in handles_snapshot:
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            utils.append(float(util.gpu))
+        if not utils:
+            return float("nan")
+        return float(sum(utils) / len(utils))
+    except Exception:  # pragma: no cover - best-effort only
+        return float("nan")
 
 
 class ResourceUsageTracker:
@@ -182,6 +224,7 @@ class ResourceUsageTracker:
 
         gpu_memory = 0.0
         gpu_reserved = 0.0
+        gpu_util_percent = float("nan")
         if torch is not None:
             try:
                 if torch.cuda.is_available():
@@ -190,6 +233,7 @@ class ResourceUsageTracker:
                         gpu_reserved += float(torch.cuda.memory_reserved(idx)) / (1024 ** 3)
             except Exception:  # pragma: no cover - defensive GPU handling
                 pass
+        gpu_util_percent = _get_gpu_utilization_percent()
 
         self._records.append(
             _ResourceSample(
@@ -199,6 +243,7 @@ class ResourceUsageTracker:
                 thread_count=int(thread_count),
                 gpu_memory_gib=float(gpu_memory),
                 gpu_reserved_gib=float(gpu_reserved),
+                gpu_util_percent=float(gpu_util_percent),
             )
         )
 
@@ -216,6 +261,7 @@ class ResourceUsageTracker:
                         "thread_count",
                         "gpu_memory_gib",
                         "gpu_reserved_gib",
+                        "gpu_util_percent",
                     ]
                 )
                 for sample in self._records:
@@ -227,6 +273,7 @@ class ResourceUsageTracker:
                             sample.thread_count,
                             f"{sample.gpu_memory_gib:.4f}",
                             f"{sample.gpu_reserved_gib:.4f}",
+                            f"{sample.gpu_util_percent:.2f}",
                         ]
                     )
             self._log.info("Wrote resource usage CSV to %s", path)
@@ -244,6 +291,9 @@ class ResourceUsageTracker:
         rss = [sample.rss_gib for sample in self._records]
         cpu = [sample.cpu_percent for sample in self._records]
         gpu = [sample.gpu_memory_gib for sample in self._records]
+        gpu_reserved = [sample.gpu_reserved_gib for sample in self._records]
+        gpu_util = [sample.gpu_util_percent for sample in self._records]
+        threads = [sample.thread_count for sample in self._records]
 
         if not times:
             return
@@ -256,21 +306,46 @@ class ResourceUsageTracker:
 
         ax_right = ax_left.twinx()
         ax_right.plot(times, cpu, label="CPU %", color="#ff7f0e", linestyle="--")
-        ax_right.set_ylabel("CPU usage (%)", color="#ff7f0e")
+        ax_right.set_ylabel("Utilization / GPU Memory", color="#ff7f0e")
         ax_right.tick_params(axis="y", labelcolor="#ff7f0e")
 
         if any(value > 0.0 for value in gpu):
             ax_right.plot(times, gpu, label="GPU mem (GiB)", color="#2ca02c", linestyle=":")
+        if any(value > 0.0 for value in gpu_reserved):
+            ax_right.plot(times, gpu_reserved, label="GPU reserved (GiB)", color="#17becf", linestyle=":")
+        if any(value == value for value in gpu_util):
+            ax_right.plot(times, gpu_util, label="GPU %", color="#9467bd", linestyle="-.")
 
         ax_left.set_title(f"Resource usage | {self._name}")
+        lines_left, labels_left = ax_left.get_legend_handles_labels()
+        lines_right, labels_right = ax_right.get_legend_handles_labels()
+        if lines_left or lines_right:
+            ax_left.legend(lines_left + lines_right, labels_left + labels_right, loc="upper right")
         fig.tight_layout()
 
         self._output_dir.mkdir(parents=True, exist_ok=True)
         path = self._output_dir / f"{self._safe_name}_resource_usage.png"
         try:
-            fig.savefig(path, dpi=150)
+            fig.savefig(path, dpi=300)
             self._log.info("Wrote resource usage plot to %s", path)
         except Exception:  # pragma: no cover - IO errors shouldn't crash pipeline
             self._log.warning("Failed to write resource usage plot to %s", path, exc_info=True)
         finally:
             plt.close(fig)
+
+        if threads:
+            fig_threads, ax_threads = plt.subplots(figsize=(8, 4.5))
+            ax_threads.plot(times, threads, label="Threads", color="#8c564b", linewidth=2.0)
+            ax_threads.set_xlabel("Time (s)")
+            ax_threads.set_ylabel("Thread Count")
+            ax_threads.set_title(f"Thread count | {self._name}")
+            ax_threads.legend(loc="upper right")
+            fig_threads.tight_layout()
+            thread_path = self._output_dir / f"{self._safe_name}_resource_threads.png"
+            try:
+                fig_threads.savefig(thread_path, dpi=300)
+                self._log.info("Wrote thread usage plot to %s", thread_path)
+            except Exception:  # pragma: no cover - IO errors shouldn't crash pipeline
+                self._log.warning("Failed to write thread usage plot to %s", thread_path, exc_info=True)
+            finally:
+                plt.close(fig_threads)

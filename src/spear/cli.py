@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config import ModelConfig, PipelineConfig, PathsConfig, TrainingConfig
+from .config import ModelConfig, PipelineConfig, PathsConfig, TrainingConfig, WandbConfig
 from .evaluation import run_pipeline
 from .logging_utils import configure_logging, get_logger
 
@@ -37,6 +37,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--window-bp", type=int, help="Window around TSS in base pairs (default 10,000)")
     parser.add_argument("--bin-size-bp", type=int, help="Bin size in base pairs (default 500)")
+    parser.add_argument(
+        "--multioutput-feature-basis",
+        choices=["bin", "peak"],
+        help="Feature basis for multi-output mode: bin (default) or peak",
+    )
     parser.add_argument("--scaler", choices=["standard", "minmax", "none"], help="Feature scaler")
     parser.add_argument("--target-scaler", choices=["standard", "minmax", "none"], help="Target scaler")
     parser.add_argument(
@@ -47,6 +52,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, help="Training epochs for neural models")
     parser.add_argument("--learning-rate", type=float, help="Learning rate for neural models")
     parser.add_argument("--batch-size", type=int, help="Batch size for neural models")
+    parser.add_argument(
+        "--effective-batch-cap",
+        type=int,
+        help=(
+            "Cap for the effective batch size in multi-output mode (default 48000). "
+            "When many targets are predicted at once, the per-step workload can exceed "
+            "batch_size; lower this to avoid OOMs or slowdowns, raise it to use more throughput."
+        ),
+    )
     parser.add_argument(
         "--pseudobulk-group-size",
         type=int,
@@ -83,9 +97,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Interval (in seconds) between resource usage samples (default 60)",
     )
     parser.add_argument(
-        "--disable-feature-importance",
+        "--enable-feature-importance",
         action="store_true",
-        help="Disable feature importance even if enabled by default in config",
+        help="Enable feature importance for multi-output torch models",
     )
     parser.add_argument(
         "--feature-importance-samples",
@@ -98,17 +112,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Batch size for feature-importance gradient accumulation (default 128)",
     )
     parser.add_argument(
-        "--disable-shap",
+        "--enable-shap",
         action="store_true",
-        help="Disable SHAP attribution export for multi-output torch models",
+        help="Enable SHAP attribution export for multi-output torch models",
     )
     parser.add_argument(
-        "--no-export-raw-predictions",
-        dest="export_raw_predictions",
-        action="store_false",
-        help="Disable exporting per-cell predictions_raw.csv to reduce runtime and output size",
+        "--export-raw-predictions",
+        action="store_true",
+        help="Export per-cell predictions_raw.csv (adds runtime/output size)",
     )
-    parser.set_defaults(export_raw_predictions=True)
     parser.add_argument(
         "--shap-max-samples",
         type=int,
@@ -131,8 +143,55 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Preferred compute device (cuda, cpu, or auto to choose CUDA when available)",
     )
     parser.add_argument("--run-name", help="Optional run name override")
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging (requires wandb + login)",
+    )
+    parser.add_argument("--wandb-project", help="W&B project name (default SPEAR)")
+    parser.add_argument("--wandb-entity", help="W&B entity/team name")
+    parser.add_argument("--wandb-run-name", help="Override W&B run name (defaults to --run-name)")
+    parser.add_argument("--wandb-tags", nargs="*", help="Optional W&B tags")
+    parser.add_argument("--wandb-group", help="Optional W&B group")
+    parser.add_argument("--wandb-job-type", help="Optional W&B job type")
+    parser.add_argument(
+        "--wandb-no-artifacts",
+        action="store_true",
+        help="Disable W&B artifact logging when --wandb is enabled",
+    )
+    parser.add_argument(
+        "--wandb-no-tables",
+        action="store_true",
+        help="Disable W&B table logging when --wandb is enabled",
+    )
+    parser.add_argument(
+        "--wandb-no-media",
+        action="store_true",
+        help="Disable W&B media logging (plots/images) when --wandb is enabled",
+    )
+    parser.add_argument(
+        "--wandb-no-predictions-table",
+        action="store_true",
+        help="Disable W&B predictions table logging when --wandb is enabled",
+    )
+    parser.add_argument(
+        "--wandb-sweep",
+        action="store_true",
+        help="Apply sweep overrides from wandb.config when running as a sweep agent",
+    )
+    parser.add_argument(
+        "--wandb-table-max-rows",
+        type=int,
+        help="Max rows to log per W&B Table (default 5000)",
+    )
+    parser.add_argument(
+        "--wandb-media-max-items",
+        type=int,
+        help="Max number of media items to log per run (default 50)",
+    )
     parser.add_argument("--chunk-index", type=int, default=0, help="Zero-based index of the gene chunk to process")
     parser.add_argument("--chunk-total", type=int, default=1, help="Total number of gene chunks across all jobs")
+    parser.add_argument("--cache-dir", help="Directory for on-disk preprocessing cache")
     parser.add_argument("--config-json", help="Path to configuration JSON file to load")
     parser.add_argument(
         "--per-gene",
@@ -171,7 +230,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.config_json:
         config_path = Path(args.config_json).expanduser().resolve()
         payload = json.loads(config_path.read_text())
-        config = _config_from_json(payload)
+        try:
+            config = _config_from_json(payload)
+        except ValueError as exc:
+            parser.error(f"Invalid configuration in {config_path}: {exc}")
     else:
         paths = PathsConfig.from_base(args.base_dir)
 
@@ -200,6 +262,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.window_bp = args.window_bp
         if args.bin_size_bp:
             training.bin_size_bp = args.bin_size_bp
+        if args.multioutput_feature_basis:
+            training.multioutput_feature_basis = args.multioutput_feature_basis
         if args.scaler:
             training.scaler = None if args.scaler == "none" else args.scaler
         if args.target_scaler:
@@ -214,6 +278,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.learning_rate = args.learning_rate
         if args.batch_size:
             training.batch_size = args.batch_size
+        if args.effective_batch_cap is not None:
+            training.effective_batch_cap = args.effective_batch_cap
         if args.smoothing_k is not None:
             training.smoothing_k = args.smoothing_k
         if args.smoothing_pca_components is not None:
@@ -231,14 +297,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         if args.atac_layer:
             training.atac_layer = None if args.atac_layer == "none" else args.atac_layer
         training.device_preference = args.device
-        if args.disable_feature_importance:
-            training.enable_feature_importance = False
+        if args.enable_feature_importance:
+            training.enable_feature_importance = True
         if args.feature_importance_samples is not None:
             training.feature_importance_samples = args.feature_importance_samples
         if args.feature_importance_batch_size is not None:
             training.feature_importance_batch_size = args.feature_importance_batch_size
-        if args.disable_shap:
-            training.enable_shap = False
+        if args.enable_shap:
+            training.enable_shap = True
         training.export_raw_predictions = args.export_raw_predictions
         if args.shap_max_samples is not None:
             training.shap_max_samples = args.shap_max_samples
@@ -257,7 +323,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                 training.rf_max_features = args.rf_max_features
         if args.rf_bootstrap is not None:
             training.rf_bootstrap = args.rf_bootstrap.lower() == "true"
-        training.validate()
+        try:
+            training.validate()
+        except ValueError as exc:
+            parser.error(f"Invalid training configuration: {exc}")
 
         models = ModelConfig()
         if args.models:
@@ -284,10 +353,41 @@ def main(argv: Optional[list[str]] = None) -> None:
                 parser.error(f"Gene manifest {manifest_path} did not contain any gene entries")
             gene_list = manifest_genes
 
+        wandb_config = WandbConfig()
+        if args.wandb:
+            wandb_config.enabled = True
+        if args.wandb_project:
+            wandb_config.project = args.wandb_project
+        if args.wandb_entity:
+            wandb_config.entity = args.wandb_entity
+        if args.wandb_run_name:
+            wandb_config.run_name = args.wandb_run_name
+        if args.wandb_tags:
+            wandb_config.tags = list(args.wandb_tags)
+        if args.wandb_group:
+            wandb_config.group = args.wandb_group
+        if args.wandb_job_type:
+            wandb_config.job_type = args.wandb_job_type
+        if args.wandb_no_artifacts:
+            wandb_config.log_artifacts = False
+        if args.wandb_no_tables:
+            wandb_config.log_tables = False
+        if args.wandb_no_media:
+            wandb_config.log_media = False
+        if args.wandb_no_predictions_table:
+            wandb_config.log_predictions_table = False
+        if args.wandb_sweep:
+            wandb_config.sweep_overrides = True
+        if args.wandb_table_max_rows is not None:
+            wandb_config.table_max_rows = args.wandb_table_max_rows
+        if args.wandb_media_max_items is not None:
+            wandb_config.media_max_items = args.wandb_media_max_items
+
         config = PipelineConfig(
             paths=paths,
             training=training,
             models=models,
+            wandb=wandb_config,
             genes=gene_list,
             chromosomes=list(args.chromosomes) if args.chromosomes else None,
             max_genes=args.max_genes,
@@ -295,6 +395,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             chunk_index=args.chunk_index,
             multi_output=multi_output_mode,
         )
+        if args.cache_dir:
+            config.cache_dir = Path(args.cache_dir)
 
     run_name = args.run_name or f"spear_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     config.run_name = run_name
@@ -320,15 +422,18 @@ def _config_from_json(payload: dict) -> PipelineConfig:
     paths = PathsConfig.from_base(base_dir)
     training_payload = payload.get("training", {})
     models_payload = payload.get("models", {})
+    wandb_payload = payload.get("wandb", {})
 
     training = TrainingConfig(**training_payload)
     training.validate()
     models = ModelConfig(**models_payload)
+    wandb_config = WandbConfig(**wandb_payload)
 
     return PipelineConfig(
         paths=paths,
         training=training,
         models=models,
+        wandb=wandb_config,
         genes=payload.get("genes"),
         chromosomes=payload.get("chromosomes"),
         max_genes=payload.get("max_genes"),
@@ -336,6 +441,7 @@ def _config_from_json(payload: dict) -> PipelineConfig:
         chunk_index=payload.get("chunk_index", 0),
         # Default to multi-output unless explicitly disabled in JSON payload
         multi_output=payload.get("multi_output", True),
+        cache_dir=Path(payload["cache_dir"]) if payload.get("cache_dir") else None,
     )
 
 
@@ -357,7 +463,11 @@ def _load_manifest_genes(manifest_path: Path) -> list[str]:
             rows = [row for row in reader if row]
         if not rows:
             return []
-        header_candidates = {value.strip().lower(): idx for idx, value in enumerate(rows[0])}
+        def _normalize_header(value: str) -> str:
+            normalized = value.strip().lower().replace(" ", "_").replace("-", "_")
+            return normalized
+
+        header_candidates = {_normalize_header(value): idx for idx, value in enumerate(rows[0])}
         gene_col = None
         for key in ("gene_name", "gene", "gene_id", "geneid"):
             if key in header_candidates:
@@ -374,6 +484,11 @@ def _load_manifest_genes(manifest_path: Path) -> list[str]:
         unique_ordered = list(dict.fromkeys(genes))
         return unique_ordered
 
+    # If the manifest is a single-column file without delimiters, drop a header line if present.
+    if stripped:
+        header = _normalize_header(stripped[0])
+        if header in {"gene_name", "gene", "gene_id", "geneid", "symbol"}:
+            stripped = stripped[1:]
     return list(dict.fromkeys(stripped))
 
 

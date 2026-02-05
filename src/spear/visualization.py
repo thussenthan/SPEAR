@@ -85,7 +85,7 @@ def plot_predictions_vs_actual(
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
             )
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=300)
     plt.close()
 
 
@@ -100,7 +100,7 @@ def plot_residual_histogram(y_true: np.ndarray, y_pred: np.ndarray, output_path:
     plt.ylabel("Count")
     plt.title(title)
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=300)
     plt.close()
 
 
@@ -146,7 +146,7 @@ def plot_feature_importance(
         )
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
@@ -200,7 +200,7 @@ def plot_per_gene_feature_panel(
     fig.suptitle(f"Feature importance panel | {gene_name}", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.98))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
@@ -253,7 +253,7 @@ def plot_residual_barplot(
     ax.set_ylabel("Gene")
     ax.set_title(title)
     fig.tight_layout()
-    fig.savefig(output_path)
+    fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
@@ -286,7 +286,7 @@ def plot_correlation_boxplot(
     ax.set_title(title)
     if save_and_close:
         plt.tight_layout()
-        plt.savefig(output_path)
+        plt.savefig(output_path, dpi=300)
         plt.close()
 
 
@@ -319,7 +319,7 @@ def plot_correlation_violin(
     ax.set_title(title)
     if save_and_close:
         plt.tight_layout()
-        plt.savefig(output_path)
+        plt.savefig(output_path, dpi=300)
         plt.close()
 
 
@@ -380,7 +380,7 @@ def plot_importance_distance_scatter(
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
             )
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=300)
     plt.close()
 
 
@@ -427,7 +427,7 @@ def plot_cumulative_importance_overlay(
         )
     ax.grid(True, which="major", axis="both", linestyle="--", alpha=0.4)
     fig.tight_layout()
-    fig.savefig(output_path)
+    fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
@@ -460,6 +460,17 @@ def plot_training_history_curves(
     if not curves:
         return
 
+    # Skip plots where all series are constant or all-NaN.
+    def _is_constant_or_nan(series: pd.Series) -> bool:
+        numeric = pd.to_numeric(series, errors="coerce")
+        finite = numeric.dropna()
+        if finite.empty:
+            return True
+        return finite.nunique(dropna=True) <= 1
+
+    if all(_is_constant_or_nan(series) for series, _ in curves):
+        return
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(7.5, 4.5))
     for series, label in curves:
@@ -471,5 +482,33 @@ def plot_training_history_curves(
     if len(curves) > 1:
         plt.legend()
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+
+
+def plot_training_history_series(
+    history: pd.DataFrame,
+    column: str,
+    output_path: Path,
+    title: str,
+    ylabel: str,
+) -> None:
+    if history.empty or "epoch" not in history.columns or column not in history.columns:
+        return
+
+    series = pd.to_numeric(history[column], errors="coerce")
+    finite = series.dropna()
+    if finite.empty:
+        return
+    if finite.nunique(dropna=True) <= 1:
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(7.5, 4.5))
+    plt.plot(history["epoch"], history[column], linewidth=2.0)
+    plt.xlabel("Epoch")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
     plt.close()

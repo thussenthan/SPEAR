@@ -1,6 +1,21 @@
 # SPEAR Package (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts)
 
-Python package housing the reusable components that power the SPEAR workflow:
+## Overview
+
+Python package housing the reusable components that power the SPEAR workflow.
+
+## Inputs
+
+- Installed dependencies from `requirements.txt`.
+- Project configuration via CLI or JSON.
+
+## Outputs
+
+- Python package modules used by the CLI and scripts.
+
+## Usage
+
+Key modules:
 
 - `config.py` – dataclasses describing filesystem layout, training hyperparameters, and model selections.
 - `cli.py` – entrypoint for command-line execution (`spear` or `python -m spear.cli`).
@@ -14,3 +29,7 @@ pip install -e .
 ```
 
 Run `spear --help` (or `python -m spear.cli --help`) for the full list of pipeline options.
+
+## References
+
+- `README.md`

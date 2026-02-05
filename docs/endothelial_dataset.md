@@ -6,33 +6,42 @@
 - Hemogenic endothelium–derived populations cultured under hypoxia (4% O2) or normoxia.
 - Enables comparison of chromatin and transcriptional responses under oxygen modulation.
 
-## Source References
+## Inputs
 
-- Primary study: _Hematopoietic cells emerging from hemogenic endothelium exhibit lineage-specific oxidative stress responses_.
-- GEO accession: [GSE270141](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE270141).
+- Raw GEO files from accession `GSE270141`.
+- GEX matrices: barcodes, features, and count matrices (`.tsv.gz` or `.mtx.gz`).
+- ATAC fragments: per-sample fragment files.
+- Local staging directory: `data/endothelial/raw/`.
 
-## Data Access
+## Outputs
 
-The raw and processed data files are available from GEO accession [GSE270141](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE270141). Download the required files for your analysis:
+- Processed RNA: `data/endothelial/processed/combined_RNA_qc.h5ad`.
+- Processed ATAC: `data/endothelial/processed/combined_ATAC_qc.h5ad`.
 
-- **GEX matrices**: Per-sample barcodes, features, and count matrices (`.tsv.gz` or `.mtx.gz`)
-- **ATAC fragments**: Per-sample fragment files for chromatin accessibility
+## Usage
 
-Store downloaded files under `data/endothelial/raw/`.
+### Data Access
 
-## Dataset Summary (this study)
+The raw and processed data files are available from GEO accession
+[GSE270141](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE270141).
+Download the required files for your analysis and store them under
+`data/endothelial/raw/`.
+
+### Dataset Summary (this study)
 
 | Field                    | Value                                                                                         |
 | ------------------------ | --------------------------------------------------------------------------------------------- |
 | Conditions used          | normoxia only                                                                                 |
 | Cells (raw)              | 5,621                                                                                         |
 | Cells (post-QC)          | 4,735                                                                                         |
+| Genes (raw)              | 21,134                                                                                        |
+| Genes (post-QC)          | 17,351                                                                                        |
 | Peaks (post-QC)          | 396,920                                                                                       |
 | QC applied in this study | Barcode intersection; RNA mito <15%; min genes/cells: 200/3 for RNA + ATAC; re-align after QC |
 | Genes modeled            | Configurable; 1000 (100 genes fallback)                                                       |
 | Annotation               | GENCODE v44                                                                                   |
 
-## Processed Snapshot (this repo)
+## References
 
-- RNA: `data/endothelial/processed/combined_RNA_qc_<15%mito.h5ad` (cells=4735, genes=17351)
-- ATAC: `data/endothelial/processed/combined_ATAC_qc_<15%mito.h5ad` (cells=4735, peaks=396920)
+- Primary study: _Hematopoietic cells emerging from hemogenic endothelium exhibit lineage-specific oxidative stress responses_.
+- GEO accession: [GSE270141](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE270141).

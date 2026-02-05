@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gzip
+import re
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,13 +133,14 @@ def _compute_gene_features_all_cells(
 @dataclass
 class CellwiseDataset:
     genes: List[GeneInfo]
-    X: np.ndarray
+    X: np.ndarray | sp.spmatrix
     y: np.ndarray
     cell_ids: np.ndarray
     feature_names: List[str]
     group_labels: np.ndarray
     prepared_cache: Dict[str, object] = field(default_factory=dict, repr=False)
     feature_block_slices: List[Tuple[int, int]] = field(default_factory=list)
+    feature_block_indices: List[np.ndarray] = field(default_factory=list)
 
     def num_cells(self) -> int:
         return int(self.X.shape[0])
@@ -275,6 +277,8 @@ class PeakIndexer:
             self.matrix = np.asarray(matrix, dtype=np.float32)
         self.n_cells = atac.n_obs
         self.peak_ids = np.asarray(var_df.index).astype(str)
+        self.n_peaks = int(self.peak_ids.shape[0])
+
 
     def get_peaks_in_window(self, chrom: str, start: int, end: int) -> Tuple[np.ndarray, np.ndarray]:
         midpoints = self.chrom_to_midpoints.get(chrom)
@@ -341,6 +345,28 @@ def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_
         target_genes_norm = {_strip_gene_version(g) for g in gene_names}
         target_genes_lower = {g.lower() for g in gene_names}
         target_genes_lower_norm = {g.lower() for g in target_genes_norm}
+        # Heuristic species hinting to catch human/mouse mismatches early.
+        ensg_count = sum(1 for g in gene_names if g.upper().startswith("ENSG"))
+        ensm_count = sum(1 for g in gene_names if g.upper().startswith("ENSMUSG"))
+        mouse_like = sum(1 for g in gene_names if _is_mouse_like(g))
+        total = max(len(gene_names), 1)
+        stem = gtf_path.name.lower()
+        gtf_human = any(token in stem for token in ("gencode.v", "grch", "hg", "gcf_000001405", "gcf_000001635"))
+        gtf_mouse = any(token in stem for token in ("gencode.vm", "grcm", "mm", "gcf_000001635."))
+        if (ensm_count / total) > 0.2 or (mouse_like / total) > 0.2:
+            if gtf_human and not gtf_mouse:
+                _LOG.warning(
+                    "Gene manifest looks mouse-like (ENSMUSG/Gm/Olfr/Rik). "
+                    "GTF file name looks human: %s. This may cause missing genes.",
+                    gtf_path.name,
+                )
+        if (ensg_count / total) > 0.2:
+            if gtf_mouse and not gtf_human:
+                _LOG.warning(
+                    "Gene manifest looks human-like (ENSG). "
+                    "GTF file name looks mouse: %s. This may cause missing genes.",
+                    gtf_path.name,
+                )
     else:
         target_genes = None
         target_genes_norm = set()
@@ -433,6 +459,122 @@ def _resolve_gene_index(name_to_idx: Dict[str, int], gene: GeneInfo) -> Optional
     if idx is not None:
         return idx
     return name_to_idx.get(gene.gene_id)
+
+
+def _gene_window_peak_indices(
+    gene: GeneInfo,
+    peak_indexer: PeakIndexer,
+    training: TrainingConfig,
+) -> np.ndarray:
+    start = gene.tss - training.window_bp
+    end = gene.tss + training.window_bp
+    indices, _ = peak_indexer.get_peaks_in_window(gene.chrom, start, end)
+    return indices
+
+
+def _map_indices_to_union(idxs: np.ndarray, union_indices: np.ndarray) -> np.ndarray:
+    """Map indices into their positions within a sorted union array.
+
+    Returns an array of the same shape as ``idxs`` where missing entries are
+    encoded as -1.
+    """
+    if idxs.size == 0:
+        return np.array([], dtype=np.int64)
+    positions = np.searchsorted(union_indices, idxs)
+    valid = (positions < union_indices.size) & (union_indices[positions] == idxs)
+    mapped = np.full(idxs.shape, -1, dtype=np.int64)
+    mapped[valid] = positions[valid]
+    return mapped
+
+
+def _build_shared_peak_matrix(
+    genes: List[GeneInfo],
+    peak_indexer: PeakIndexer,
+    training: TrainingConfig,
+) -> tuple[np.ndarray | sp.spmatrix, List[str], List[np.ndarray]]:
+    selected_genes: List[GeneInfo] = []
+    per_gene_peak_indices: List[np.ndarray] = []
+    for gene in genes:
+        peak_indices = _gene_window_peak_indices(gene, peak_indexer, training)
+        per_gene_peak_indices.append(peak_indices)
+
+    if not per_gene_peak_indices:
+        raise ValueError("No peak windows constructed for shared peak matrix")
+
+    union_peak_indices = np.unique(np.concatenate(per_gene_peak_indices))
+    if union_peak_indices.size == 0:
+        raise ValueError("No shared peaks found across selected genes")
+
+    # Map global peak indices to positions within the union of peaks.
+    # A value of -1 denotes peaks that are not present in the union set
+    # (i.e., no corresponding shared feature).
+    # Use a vectorized lookup based on the fact that ``union_peak_indices``
+    # is sorted (as returned by ``np.unique``), avoiding per-element Python
+    # loops for better performance when idxs is large.
+
+    feature_block_indices = [
+        _map_indices_to_union(idxs, union_peak_indices) for idxs in per_gene_peak_indices
+    ]
+    shared_matrix = peak_indexer.matrix[:, union_peak_indices]
+    if sp.issparse(shared_matrix):
+        shared_matrix = shared_matrix.tocsr()
+    else:
+        shared_matrix = np.asarray(shared_matrix, dtype=np.float32)
+
+    feature_names = list(peak_indexer.peak_ids[union_peak_indices])
+    return shared_matrix, feature_names, feature_block_indices
+
+
+def _build_shared_bin_matrix(
+    genes: List[GeneInfo],
+    peak_indexer: PeakIndexer,
+    training: TrainingConfig,
+) -> tuple[np.ndarray, List[str], List[np.ndarray]]:
+    bin_map: Dict[Tuple[str, int, int], int] = {}
+    bin_records: List[Tuple[str, int, int]] = []
+    feature_block_indices: List[np.ndarray] = []
+
+    for gene in genes:
+        start = gene.tss - training.window_bp
+        end = gene.tss + training.window_bp
+        num_bins = int(np.ceil((end - start) / training.bin_size_bp))
+        if num_bins <= 0:
+            raise ValueError("Invalid bin configuration")
+        bin_starts = start + np.arange(num_bins, dtype=np.int64) * training.bin_size_bp
+        bin_ends = bin_starts + training.bin_size_bp
+
+        indices: List[int] = []
+        for bstart, bend in zip(bin_starts, bin_ends):
+            key = (gene.chrom, int(bstart), int(bend))
+            idx = bin_map.get(key)
+            if idx is None:
+                idx = len(bin_records)
+                bin_map[key] = idx
+                bin_records.append(key)
+            indices.append(idx)
+
+        if gene.strand == "-":
+            indices = list(reversed(indices))
+        feature_block_indices.append(np.asarray(indices, dtype=np.int64))
+
+    if not bin_records:
+        raise ValueError("No bins constructed for shared bin matrix")
+
+    X = np.zeros((peak_indexer.n_cells, len(bin_records)), dtype=np.float32)
+    for col_idx, (chrom, start, end) in enumerate(bin_records):
+        indices, _ = peak_indexer.get_peaks_in_window(chrom, start, end)
+        if indices.size == 0:
+            continue
+        matrix = peak_indexer.matrix[:, indices]
+        if sp.issparse(matrix):
+            matrix = matrix.tocsc()
+            summed = np.asarray(matrix.sum(axis=1)).ravel()
+        else:
+            summed = np.sum(matrix, axis=1)
+        X[:, col_idx] = summed
+
+    feature_names = [f"{chrom}:{start}-{end}" for chrom, start, end in bin_records]
+    return X, feature_names, feature_block_indices
 
 
 def build_gene_dataset(
@@ -623,12 +765,8 @@ def build_cellwise_dataset(
         expression_matrix = rna.X
         already_logged = False
 
-    feature_blocks: List[np.ndarray] = []
     target_blocks: List[np.ndarray] = []
     selected_genes: List[GeneInfo] = []
-    feature_names: List[str] = []
-    block_slices: List[Tuple[int, int]] = []
-    offset = 0
 
     for gene in genes:
         gene_idx = _resolve_gene_index(name_to_idx, gene)
@@ -660,39 +798,36 @@ def build_cellwise_dataset(
             )
             continue
 
-        features, bin_names = _compute_gene_features_all_cells(
-            gene,
-            peak_indexer,
-            training,
-        )
-        if features.size == 0:
-            _LOG.warning("Gene %s produced empty feature block; skipping", gene.gene_name)
-            continue
-
-        feature_blocks.append(features.astype(np.float32))
         target_blocks.append(y.astype(np.float32))
         selected_genes.append(gene)
-        feature_names.extend([f"{gene.gene_name}|{bn}" for bn in bin_names])
-        block_slices.append((offset, offset + features.shape[1]))
-        offset += features.shape[1]
 
     if not selected_genes:
         raise ValueError("No genes satisfied inclusion criteria for cell-wise dataset")
-
-    if not feature_blocks:
-        raise ValueError("No feature blocks constructed for cell-wise dataset")
-
-    X = _safe_concat(feature_blocks, axis=1)
     Y = _safe_stack(target_blocks, axis=1)
+
+    basis = training.multioutput_feature_basis
+    if basis == "peak":
+        shared_matrix, feature_names, feature_block_indices = _build_shared_peak_matrix(
+            selected_genes,
+            peak_indexer,
+            training,
+        )
+    else:
+        shared_matrix, feature_names, feature_block_indices = _build_shared_bin_matrix(
+            selected_genes,
+            peak_indexer,
+            training,
+        )
 
     return CellwiseDataset(
         genes=selected_genes,
-        X=X,
+        X=shared_matrix,
         y=Y,
         cell_ids=cell_ids,
         feature_names=feature_names,
         group_labels=group_labels,
-        feature_block_slices=block_slices,
+        feature_block_slices=[],
+        feature_block_indices=feature_block_indices,
     )
 
 
@@ -709,43 +844,37 @@ def build_cellwise_features_only(
 
     cell_ids = np.asarray(atac.obs_names).astype(str)
     group_labels = np.asarray(cell_ids)
-    feature_blocks: List[np.ndarray] = []
     selected_genes: List[GeneInfo] = []
-    feature_names: List[str] = []
-    block_slices: List[Tuple[int, int]] = []
-    offset = 0
 
     for gene in genes:
-        features, bin_names = _compute_gene_features_all_cells(
-            gene,
-            peak_indexer,
-            training,
-        )
-        if features.size == 0:
-            _LOG.warning("Gene %s produced empty feature block; skipping", gene.gene_name)
-            continue
-
-        feature_blocks.append(features.astype(np.float32))
         selected_genes.append(gene)
-        feature_names.extend([f"{gene.gene_name}|{bn}" for bn in bin_names])
-        block_slices.append((offset, offset + features.shape[1]))
-        offset += features.shape[1]
 
     if not selected_genes:
         raise ValueError("No genes produced usable feature blocks for inference")
-    if not feature_blocks:
-        raise ValueError("No feature blocks constructed for inference")
 
-    X = _safe_concat(feature_blocks, axis=1)
+    basis = training.multioutput_feature_basis
+    if basis == "peak":
+        shared_matrix, feature_names, feature_block_indices = _build_shared_peak_matrix(
+            selected_genes,
+            peak_indexer,
+            training,
+        )
+    else:
+        shared_matrix, feature_names, feature_block_indices = _build_shared_bin_matrix(
+            selected_genes,
+            peak_indexer,
+            training,
+        )
 
     return CellwiseDataset(
         genes=selected_genes,
-        X=X,
-        y=np.empty((X.shape[0], 0), dtype=np.float32),
+        X=shared_matrix,
+        y=np.empty((shared_matrix.shape[0], 0), dtype=np.float32),
         cell_ids=cell_ids,
         feature_names=feature_names,
         group_labels=group_labels,
-        feature_block_slices=block_slices,
+        feature_block_slices=[],
+        feature_block_indices=feature_block_indices,
     )
 def _safe_concat(arrays: Sequence[np.ndarray], axis: int = 0) -> np.ndarray:
     try:
@@ -852,6 +981,12 @@ def _normalize_chrom_name(name: str) -> str:
         return mapped
 
     return raw
+
+
+def _is_mouse_like(name: str) -> bool:
+    if not name:
+        return False
+    return bool(re.match(r"^(Gm\d+|[0-9]+Rik)$", name)) or name.startswith("Olfr")
 
 
 def _parse_gtf_attributes(attributes: str) -> Dict[str, str]:

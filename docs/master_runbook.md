@@ -1,8 +1,23 @@
 # SPEAR End-to-End Runbook (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts)
 
+## Overview
+
 This runbook connects the biological motivation for the mouse embryonic stem cell (mESC) project with the computational workflow implemented in the SPEAR repository. Follow the stages in order when onboarding a new environment, reproducing results, or preparing a public release.
 
-## Orientation
+## Inputs
+
+- SPEAR repository checkout.
+- Access to GEO data referenced in dataset docs.
+- Python 3.10+ environment with project dependencies.
+
+## Outputs
+
+- Model checkpoints, metrics, summaries, and figures under `output/` and `analysis/figs`.
+- Log files under `output/logs`.
+
+## Usage
+
+### Orientation
 
 - Scope: infer gene regulatory networks from paired single-cell RNA-seq and ATAC-seq across E7.5 to E8.75 mouse embryogenesis with CRISPR controls.
 - Target users: computational biologists operating on the Penn State College of Medicine HPC cluster (Slurm) or a comparable environment.
@@ -26,7 +41,7 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 - Gene manifests live under `data/embryonic/manifests/` and define target scopes for each run.
 - Reference annotations are kept in `data/references/`.
 
-## Stage 1 - Bootstrap Environment
+### Stage 1 - Bootstrap Environment
 
 ### Stage 1 - Practical steps
 
@@ -45,7 +60,7 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 - Stable environments reduce the risk of numerical drift in downstream metrics, allowing direct biological comparisons with published results.
 - Maintaining the same dependency stack as the original analysis preserves behavior of preprocessing routines that enforce biologically motivated QC filters.
 
-## Stage 2 - Acquire and Stage Data
+### Stage 2 - Acquire and Stage Data
 
 ### Stage 2 - Practical steps
 
@@ -65,7 +80,7 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 - Confirming each replicate directory contains both RNA and ATAC modalities preserves the paired design necessary for integrative inference.
 - Refreshing processed matrices after raw updates avoids mixing batches generated with different cell filters or peak calling parameters.
 
-## Stage 3 - Understand Configuration Surface
+### Stage 3 - Understand Configuration Surface
 
 ### Stage 3 - Practical steps
 
@@ -84,11 +99,11 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 - Deciding on gene subsets (pan-cellular vs lineage-specific) and genomic windows frames the biological hypotheses each run can test.
 - Clarifying perturbation cohorts (wild-type vs CRISPR) ahead of time ensures downstream comparisons remain interpretable.
 
-## Stage 4 - Internalize Pipeline Architecture
+### Stage 4 - Internalize Pipeline Architecture
 
 Refer to the "Preprocessing Details", "Supported Models", and "Results & Visualization" sections in `README.md` for the pipeline walkthrough. This runbook stays focused on operational steps and release prep.
 
-## Stage 5 - Prime Output and Metadata Directories
+### Stage 5 - Prime Output and Metadata Directories
 
 ### Stage 5 - Practical steps
 
@@ -106,7 +121,7 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 - Organized outputs streamline later aggregation into figures and tables for manuscripts.
 - Maintaining log lineage enables provenance tracking when reported biological insights rely on specific training runs.
 
-## Stage 6 - Run Local Smoke Tests
+### Stage 6 - Run Local Smoke Tests
 
 ### Stage 6 - Practical steps
 
@@ -124,7 +139,7 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 
 - Even miniature runs validate that cell metadata lines up with gene manifests (e.g., no empty matrices), avoiding biological misinterpretations later.
 
-## Stage 7 - Submit Cluster Jobs
+### Stage 7 - Submit Cluster Jobs
 
 ### Stage 7 - Practical steps
 
@@ -140,7 +155,7 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 - Running diverse model classes provides complementary evidence of regulatory influence (e.g., nonlinear vs linear importance patterns).
 - Pairing runs with specific manifests (e.g., endothelial vs global genes) focuses the analysis on biologically coherent questions.
 
-## Stage 8 - Monitor Execution and Validate Intermediate Outputs
+### Stage 8 - Monitor Execution and Validate Intermediate Outputs
 
 ### Stage 8 - Practical steps
 
@@ -158,7 +173,7 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 
 - Mid-run checks verify that metrics fall within expected biological ranges (e.g., correlation coefficients not trivially zero), preventing wasted compute on pathological settings.
 
-## Stage 9 - Aggregate, Interpret, and Visualize
+### Stage 9 - Aggregate, Interpret, and Visualize
 
 ### Stage 9 - Practical steps
 
@@ -176,7 +191,7 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 - Examine whether top regulatory features align with known developmental regulators, CRISPR perturbation expectations, or spatial gradients.
 - Compare accessibility-weighted features against gene expression shifts to propose mechanistic hypotheses.
 
-## Stage 10 - Ensure Reproducibility and Prepare for Release
+### Stage 10 - Ensure Reproducibility and Prepare for Release
 
 ### Stage 10 - Practical steps
 
@@ -195,7 +210,7 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 - Contextual notes describing biological interpretation, quality thresholds, and open questions transform raw metrics into actionable insights for collaborators.
 - Proper provenance documentation supports peer review, future integrative analyses, and compliance with data-sharing policies.
 
-## Additional References
+## References
 
 - Dataset specifics and download automation: `docs/mouse_esc_dataset.md`, `docs/endothelial_dataset.md`
 - Configuration dictionary: `docs/config_reference.md`

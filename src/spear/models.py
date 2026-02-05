@@ -64,6 +64,10 @@ class TorchModelBundle:
     reshape: str = "flat"  # "flat" or "sequence"
 
 
+def _target_segments(input_dim: int, *, divisor: int, min_segments: int = 8, max_segments: int = 128) -> int:
+    return max(min_segments, min(max_segments, max(1, input_dim // divisor)))
+
+
 class CNNRegressor(nn.Module):
     """1D Convolutional Neural Network for feature extraction and regression.
     
@@ -86,7 +90,7 @@ class CNNRegressor(nn.Module):
     
     def __init__(self, input_dim: int, output_dim: int = 1):
         super().__init__()
-        target_segments = max(8, min(128, max(1, input_dim // 32)))
+        target_segments = _target_segments(input_dim, divisor=32)
         self.backbone = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, stride=4, padding=3),
             nn.BatchNorm1d(32),
@@ -112,6 +116,106 @@ class CNNRegressor(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         x = self.backbone(x)
+        x = self.pool(x)
+        return self.head(x)
+
+
+class ResNetBlock1D(nn.Module):
+    """Basic residual block for 1D convolutions."""
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
+        else:
+            self.downsample = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = out + self.downsample(x)
+        return F.relu(out)
+
+
+class ResNet1DRegressor(nn.Module):
+    """ResNet-style 1D CNN for ATAC feature regression.
+
+    Architecture:
+        - Strided conv stem + max pool for downsampling
+        - 3 residual stages (channels 32 → 64 → 128) with 2 blocks each
+        - Adaptive pooling to fixed segment count for stable dense head
+        - Dense head (256 → output_dim) with dropout
+
+    Input: (batch, input_dim) or (batch, 1, input_dim) → sequence format
+    Output: (batch, output_dim) predictions
+    """
+
+    def __init__(self, input_dim: int, output_dim: int = 1) -> None:
+        super().__init__()
+        # Heuristic for the number of pooled segments used by the dense head:
+        # - CNNRegressor has total stride 4*4*2 = 32; this ResNet has stride
+        #   4 (stem) * 2 (maxpool) * 2 (layer2) * 2 (layer3) = 32 as well.
+        # - We still use input_dim // 64 (vs. // 32 in CNNRegressor) to halve the
+        #   segment count and keep the 128 * target_segments head size in check
+        #   given the deeper residual stack.
+        # - Clamp the segment count to [8, 128] to keep the representation
+        #   expressive but memory-efficient.
+        target_segments = _target_segments(input_dim, divisor=64)
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
+        )
+        self.layer1 = self._make_layer(32, 32, blocks=2, stride=1)
+        self.layer2 = self._make_layer(32, 64, blocks=2, stride=2)
+        self.layer3 = self._make_layer(64, 128, blocks=2, stride=2)
+        self.pool = nn.AdaptiveAvgPool1d(target_segments)
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * target_segments, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, output_dim),
+        )
+
+    def _make_layer(self, in_channels: int, out_channels: int, *, blocks: int, stride: int) -> nn.Sequential:
+        layers = [ResNetBlock1D(in_channels, out_channels, stride=stride)]
+        for _ in range(1, blocks):
+            layers.append(ResNetBlock1D(out_channels, out_channels, stride=1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
         x = self.pool(x)
         return self.head(x)
 
@@ -439,6 +543,8 @@ def build_model(
     name = name.lower()
     if name == "cnn":
         return TorchModelBundle(CNNRegressor(input_dim, output_dim=output_dim))
+    if name == "resnet":
+        return TorchModelBundle(ResNet1DRegressor(input_dim, output_dim=output_dim))
     if name == "rnn":
         return TorchModelBundle(RNNRegressor(input_dim, output_dim=output_dim), reshape="sequence")
     if name == "lstm":

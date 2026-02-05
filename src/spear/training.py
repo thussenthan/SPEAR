@@ -3,15 +3,17 @@ import hashlib
 import json
 import logging
 import random
+import threading
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import contextlib
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 from sklearn.base import clone
 from sklearn.decomposition import PCA
@@ -22,9 +24,17 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .config import TrainingConfig
+from .data import GeneInfo
 from .metrics import regression_metrics
 from .models import TorchModelBundle, build_model
-from .logging_utils import get_logger
+from .logging_utils import get_logger, _get_gpu_utilization_percent
+from .cache import (
+    save_prepared_data,
+    load_prepared_data,
+    save_prepared_cellwise_data,
+    load_prepared_cellwise_data,
+)
+from .data_types import PreparedData, PreparedCellwiseData, SplitData, CellwiseSplitData
 
 # Suppress specific warnings that are informational only
 warnings.filterwarnings('ignore', message='.*CuDNN issue.*nvrtc.so.*', category=UserWarning)
@@ -42,6 +52,29 @@ _RESOURCE_TRACKER = {
 }
 
 
+def _get_gpu_utilization_pct(device_index: int = 0) -> Optional[float]:
+    """Return GPU utilization percentage if available.
+    
+    Queries GPU utilization via the thread-safe NVML interface from logging_utils.
+    Returns None if GPU is unavailable or utilization cannot be determined.
+    
+    Parameters
+    ----------
+    device_index : int
+        GPU device index (currently unused; utilization is averaged across all devices).
+        Included for API compatibility.
+    
+    Returns
+    -------
+    Optional[float]
+        GPU utilization as a percentage (0-100), or None if unavailable.
+    """
+    try:
+        return _get_gpu_utilization_percent()
+    except Exception:
+        return None
+
+
 def get_resource_summary() -> dict:
     """Return dictionary of peak resource values accumulated during the run."""
     return _RESOURCE_TRACKER.copy()
@@ -51,6 +84,11 @@ try:  # psutil is optional; best-effort resource visibility
     import psutil  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     psutil = None
+
+try:  # optional GPU utilization reporting
+    import pynvml  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    pynvml = None
 
 try:  # torch.amp compatibility varies by version/installation
     from torch.cuda import amp as _cuda_amp  # type: ignore[attr-defined]
@@ -269,64 +307,6 @@ def _config_cache_key(config: TrainingConfig, scope: str) -> str:
 
 
 @dataclass
-class SplitData:
-    X_train: np.ndarray
-    X_val: np.ndarray
-    X_test: np.ndarray
-    y_train: np.ndarray
-    y_val: np.ndarray
-    y_test: np.ndarray
-    cell_ids_train: np.ndarray
-    cell_ids_val: np.ndarray
-    cell_ids_test: np.ndarray
-    group_labels_train: np.ndarray
-    group_labels_val: np.ndarray
-    group_labels_test: np.ndarray
-    X_train_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    X_val_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    X_test_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    y_train_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    y_val_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    y_test_raw: Optional[np.ndarray] = field(default=None, repr=False)
-
-
-@dataclass
-class PreparedData:
-    splits: SplitData
-    feature_scaler: Optional[StandardScaler | MinMaxScaler]
-    target_scaler: Optional[StandardScaler | MinMaxScaler]
-
-
-@dataclass
-class CellwiseSplitData:
-    X_train: np.ndarray
-    X_val: np.ndarray
-    X_test: np.ndarray
-    y_train: np.ndarray
-    y_val: np.ndarray
-    y_test: np.ndarray
-    cell_ids_train: np.ndarray
-    cell_ids_val: np.ndarray
-    cell_ids_test: np.ndarray
-    group_labels_train: np.ndarray
-    group_labels_val: np.ndarray
-    group_labels_test: np.ndarray
-    X_train_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    X_val_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    X_test_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    y_train_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    y_val_raw: Optional[np.ndarray] = field(default=None, repr=False)
-    y_test_raw: Optional[np.ndarray] = field(default=None, repr=False)
-
-
-@dataclass
-class PreparedCellwiseData:
-    splits: CellwiseSplitData
-    feature_scaler: Optional[StandardScaler | MinMaxScaler]
-    target_scaler: Optional[StandardScaler | MinMaxScaler]
-
-
-@dataclass
 class FoldMetrics:
     fold: int
     metrics: Dict[str, float]
@@ -334,6 +314,30 @@ class FoldMetrics:
 
 @dataclass
 class ModelResult:
+    """
+    Results of a per-gene model trained for a single gene.
+
+    Attributes
+    ----------
+    gene_name
+        Gene identifier (e.g., gene symbol or ID).
+    model_name
+        Name of the model used.
+    cv_metrics
+        Cross-validation metrics across folds.
+    train_metrics
+        Training set performance metrics.
+    val_metrics
+        Validation set performance metrics.
+    test_metrics
+        Test set performance metrics.
+    predictions
+        Structured array containing predictions and ground truth values.
+    fitted_model
+        The fitted model object (optional).
+    history
+        Training history records (optional).
+    """
     gene_name: str
     model_name: str
     cv_metrics: List[FoldMetrics]
@@ -349,6 +353,7 @@ class ModelResult:
 class CellwiseModelResult:
     model_name: str
     gene_names: List[str]
+    gene_infos: Optional[List[GeneInfo]]
     cv_metrics: List[FoldMetrics]
     aggregate_metrics: Dict[str, Dict[str, float]]
     per_gene_metrics: Dict[str, List[Dict[str, float]]]
@@ -361,17 +366,30 @@ class CellwiseModelResult:
     shap_importances_mean: Optional[np.ndarray] = None
     shap_importance_method: Optional[str] = None
     feature_block_slices: Optional[List[Tuple[int, int]]] = None
+    feature_block_indices: Optional[List[np.ndarray]] = None
     feature_scaler: Optional[StandardScaler | MinMaxScaler] = None
     target_scaler: Optional[StandardScaler | MinMaxScaler] = None
     reshape: Optional[str] = None
 
 
-def prepare_data(dataset, config: TrainingConfig) -> PreparedData:
+def prepare_data(dataset, config: TrainingConfig, cache_dir: Optional[Path] = None) -> PreparedData:
     cache_key = _config_cache_key(config, "gene")
-    cache_dict = dataset.prepared_cache
+    cache_dict = getattr(dataset, "prepared_cache", {})
+    if cache_dict is None:
+        cache_dict = {}
+        setattr(dataset, "prepared_cache", cache_dict)
 
+    # Try in-memory cache first
     if cache_key in cache_dict:
         return cache_dict[cache_key]  # type: ignore[return-value]
+    
+    # Try disk cache if directory provided
+    if cache_dir is not None:
+        disk_cached = load_prepared_data(cache_dir, cache_key)
+        if disk_cached is not None:
+            # Restore to in-memory cache too
+            cache_dict[cache_key] = disk_cached
+            return disk_cached
 
     _seed_everything(config.random_state)
 
@@ -601,10 +619,62 @@ def prepare_data(dataset, config: TrainingConfig) -> PreparedData:
         time.perf_counter() - _prep_start,
     )
     _log_resource_snapshot("prepare_data:end")
-    return PreparedData(splits=splits, feature_scaler=feature_scaler, target_scaler=target_scaler)
+    
+    prepared_data = PreparedData(splits=splits, feature_scaler=feature_scaler, target_scaler=target_scaler)
+    
+    # Save to disk cache if directory provided
+    if cache_dir is not None:
+        try:
+            save_prepared_data(prepared_data, cache_dir, cache_key)
+        except Exception as exc:
+            _LOG.warning("Failed to save prepared data to disk cache: %s", exc)
+    
+    cache_dict[cache_key] = prepared_data
+    return prepared_data
 
 
-def prepare_cellwise_data(dataset, config: TrainingConfig) -> PreparedCellwiseData:
+def _cellwise_cache_key(dataset, config: TrainingConfig) -> str:
+    cache_key = _config_cache_key(config, "cellwise")
+    # Make cache dataset-specific to avoid collisions across datasets with same config.
+    try:
+        sig = f"{dataset.X.shape}-{dataset.y.shape}"
+    except Exception:
+        # Fallback: build a stable identifier from common dataset attributes (if available)
+        parts = []
+        for attr in ("name", "id", "path", "file_path", "filename"):
+            if hasattr(dataset, attr):
+                try:
+                    value = getattr(dataset, attr)
+                except Exception:
+                    continue
+                parts.append(f"{attr}={value}")
+        if parts:
+            sig = "|".join(parts)
+        else:
+            # Last-resort: fall back to the dataset's type name, which is stable across runs
+            sig = f"unknown-{type(dataset).__name__}"
+    return f"{cache_key}_{hashlib.sha256(sig.encode('utf-8')).hexdigest()}"
+
+
+def prepare_cellwise_data(dataset, config: TrainingConfig, cache_dir: Optional[Path] = None) -> PreparedCellwiseData:
+    cache_key = _cellwise_cache_key(dataset, config)
+    cache_dict = getattr(dataset, "prepared_cache", {})
+    if cache_dict is None:
+        cache_dict = {}
+        setattr(dataset, "prepared_cache", cache_dict)
+    
+    # Try in-memory cache first
+    if cache_key in cache_dict:
+        return cache_dict[cache_key]  # type: ignore[return-value]
+    
+    # Try disk cache if directory provided
+    if cache_dir is not None:
+        disk_cached = load_prepared_cellwise_data(cache_dir, cache_key)
+        if disk_cached is not None:
+            # Restore to in-memory cache too
+            cache_dict[cache_key] = disk_cached
+            return disk_cached
+    
     _LOG.info(
         "Preparing cell-wise data | cells=%d | features=%d | targets=%d",
         dataset.X.shape[0],
@@ -614,7 +684,41 @@ def prepare_cellwise_data(dataset, config: TrainingConfig) -> PreparedCellwiseDa
     _log_resource_snapshot("prepare_cellwise_data:start")
     _cellwise_prep_start = time.perf_counter()
 
-    X = dataset.X.astype(np.float32)
+    X = dataset.X
+    force_dense = getattr(config, "force_dense_features", True)
+    needs_dense = bool(config.enable_smoothing and config.smoothing_k > 1) or config.pseudobulk_group_size > 1
+    if sp.issparse(X) and not force_dense and needs_dense:
+        _LOG.warning(
+            "Sparse features with smoothing/pseudobulk require dense arrays; forcing densification."
+        )
+        force_dense = True
+    if sp.issparse(X) and not force_dense and config.scaler == "minmax":
+        _LOG.warning("MinMax scaling does not support sparse inputs; forcing densification.")
+        force_dense = True
+    # NOTE: Cell-wise training typically expects dense features for downstream scaling/modeling.
+    # For large sparse ATAC matrices, this conversion can be memory intensive; keep sparse
+    # if allowed by config to avoid OOMs.
+    if sp.issparse(X):
+        if force_dense:
+            # Estimate memory usage of dense float32 matrix before densification.
+            n_rows, n_cols = X.shape
+            # float32 uses 4 bytes per element.
+            estimated_bytes = int(n_rows) * int(n_cols) * 4
+            # Warn if the estimated size is larger than 1 GiB.
+            one_gib = 1024 ** 3
+            if estimated_bytes > one_gib:
+                _LOG.warning(
+                    "Converting sparse matrix to dense may require approximately %.2f GiB of memory "
+                    "(shape=%d x %d). This may lead to out-of-memory errors.",
+                    estimated_bytes / one_gib,
+                    n_rows,
+                    n_cols,
+                )
+            X = X.toarray().astype(np.float32)
+        else:
+            X = X.astype(np.float32)
+    else:
+        X = np.asarray(X, dtype=np.float32)
     Y = dataset.y.astype(np.float32)
     cells = dataset.cell_ids
     groups = getattr(dataset, "group_labels", None)
@@ -763,7 +867,7 @@ def prepare_cellwise_data(dataset, config: TrainingConfig) -> PreparedCellwiseDa
 
     feature_scaler: Optional[StandardScaler | MinMaxScaler]
     if config.scaler == "standard":
-        feature_scaler = StandardScaler()
+        feature_scaler = StandardScaler(with_mean=not sp.issparse(X_train))
     elif config.scaler == "minmax":
         feature_scaler = MinMaxScaler()
     else:
@@ -828,7 +932,18 @@ def prepare_cellwise_data(dataset, config: TrainingConfig) -> PreparedCellwiseDa
         time.perf_counter() - _cellwise_prep_start,
     )
     _log_resource_snapshot("prepare_cellwise_data:end")
-    return PreparedCellwiseData(splits=splits, feature_scaler=feature_scaler, target_scaler=target_scaler)
+    
+    prepared_cellwise = PreparedCellwiseData(splits=splits, feature_scaler=feature_scaler, target_scaler=target_scaler)
+    
+    # Save to disk cache if directory provided
+    if cache_dir is not None:
+        try:
+            save_prepared_cellwise_data(prepared_cellwise, cache_dir, cache_key)
+        except Exception as exc:
+            _LOG.warning("Failed to save prepared cell-wise data to disk cache: %s", exc)
+    
+    cache_dict[cache_key] = prepared_cellwise
+    return prepared_cellwise
 
 
 def train_model_for_gene(
@@ -836,19 +951,22 @@ def train_model_for_gene(
     model_name: str,
     config: TrainingConfig,
     artifacts_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
 ) -> ModelResult:
     _seed_everything(config.random_state)
     cache_key = _config_cache_key(config, scope="gene")
-    cache_dict = getattr(dataset, "prepared_cache", None)
+    cache_dict = getattr(dataset, "prepared_cache", {})
+    if cache_dict is None:
+        cache_dict = {}
+        setattr(dataset, "prepared_cache", cache_dict)
     prepared: PreparedData
-    if isinstance(cache_dict, dict) and cache_key in cache_dict:
+    if cache_key in cache_dict:
         prepared = cache_dict[cache_key]  # type: ignore[assignment]
         if hasattr(dataset, "gene"):
             _LOG.info("Reusing cached prepared data for gene %s", getattr(dataset.gene, "gene_name", "unknown"))
     else:
-        prepared = prepare_data(dataset, config)
-        if isinstance(cache_dict, dict):
-            cache_dict[cache_key] = prepared
+        prepared = prepare_data(dataset, config, cache_dir=cache_dir)
+        cache_dict[cache_key] = prepared
     splits = prepared.splits
 
     cv_groups = np.asarray(splits.group_labels_train)
@@ -1239,21 +1357,24 @@ def train_multi_output_model(
     model_name: str,
     config: TrainingConfig,
     artifacts_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
 ) -> CellwiseModelResult:
     _seed_everything(config.random_state)
-    cache_key = _config_cache_key(config, scope="cellwise")
-    cache_dict = getattr(dataset, "prepared_cache", None)
+    cache_key = _cellwise_cache_key(dataset, config)
+    cache_dict = getattr(dataset, "prepared_cache", {})
+    if cache_dict is None:
+        cache_dict = {}
+        setattr(dataset, "prepared_cache", cache_dict)
     prepared: PreparedCellwiseData
-    if isinstance(cache_dict, dict) and cache_key in cache_dict:
+    if cache_key in cache_dict:
         prepared = cache_dict[cache_key]  # type: ignore[assignment]
         _LOG.info(
             "Reusing cached prepared cell-wise data for %d genes",
             len(getattr(dataset, "genes", [])),
         )
     else:
-        prepared = prepare_cellwise_data(dataset, config)
-        if isinstance(cache_dict, dict):
-            cache_dict[cache_key] = prepared
+        prepared = prepare_cellwise_data(dataset, config, cache_dir=cache_dir)
+        cache_dict[cache_key] = prepared
     splits = prepared.splits
     gene_names = [gene.gene_name for gene in dataset.genes]
     target_dim = dataset.y.shape[1]
@@ -1507,6 +1628,7 @@ def train_multi_output_model(
     return CellwiseModelResult(
         model_name=model_name,
         gene_names=gene_names,
+        gene_infos=list(getattr(dataset, "genes", [])),
         cv_metrics=cv_metrics,
         aggregate_metrics=aggregate_metrics,
         per_gene_metrics=per_gene_metrics,
@@ -1519,6 +1641,7 @@ def train_multi_output_model(
         shap_importances_mean=shap_importances_mean,
         shap_importance_method=shap_importance_method,
         feature_block_slices=getattr(dataset, "feature_block_slices", None),
+        feature_block_indices=getattr(dataset, "feature_block_indices", None),
         feature_scaler=prepared.feature_scaler,
         target_scaler=prepared.target_scaler,
         reshape=model.reshape if isinstance(model, TorchModelBundle) else None,
@@ -1568,6 +1691,13 @@ def _fit_torch_model(
     best_val = float("inf")
     patience = config.early_stopping_patience
     epochs_no_improve = 0
+    process: Optional[Any] = None
+    if track_history and psutil is not None:
+        process = psutil.Process()
+        try:
+            process.cpu_percent(interval=None)
+        except Exception:  # pragma: no cover - psutil quirks
+            process = None
 
     def _collect_predictions(loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
         preds: List[np.ndarray] = []
@@ -1623,6 +1753,8 @@ def _fit_torch_model(
     _log_gpu_memory_snapshot("Before training start")
 
     for epoch in range(config.epochs):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         model.train()
         train_loss_accum = 0.0
         train_samples = 0
@@ -1666,6 +1798,10 @@ def _fit_torch_model(
             if epochs_no_improve >= patience:
                 should_stop = True
 
+        gpu_util_pct = None
+        if device.type == "cuda":
+            gpu_util_pct = _get_gpu_utilization_pct()
+
         if track_history:
             train_loss_mean = train_loss_accum / max(train_samples, 1)
             train_pred_scaled, train_true_scaled = _collect_predictions(train_eval_loader)  # type: ignore[arg-type]
@@ -1682,7 +1818,28 @@ def _fit_torch_model(
                 "epoch": float(epoch + 1),
                 "train_loss": float(train_loss_mean),
                 "val_loss": float(mean_val),
+                "effective_batch_size": float(batch_size),
             }
+            if process is not None:
+                try:
+                    entry["cpu_percent"] = float(process.cpu_percent(interval=None))
+                except Exception:
+                    pass
+                try:
+                    if "gpu_util_pct" in locals() and gpu_util_pct is not None:
+                        entry["rss_gib"] = float(torch.cuda.memory_allocated()) / (1024 ** 3)
+                except Exception:
+                    pass
+                try:
+                    entry["thread_count"] = float(process.num_threads())
+                except Exception:
+                    pass
+            if device.type == "cuda":
+                entry["gpu_alloc_mb"] = float(torch.cuda.memory_allocated() / (1024 ** 2))
+                entry["gpu_reserved_mb"] = float(torch.cuda.memory_reserved() / (1024 ** 2))
+                entry["gpu_peak_alloc_mb"] = float(torch.cuda.max_memory_allocated() / (1024 ** 2))
+                if gpu_util_pct is not None:
+                    entry["gpu_util_pct"] = float(gpu_util_pct)
             for metric_name in config.history_metrics:
                 key = metric_name.lower()
                 if key == "loss":
@@ -1695,14 +1852,19 @@ def _fit_torch_model(
                     entry[f"val_{key}"] = float(val_value)
             history.append(entry)
 
+        gpu_peak_mb = None
+        if device.type == "cuda":
+            gpu_peak_mb = float(torch.cuda.max_memory_allocated() / (1024 ** 2))
+
         if config.track_history and history:
             recent = history[-1]
             log_msg = (
-                "Epoch %d/%d | model=%s | train_loss=%.6f | val_loss=%.6f"
+                "Epoch %d/%d | model=%s | batch_size=%d | train_loss=%.6f | val_loss=%.6f"
                 % (
                     epoch + 1,
                     config.epochs,
                     type(model).__name__,
+                    batch_size,
                     recent.get("train_loss", float("nan")),
                     recent.get("val_loss", float("nan")),
                 )
@@ -1717,16 +1879,38 @@ def _fit_torch_model(
                     log_msg += f" | {train_key}={recent[train_key]:.4f}"
                 if val_key in recent:
                     log_msg += f" | {val_key}={recent[val_key]:.4f}"
+            if "cpu_percent" in recent:
+                log_msg += f" | cpu_pct={recent['cpu_percent']:.1f}"
+            if "rss_gib" in recent:
+                log_msg += f" | rss_gib={recent['rss_gib']:.2f}"
+            if "thread_count" in recent:
+                log_msg += f" | threads={recent['thread_count']:.0f}"
+            if "gpu_alloc_mb" in recent:
+                log_msg += f" | gpu_alloc_mb={recent['gpu_alloc_mb']:.0f}"
+            if "gpu_reserved_mb" in recent:
+                log_msg += f" | gpu_reserved_mb={recent['gpu_reserved_mb']:.0f}"
+            if gpu_peak_mb is not None:
+                log_msg += f" | gpu_peak_alloc_mb={gpu_peak_mb:.0f}"
+            if gpu_util_pct is not None:
+                log_msg += f" | gpu_util_pct={gpu_util_pct:.0f}"
             _LOG.info(log_msg)
         else:
-            _LOG.info(
-                "Epoch %d/%d | model=%s | train_loss=%.6f | val_loss=%.6f",
-                epoch + 1,
-                config.epochs,
-                type(model).__name__,
-                train_loss_accum / max(train_samples, 1),
-                mean_val,
+            log_msg = (
+                "Epoch %d/%d | model=%s | batch_size=%d | train_loss=%.6f | val_loss=%.6f"
+                % (
+                    epoch + 1,
+                    config.epochs,
+                    type(model).__name__,
+                    batch_size,
+                    train_loss_accum / max(train_samples, 1),
+                    mean_val,
+                )
             )
+            if gpu_peak_mb is not None:
+                log_msg += f" | gpu_peak_alloc_mb={gpu_peak_mb:.0f}"
+            if gpu_util_pct is not None:
+                log_msg += f" | gpu_util_pct={gpu_util_pct:.0f}"
+            _LOG.info(log_msg)
 
         if should_stop:
             break
@@ -1807,11 +1991,37 @@ def _select_device(device_preference: str) -> torch.device:
 
 
 def _effective_batch_size(config: TrainingConfig, target_dim: int) -> int:
+    """
+    Compute effective batch size, scaling down for multi-output models.
+    
+    The base batch size is taken from ``config.batch_size``. For multi-output
+    models, the batch size is reduced so that the product
+    ``target_dim * effective_batch_size`` does not exceed
+    ``config.effective_batch_cap``. This helps manage memory usage across
+    multiple targets.
+
+    For single-output (``target_dim == 1``), this function returns the base
+    batch size without scaling. ``target_dim`` values less than 1 are invalid
+    and raise ``ValueError``.
+
+    Args:
+        config: Training configuration providing ``batch_size`` and
+            ``effective_batch_cap`` attributes.
+        target_dim: Number of output targets (e.g., genes) predicted by the
+            model.
+
+    Returns:
+        Effective batch size to use for training.
+    """
+    if target_dim < 1:
+        raise ValueError(f"target_dim must be >= 1, got {target_dim}")
     base = max(1, int(config.batch_size))
-    if target_dim > 1:
-        limit = max(8, 12288 // max(target_dim, 1))
-        return max(8, min(base, limit))
-    return base
+    if target_dim == 1:
+        # Single-output: no scaling needed
+        return base
+    # Multi-output: scale batch size down to respect effective_batch_cap
+    limit = max(8, int(config.effective_batch_cap) // target_dim)
+    return max(8, min(base, limit))
 
 
 def _unscale_targets(scaler: Optional[StandardScaler | MinMaxScaler], values: np.ndarray) -> np.ndarray:

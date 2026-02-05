@@ -1,6 +1,23 @@
 # Utility Scripts
 
-## Core Pipeline Scripts
+## Overview
+
+Summary of helper scripts for data preparation, aggregation, and reporting.
+
+## Inputs
+
+- Repository checkout with `scripts/`.
+- Data files referenced by individual scripts (see script docstrings or `--help`).
+
+## Outputs
+
+- Processed datasets under `data/`.
+- Reports under `analysis/reports/`.
+- Figures under `analysis/figs/`.
+
+## Usage
+
+### Core Pipeline Scripts
 
 - `select_random_genes.py` – validate expression thresholds and build reusable gene manifests.
 - `combine_filtered.py`, `preprocess.py` – data wrangling helpers used prior to training
@@ -10,7 +27,7 @@
 - `plot_feature_importance_vs_tss.py` – plot feature importance relative to TSS
 - `preflight_check.py` – pre-flight checks before running pipeline
 
-## Results Analysis & Reporting Scripts
+### Results Analysis & Reporting Scripts
 
 **NEW:** Automated reporting tools for analyzing completed model runs:
 
@@ -41,3 +58,7 @@ For interactive visualization and figure generation, use:
 The notebook expects results in `output/results/spear_results/` and will generate publication-ready figures.
 
 Run any script with `python scripts/<name>.py --help` for available options.
+
+## References
+
+- `README.md`

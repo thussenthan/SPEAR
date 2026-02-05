@@ -38,6 +38,16 @@ from .data import (
 from .logging_utils import ResourceUsageTracker, get_logger
 from .training import CellwiseModelResult, ModelResult, train_model_for_gene, train_multi_output_model, get_resource_summary
 from . import predict
+from .wandb_utils import (
+    apply_sweep_overrides,
+    log_images_from_globs,
+    log_run_artifacts,
+    log_tables_from_csv,
+    maybe_init_wandb,
+    wandb_finish,
+    wandb_log_metrics,
+    wandb_update_summary,
+)
 from .visualization import (
     plot_feature_importance,
     plot_correlation_boxplot,
@@ -46,6 +56,7 @@ from .visualization import (
     plot_residual_barplot,
     plot_residual_histogram,
     plot_training_history_curves,
+    plot_training_history_series,
     plot_importance_distance_scatter,
     plot_per_gene_feature_panel,
     plot_cumulative_importance_overlay,
@@ -54,6 +65,11 @@ from .visualization import (
 _LOG = get_logger(__name__)
 
 _FEATURE_BIN_PATTERN = re.compile(r"bin_(-?\d+)_to_(-?\d+)", re.IGNORECASE)
+
+# Regex to parse genomic interval notation: chr<name>:<start>-<end>
+# Expected format examples: 'chr1:1000-2000', 'chrX:500000-600000', 'chrMT:100-200'
+# Captures: (1) chromosome name, (2) start position, (3) end position
+_FEATURE_INTERVAL_PATTERN = re.compile(r"^(chr[A-Za-z0-9_]+):(\d+)-(\d+)$", re.IGNORECASE)
 
 
 def _feature_name_metadata(feature_name: str) -> Dict[str, object]:
@@ -80,27 +96,54 @@ def _feature_name_metadata(feature_name: str) -> Dict[str, object]:
     if "peak" in lowered:
         meta["feature_class"] = "atac_peak"
 
-    match = _FEATURE_BIN_PATTERN.search(token)
-    if match:
-        start = int(match.group(1))
-        end = int(match.group(2))
-        center = (start + end) / 2.0
+    interval_match = _FEATURE_INTERVAL_PATTERN.match(token)
+    if interval_match:
+        chrom, start_str, end_str = interval_match.groups()
+        start = int(start_str)
+        end = int(end_str)
         meta.update(
             {
                 "feature_class": "atac_bin",
-                "relative_start_bp": start,
-                "relative_end_bp": end,
-                "relative_center_bp": center,
-                "delta_to_tss_bp": center,
-                "distance_to_tss_bp": abs(center),
-                "delta_to_tss_kb": center / 1_000.0,
-                # Preserve a signed distance for plotting/correlation; keep abs variant for convenience
-                "signed_distance_to_tss_kb": center / 1_000.0,
-                "distance_to_tss_abs_kb": abs(center) / 1_000.0,
+                "chrom": chrom,
+                "genomic_start_bp": start,
+                "genomic_end_bp": end,
+                "genomic_center_bp": (start + end) / 2.0,
             }
         )
+    else:
+        # Only check bin pattern if interval pattern did not match
+        bin_match = _FEATURE_BIN_PATTERN.search(token)
+        if bin_match:
+            start = int(bin_match.group(1))
+            end = int(bin_match.group(2))
+            center = (start + end) / 2.0
+            meta.update(
+                {
+                    "feature_class": "atac_bin",
+                    "relative_start_bp": start,
+                    "relative_end_bp": end,
+                    "relative_center_bp": center,
+                    "delta_to_tss_bp": center,
+                    "distance_to_tss_bp": abs(center),
+                    "delta_to_tss_kb": center / 1_000.0,
+                    # Preserve a signed distance for plotting/correlation; keep abs variant for convenience
+                    "signed_distance_to_tss_kb": center / 1_000.0,
+                    "distance_to_tss_abs_kb": abs(center) / 1_000.0,
+                }
+            )
 
     return meta
+
+
+def _parse_genomic_interval(feature_name: str) -> Optional[Tuple[str, int, int]]:
+    if not feature_name:
+        return None
+    token = feature_name.split("|", 1)[-1]
+    match = _FEATURE_INTERVAL_PATTERN.match(token)
+    if not match:
+        return None
+    chrom, start_str, end_str = match.groups()
+    return chrom, int(start_str), int(end_str)
 
 
 def _export_feature_importance_artifacts(
@@ -112,6 +155,8 @@ def _export_feature_importance_artifacts(
     method: Optional[str] = None,
     gene_names: Optional[Sequence[str]] = None,
     feature_block_slices: Optional[Sequence[Tuple[int, int]]] = None,
+    feature_block_indices: Optional[Sequence[Sequence[int]]] = None,
+    gene_infos: Optional[Sequence[GeneInfo]] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     fi = np.asarray(importances, dtype=np.float64)
@@ -196,8 +241,123 @@ def _export_feature_importance_artifacts(
         _LOG.info("Top feature importances | %s | %s", model_name, top_summary)
 
     per_gene_summary_path: Optional[Path] = None
-    if feature_block_slices and gene_names:
-        per_gene_records: List[Dict[str, object]] = []
+    if feature_block_indices and gene_names:
+        per_gene_records = []
+        gene_block_indices: Dict[str, np.ndarray] = {}
+        limit = min(len(feature_block_indices), len(gene_names))
+        for idx in range(limit):
+            indices = np.asarray(feature_block_indices[idx], dtype=np.int64)
+            if indices.size == 0:
+                continue
+            valid_mask = (indices >= 0) & (indices < len(feature_names))
+            invalid_mask = ~valid_mask
+            if invalid_mask.any():
+                invalid_indices = indices[invalid_mask]
+                _LOG.warning(
+                    "Out-of-bounds feature indices detected for gene block %d: %d invalid "
+                    "indices (min=%s, max=%s) outside valid range [0, %d). These indices "
+                    "will be ignored.",
+                    idx,
+                    invalid_indices.size,
+                    int(invalid_indices.min()) if invalid_indices.size else "n/a",
+                    int(invalid_indices.max()) if invalid_indices.size else "n/a",
+                    len(feature_names),
+                )
+                continue
+            indices = indices[valid_mask]
+            if indices.size == 0:
+                continue
+            block = aggregate_df.iloc[indices].copy()
+            if block.empty:
+                continue
+            gene_label = gene_names[idx]
+            gene_block_indices[gene_label] = indices
+            gene_info = gene_infos[idx] if gene_infos is not None and idx < len(gene_infos) else None
+            record = {
+                "gene": gene_label,
+                "feature_count": int(block.shape[0]),
+                "importance_mean_sum": float(block["importance_mean"].sum()),
+                "importance_mean_avg": float(block["importance_mean"].mean()),
+                "top_feature": str(block.loc[block["importance_mean"].idxmax(), "feature"]),
+                "top_feature_importance": float(block["importance_mean"].max()),
+            }
+            distances = None
+            if "signed_distance_to_tss_kb" in block.columns and block["signed_distance_to_tss_kb"].notna().any():
+                distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
+            elif gene_info is not None:
+                rel_centers = np.full(block.shape[0], np.nan, dtype=float)
+                for row_idx, feature in enumerate(block["feature"].astype(str)):
+                    parsed = _parse_genomic_interval(feature)
+                    if not parsed:
+                        continue
+                    chrom, start, end = parsed
+                    if chrom != gene_info.chrom:
+                        continue
+                    rel_start = start - gene_info.tss
+                    rel_end = end - gene_info.tss
+                    if gene_info.strand == "-":
+                        rel_start, rel_end = -rel_end, -rel_start
+                    rel_centers[row_idx] = (rel_start + rel_end) / 2.0
+                distances = pd.Series(rel_centers / 1_000.0)
+                block = block.copy()
+                block["signed_distance_to_tss_kb"] = distances
+            if distances is not None:
+                mask = np.isfinite(distances) & np.isfinite(block["importance_mean"])
+                if mask.any():
+                    imp = block.loc[mask, "importance_mean"]
+                    dist = distances[mask]
+                    if imp.nunique() > 1 and dist.nunique() > 1:
+                        record["pearson_distance_corr"] = float(imp.corr(dist, method="pearson"))
+                        record["spearman_distance_corr"] = float(imp.corr(dist, method="spearman"))
+                    top_idx = block.loc[mask, "importance_mean"].idxmax()
+                    record["top_feature_distance_kb"] = float(distances.loc[top_idx])
+            per_gene_records.append(record)
+        if per_gene_records:
+            per_gene_df = pd.DataFrame(per_gene_records)
+            per_gene_summary_path = output_dir / "feature_importance_per_gene_summary.csv"
+            per_gene_df.to_csv(per_gene_summary_path, index=False)
+            _LOG.info(
+                "Saved per-gene feature importance summary (%d genes) to %s",
+                per_gene_df.shape[0],
+                per_gene_summary_path,
+            )
+
+            panel_dir = output_dir / "per_gene_panels"
+            panel_candidates = per_gene_df.sort_values("importance_mean_sum", ascending=False).head(12)
+            generated = 0
+            gene_info_map = {g.gene_name: g for g in gene_infos} if gene_infos is not None else {}
+            for gene_value in panel_candidates["gene"]:
+                block_indices = gene_block_indices.get(gene_value)
+                if block_indices is None or block_indices.size == 0:
+                    continue
+                block_slice = aggregate_df.iloc[block_indices].copy()
+                if block_slice.empty:
+                    continue
+                gene_info = gene_info_map.get(gene_value)
+                if gene_info is not None:
+                    # Compute relative centers only for features on the same chromosome
+                    rel_centers = np.full(block_slice.shape[0], np.nan, dtype=float)
+                    for row_idx, feature in enumerate(block_slice["feature"].astype(str)):
+                        parsed = _parse_genomic_interval(feature)
+                        if not parsed:
+                            continue
+                        chrom, start, end = parsed
+                        if chrom != gene_info.chrom:
+                            continue
+                        rel_start = start - gene_info.tss
+                        rel_end = end - gene_info.tss
+                        if gene_info.strand == "-":
+                            rel_start, rel_end = -rel_end, -rel_start
+                        rel_centers[row_idx] = (rel_start + rel_end) / 2.0
+                    block_slice["signed_distance_to_tss_kb"] = rel_centers / 1_000.0
+                safe_gene = re.sub(r"[^A-Za-z0-9._-]", "_", gene_value)
+                panel_path = panel_dir / f"{safe_gene}.png"
+                plot_per_gene_feature_panel(block_slice, gene_value, panel_path)
+                generated += 1
+            if generated:
+                _LOG.info("Generated %d per-gene feature panels in %s", generated, panel_dir)
+    elif feature_block_slices and gene_names:
+        per_gene_records = []
         gene_block_ranges: Dict[str, Tuple[int, int]] = {}
         limit = min(len(feature_block_slices), len(gene_names))
         for idx in range(limit):
@@ -211,7 +371,7 @@ def _export_feature_importance_artifacts(
                 continue
             gene_label = gene_names[idx]
             gene_block_ranges[gene_label] = (start, end)
-            record: Dict[str, object] = {
+            record = {
                 "gene": gene_label,
                 "feature_count": int(block.shape[0]),
                 "importance_mean_sum": float(block["importance_mean"].sum()),
@@ -226,12 +386,8 @@ def _export_feature_importance_artifacts(
                     imp = block.loc[mask, "importance_mean"]
                     dist = distances[mask]
                     if imp.nunique() > 1 and dist.nunique() > 1:
-                        record["pearson_distance_corr"] = float(
-                            imp.corr(dist, method="pearson")
-                        )
-                        record["spearman_distance_corr"] = float(
-                            imp.corr(dist, method="spearman")
-                        )
+                        record["pearson_distance_corr"] = float(imp.corr(dist, method="pearson"))
+                        record["spearman_distance_corr"] = float(imp.corr(dist, method="spearman"))
                     top_idx = block.loc[mask, "importance_mean"].idxmax()
                     record["top_feature_distance_kb"] = float(distances.loc[top_idx])
             per_gene_records.append(record)
@@ -533,197 +689,216 @@ except ImportError:  # pragma: no cover - torch optional during some tests
 def run_pipeline(config: PipelineConfig) -> Path:
     config.ensure_directories()
 
-    atac, rna = load_datasets(config.paths)
-    atac, rna = preprocess_modalities(atac, rna, config.training)
+    wandb_run = maybe_init_wandb(config)
+    run_status = "failed"
+    run_dir: Optional[Path] = None
+    try:
+        apply_sweep_overrides(config, wandb_run)
 
-    target_chromosomes = config.chromosomes
-    if target_chromosomes and len(target_chromosomes) == 1:
-        token = target_chromosomes[0].strip().lower()
-        if token in {"all", "genome-wide", "genome"}:
-            target_chromosomes = None
-            _LOG.info("Chromosome filter explicitly set to all/genome-wide")
-
-    genes_all = parse_gtf(
-        config.paths.gtf_path,
-        chromosomes=target_chromosomes,
-        gene_names=config.genes,
-    )
-    max_genes_for_selection = config.max_genes
-    if config.multi_output and not config.genes:
-        # Defer max_genes enforcement until after expression filtering for multi-output sampling
-        max_genes_for_selection = None
-    elif config.max_genes and not config.genes:
-        # Load the full candidate set so we can perform a random draw later
-        max_genes_for_selection = None
-
-    genes = select_genes(genes_all, requested_genes=config.genes, max_genes=max_genes_for_selection)
-
-    candidate_count = len(genes)
-    if (
-        not config.multi_output
-        and config.max_genes
-        and not config.genes
-        and candidate_count > config.max_genes
-    ):
-        rng = np.random.default_rng(config.training.random_state)
-        sample_indices = np.asarray(rng.choice(len(genes), size=config.max_genes, replace=False))
-        sample_indices.sort()
-        genes = [genes[int(idx)] for idx in sample_indices]
-        _LOG.info(
-            "Randomly sampled %d genes (from %d candidates) for gene-wise processing",
-            config.max_genes,
-            candidate_count,
+        atac, rna = load_datasets(config.paths)
+        atac, rna = preprocess_modalities(atac, rna, config.training)
+    
+        target_chromosomes = config.chromosomes
+        if target_chromosomes and len(target_chromosomes) == 1:
+            token = target_chromosomes[0].strip().lower()
+            if token in {"all", "genome-wide", "genome"}:
+                target_chromosomes = None
+                _LOG.info("Chromosome filter explicitly set to all/genome-wide")
+    
+        genes_all = parse_gtf(
+            config.paths.gtf_path,
+            chromosomes=target_chromosomes,
+            gene_names=config.genes,
         )
-
-    if config.genes:
-        found_names = {gene.gene_name for gene in genes}
-        found_ids = {gene.gene_id for gene in genes}
-        missing = [name for name in config.genes if name not in found_names and name not in found_ids]
-        if missing:
-            raise RuntimeError(
-                "The following requested genes were not found in annotations: "
-                + ", ".join(missing[:10])
-                + (" ..." if len(missing) > 10 else "")
-            )
-
-    selected_gene_fractions: Dict[str, float] = {}
-    manifest_mode = bool(config.genes)
-    if config.multi_output:
-        base_pool = genes if genes else genes_all
-        expressed_candidates, fraction_map = _genes_expressed_above_fraction(
-            base_pool,
-            rna,
-            min_expression=config.training.min_expression,
-            min_fraction=config.training.min_expression_fraction,
-        )
-
-        if manifest_mode:
-            missing = [
-                gene
-                for gene in genes
-                if fraction_map.get(gene.gene_name, 0.0) < config.training.min_expression_fraction
-            ]
-            if missing:
-                names = ", ".join(g.gene_name for g in missing[:10])
-                _LOG.error(
-                    "Manifest supplied %d genes below expression fraction threshold: %s%s",
-                    len(missing),
-                    names,
-                    " ..." if len(missing) > 10 else "",
-                )
-                raise RuntimeError(
-                    "Gene manifest contains entries below the minimum expression fraction threshold"
-                )
-            selected_gene_fractions = {
-                gene.gene_name: fraction_map.get(gene.gene_name, float("nan"))
-                for gene in genes
-            }
+        max_genes_for_selection = config.max_genes
+        if config.multi_output and not config.genes:
+            max_genes_for_selection = None
+        elif config.max_genes and not config.genes:
+            max_genes_for_selection = None
+    
+        genes = select_genes(genes_all, requested_genes=config.genes, max_genes=max_genes_for_selection)
+    
+        candidate_count = len(genes)
+        if (
+            not config.multi_output
+            and config.max_genes
+            and not config.genes
+            and candidate_count > config.max_genes
+        ):
+            rng = np.random.default_rng(config.training.random_state)
+            sample_indices = np.asarray(rng.choice(len(genes), size=config.max_genes, replace=False))
+            sample_indices.sort()
+            genes = [genes[int(idx)] for idx in sample_indices]
             _LOG.info(
-                "Using %d genes from manifest with >=%.1f%% expressing cells",
-                len(genes),
-                config.training.min_expression_fraction * 100.0,
+                "Randomly sampled %d genes (from %d candidates) for gene-wise processing",
+                config.max_genes,
+                candidate_count,
             )
-        else:
-            available_gene_count = len(expressed_candidates)
-            if config.max_genes is None:
-                if available_gene_count == 0:
-                    raise RuntimeError(
-                        "No genes met the minimum expression fraction (>=%.2f of cells)"
-                        % config.training.min_expression_fraction
+    
+        if config.genes:
+            found_names = {gene.gene_name for gene in genes}
+            found_ids = {gene.gene_id for gene in genes}
+            missing = [name for name in config.genes if name not in found_names and name not in found_ids]
+            if missing:
+                raise RuntimeError(
+                    "The following requested genes were not found in annotations: "
+                    + ", ".join(missing[:10])
+                    + (" ..." if len(missing) > 10 else "")
+                )
+    
+        selected_gene_fractions: Dict[str, float] = {}
+        manifest_mode = bool(config.genes)
+        if config.multi_output:
+            base_pool = genes if genes else genes_all
+            expressed_candidates, fraction_map = _genes_expressed_above_fraction(
+                base_pool,
+                rna,
+                min_expression=config.training.min_expression,
+                min_fraction=config.training.min_expression_fraction,
+            )
+    
+            if manifest_mode:
+                missing = [
+                    gene
+                    for gene in genes
+                    if fraction_map.get(gene.gene_name, 0.0) < config.training.min_expression_fraction
+                ]
+                if missing:
+                    names = ", ".join(g.gene_name for g in missing[:10])
+                    _LOG.error(
+                        "Manifest supplied %d genes below expression fraction threshold: %s%s",
+                        len(missing),
+                        names,
+                        " ..." if len(missing) > 10 else "",
                     )
-                genes = expressed_candidates
+                    raise RuntimeError(
+                        "Gene manifest contains entries below the minimum expression fraction threshold"
+                    )
                 selected_gene_fractions = {
                     gene.gene_name: fraction_map.get(gene.gene_name, float("nan"))
                     for gene in genes
                 }
                 _LOG.info(
-                    "Using all %d genes meeting the >=%.1f%% expression threshold",
+                    "Using %d genes from manifest with >=%.1f%% expressing cells",
                     len(genes),
                     config.training.min_expression_fraction * 100.0,
                 )
             else:
-                requested_gene_count = config.max_genes
-                if requested_gene_count <= 0:
-                    raise RuntimeError("Configured max_genes must be >= 1 for multi-output mode")
-
-                if available_gene_count < requested_gene_count:
-                    _LOG.warning(
-                        "Only %d genes meet the expression threshold (requested %d); proceeding with available genes",
-                        available_gene_count,
-                        requested_gene_count,
+                available_gene_count = len(expressed_candidates)
+                if config.max_genes is None:
+                    if available_gene_count == 0:
+                        raise RuntimeError(
+                            "No genes met the minimum expression fraction (>=%.2f of cells)"
+                            % config.training.min_expression_fraction
+                        )
+                    genes = expressed_candidates
+                    selected_gene_fractions = {
+                        gene.gene_name: fraction_map.get(gene.gene_name, float("nan"))
+                        for gene in genes
+                    }
+                    _LOG.info(
+                        "Using all %d genes meeting the >=%.1f%% expression threshold",
+                        len(genes),
+                        config.training.min_expression_fraction * 100.0,
                     )
-
-                selected_gene_count = min(requested_gene_count, available_gene_count)
-                if selected_gene_count == 0:
-                    raise RuntimeError(
-                        "No genes met the minimum expression fraction (>=%.2f of cells)"
-                        % config.training.min_expression_fraction
+                else:
+                    requested_gene_count = config.max_genes
+                    if requested_gene_count <= 0:
+                        raise RuntimeError("Configured max_genes must be >= 1 for multi-output mode")
+    
+                    if available_gene_count < requested_gene_count:
+                        _LOG.warning(
+                            "Only %d genes meet the expression threshold (requested %d); proceeding with available genes",
+                            available_gene_count,
+                            requested_gene_count,
+                        )
+    
+                    selected_gene_count = min(requested_gene_count, available_gene_count)
+                    if selected_gene_count == 0:
+                        raise RuntimeError(
+                            "No genes met the minimum expression fraction (>=%.2f of cells)"
+                            % config.training.min_expression_fraction
+                        )
+    
+                    genes = _choose_random_genes(
+                        expressed_candidates,
+                        selected_gene_count,
+                        config.training.random_state,
                     )
-
-                genes = _choose_random_genes(
-                    expressed_candidates,
-                    selected_gene_count,
-                    config.training.random_state,
-                )
-                selected_gene_fractions = {
-                    gene.gene_name: fraction_map.get(gene.gene_name, float("nan"))
-                    for gene in genes
-                }
-                _LOG.info(
-                    "Selected %d genome-wide genes with >=%.1f%% expressing cells",
-                    len(genes),
-                    config.training.min_expression_fraction * 100.0,
-                )
-                _LOG.debug("Selected genes: %s", ", ".join(g.gene_name for g in genes))
-
-    if config.multi_output and not genes:
-        raise RuntimeError("No genes matched the provided filters for multi-output training")
-
-    total_genes = len(genes)
-    chunk_total = max(1, int(config.chunk_total))
-    chunk_index = int(config.chunk_index)
-    applied_chunking = False
-    if chunk_index < 0:
-        chunk_index = 0
-    if chunk_index >= chunk_total:
-        chunk_index = chunk_total - 1
-    if chunk_total > 1 and total_genes:
-        chunk_size = math.ceil(total_genes / chunk_total)
-        start = chunk_index * chunk_size
-        end = min(total_genes, start + chunk_size)
-        _LOG.info(
-            "Applying chunk selection: total_genes=%d | chunk_total=%d | chunk_index=%d | chunk_size=%d | start=%d | end=%d",
-            total_genes,
-            chunk_total,
-            chunk_index,
-            chunk_size,
-            start,
-            end,
-        )
-        genes = genes[start:end]
-        applied_chunking = True
-
-    if not genes:
-        peak_indexer = PeakIndexer(atac, layer=config.training.atac_layer)
-    else:
-        atac = filter_atac_by_genes(atac, genes, config.training.window_bp)
-        peak_indexer = PeakIndexer(atac, layer=config.training.atac_layer)
-
-    if config.multi_output:
-        if applied_chunking:
+                    selected_gene_fractions = {
+                        gene.gene_name: fraction_map.get(gene.gene_name, float("nan"))
+                        for gene in genes
+                    }
+                    _LOG.info(
+                        "Selected %d genome-wide genes with >=%.1f%% expressing cells",
+                        len(genes),
+                        config.training.min_expression_fraction * 100.0,
+                    )
+                    _LOG.debug("Selected genes: %s", ", ".join(g.gene_name for g in genes))
+    
+        if config.multi_output and not genes:
+            raise RuntimeError("No genes matched the provided filters for multi-output training")
+    
+        total_genes = len(genes)
+        chunk_total = max(1, int(config.chunk_total))
+        chunk_index = int(config.chunk_index)
+        applied_chunking = False
+        if chunk_index < 0:
+            chunk_index = 0
+        if chunk_index >= chunk_total:
+            chunk_index = chunk_total - 1
+        if chunk_total > 1 and total_genes:
+            chunk_size = math.ceil(total_genes / chunk_total)
+            start = chunk_index * chunk_size
+            end = min(total_genes, start + chunk_size)
             _LOG.info(
-                "Multi-output chunk processed: index=%d/%d | genes_in_chunk=%d",
-                chunk_index,
-                chunk_total,
-                len(genes),
-            )
-        elif chunk_total > 1:
-            _LOG.warning(
-                "Chunk parameters specified (chunk_total=%d, chunk_index=%d) but no genes selected; proceeding without chunking",
+                "Applying chunk selection: total_genes=%d | chunk_total=%d | chunk_index=%d | chunk_size=%d | start=%d | end=%d",
+                total_genes,
                 chunk_total,
                 chunk_index,
+                chunk_size,
+                start,
+                end,
             )
-        return _run_cellwise_pipeline(
+            genes = genes[start:end]
+            applied_chunking = True
+    
+        if not genes:
+            peak_indexer = PeakIndexer(atac, layer=config.training.atac_layer)
+        else:
+            atac = filter_atac_by_genes(atac, genes, config.training.window_bp)
+            peak_indexer = PeakIndexer(atac, layer=config.training.atac_layer)
+    
+        if config.multi_output:
+            if applied_chunking:
+                _LOG.info(
+                    "Multi-output chunk processed: index=%d/%d | genes_in_chunk=%d",
+                    chunk_index,
+                    chunk_total,
+                    len(genes),
+                )
+            elif chunk_total > 1:
+                _LOG.warning(
+                    "Chunk parameters specified (chunk_total=%d, chunk_index=%d) but no genes selected; proceeding without chunking",
+                    chunk_total,
+                    chunk_index,
+                )
+            run_dir = _run_cellwise_pipeline(
+                config,
+                genes,
+                atac,
+                rna,
+                peak_indexer,
+                chunk_index=chunk_index,
+                chunk_total=chunk_total,
+                gene_expression_fraction=selected_gene_fractions,
+                wandb_run=wandb_run,
+            )
+            run_status = "succeeded"
+            return run_dir
+    
+
+        run_dir = _run_per_gene_pipeline(
             config,
             genes,
             atac,
@@ -731,12 +906,31 @@ def run_pipeline(config: PipelineConfig) -> Path:
             peak_indexer,
             chunk_index=chunk_index,
             chunk_total=chunk_total,
-            gene_expression_fraction=selected_gene_fractions,
+            wandb_run=wandb_run,
         )
+        run_status = "succeeded"
+        return run_dir
+    
+    finally:
+        wandb_finish(wandb_run, status=run_status, run_dir=run_dir)
 
+
+def _run_per_gene_pipeline(
+    config: PipelineConfig,
+    genes: List[GeneInfo],
+    atac: ad.AnnData,
+    rna: ad.AnnData,
+    peak_indexer: PeakIndexer,
+    *,
+    chunk_index: int = 0,
+    chunk_total: int = 1,
+    wandb_run: Optional[Any] = None,
+) -> Path:
+    """Execute per-gene training pipeline, processing each gene independently across all models."""
+    
     base_dir = config.paths.output_dir / "spear_results"
     run_dir = base_dir / config.run_name if config.run_name else base_dir
-
+    
     if not genes:
         _LOG.warning(
             "No genes assigned to this chunk (chunk_index=%d, chunk_total=%d). Nothing to process.",
@@ -744,9 +938,21 @@ def run_pipeline(config: PipelineConfig) -> Path:
             chunk_total,
         )
         return run_dir
-
+    
     _ensure_directory(run_dir)
-
+    wandb_update_summary(
+        wandb_run,
+        {
+            "mode": "per_gene",
+            "chunk_index": chunk_index,
+            "chunk_total": chunk_total,
+            "total_models": len(config.all_models()),
+            "requested_genes": len(genes),
+            "num_genes": len(genes),
+            "models": config.all_models(),
+        },
+    )
+    
     summary_records: List[Dict[str, object]] = []
     model_store: Dict[str, Dict[str, object]] = defaultdict(lambda: {
         "predictions": [],
@@ -761,7 +967,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
     }
     model_config_snapshots: Dict[str, Dict[str, Any]] = {}
     failures: List[str] = []
-
+    
     for gene in genes:
         _LOG.info("Processing gene %s", gene.gene_name)
         try:
@@ -775,7 +981,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
         except ValueError as exc:
             _LOG.warning("Skipping gene %s: %s", gene.gene_name, exc)
             continue
-
+    
         for model_name in config.all_models():
             _LOG.info("Training %s for gene %s", model_name, gene.gene_name)
             try:
@@ -787,6 +993,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
                     model_name,
                     config.training,
                     artifacts_dir=artifacts_dir,
+                    cache_dir=config.cache_dir,
                 )
             except Exception as exc:
                 _LOG.error(
@@ -804,7 +1011,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
                 continue
             preds_df = pd.DataFrame(result.predictions)
             preds_df["gene"] = gene.gene_name
-
+    
             store = model_store[model_name]
             store["predictions"].append(preds_df)
             store["metrics"].append(
@@ -823,12 +1030,12 @@ def run_pipeline(config: PipelineConfig) -> Path:
                     store["feature_names"] = list(dataset.feature_names)
             if result.history:
                 store["histories"].append((gene.gene_name, result.history))
-
+    
             model_export_meta.setdefault(model_name, {"successful_genes": [], "failures": []})
             model_export_meta[model_name]["successful_genes"].append(gene.gene_name)
             if model_name not in model_config_snapshots and result.fitted_model is not None:
                 model_config_snapshots[model_name] = _capture_model_configuration(result.fitted_model)
-
+    
             summary_records.append(
                 {
                     "gene": gene.gene_name,
@@ -839,26 +1046,27 @@ def run_pipeline(config: PipelineConfig) -> Path:
                     **{f"test_{k}": v for k, v in result.test_metrics.items()},
                 }
             )
-
+    
     if summary_records:
         summary_df = pd.DataFrame(summary_records)
         summary_path = run_dir / "summary_metrics.csv"
         summary_df.to_csv(summary_path, index=False)
         _LOG.info("Run summary metrics saved to %s", summary_path)
-
+    
     models_dir = run_dir / "models"
     models_dir.mkdir(exist_ok=True)
-
+    
+    model_order = {name: idx for idx, name in enumerate(config.all_models(), start=1)}
     for model_name, store in model_store.items():
         model_dir = models_dir / model_name
         model_dir.mkdir(exist_ok=True)
-
+    
         predictions = store["predictions"]
         if predictions:
             preds_df = pd.concat(predictions, ignore_index=True)
             preds_path = model_dir / "predictions_raw.csv"
             preds_df.to_csv(preds_path, index=False)
-
+    
             for split in ["train", "val", "test"]:
                 subset = preds_df[preds_df["split"] == split]
                 if subset.empty:
@@ -875,14 +1083,23 @@ def run_pipeline(config: PipelineConfig) -> Path:
                     model_dir / f"residuals_{split}.png",
                     f"Residuals | {model_name.upper()} | {split}",
                 )
-
+    
         metrics_records = store["metrics"]
         if metrics_records:
             metrics_df = pd.DataFrame(metrics_records)
             metrics_df.to_csv(model_dir / "metrics_by_gene.csv", index=False)
             metrics_mean = metrics_df.mean(numeric_only=True)
             metrics_mean.to_csv(model_dir / "metrics_summary.csv", header=["value"])
-
+            metrics_payload: Dict[str, Any] = {
+            }
+            for key, value in metrics_mean.items():
+                metrics_payload[f"{model_name}/{key}"] = value
+            wandb_log_metrics(
+                wandb_run,
+                metrics_payload,
+                step=model_order.get(model_name),
+            )
+    
         feature_importances = store["feature_importances"]
         feature_importance_genes = store.get("feature_importances_genes", [])
         feature_names = store["feature_names"]
@@ -904,13 +1121,13 @@ def run_pipeline(config: PipelineConfig) -> Path:
                     model_dir / "feature_importance_mean.png",
                     f"Feature importance | {model_name.upper()}",
                 )
-
+    
                 fi_std = fi_stack.std(axis=0, ddof=0)
                 fi_median = np.median(fi_stack, axis=0)
-
+    
                 metadata_records = [_feature_name_metadata(name) for name in feature_names]
                 metadata_df = pd.DataFrame(metadata_records) if metadata_records else None
-
+    
                 aggregate_df = pd.DataFrame(
                     {
                         "feature": feature_names,
@@ -922,7 +1139,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
                 if metadata_df is not None and not metadata_df.empty:
                     aggregate_df = pd.concat([aggregate_df, metadata_df], axis=1)
                 aggregate_df.to_csv(model_dir / "feature_importances_mean.csv", index=False)
-
+    
                 if feature_importance_genes:
                     long_records: List[Dict[str, object]] = []
                     metadata_lookup = (
@@ -946,7 +1163,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
                             model_dir / "feature_importances_per_gene.csv",
                             index=False,
                         )
-
+    
         histories = store["histories"]
         if histories:
             history_dir = model_dir / "histories"
@@ -962,7 +1179,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
                         history_dir / f"{gene_name}_{metric}.png",
                         title=f"{model_name.upper()} | {gene_name} | {metric.title()}",
                     )
-
+    
     model_run_details: Dict[str, Any] = {}
     for name, meta in model_export_meta.items():
         successes = sorted(set(meta.get("successful_genes", [])))
@@ -981,7 +1198,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
         if name in model_config_snapshots:
             entry["estimator"] = model_config_snapshots[name]
         model_run_details[name] = entry
-
+    
     processed_genes = sorted({row["gene"] for row in summary_records}) if summary_records else []
     extra_context = {
         "mode": "per_gene",
@@ -998,8 +1215,49 @@ def run_pipeline(config: PipelineConfig) -> Path:
             "One or more gene-level model trainings failed: " + "; ".join(failures)
         )
 
-    return run_dir
+    if wandb_run is not None and config.wandb.log_tables:
+        table_max = config.wandb.table_max_rows
+        log_tables_from_csv(
+            wandb_run,
+            "summary_metrics",
+            run_dir / "summary_metrics.csv",
+            max_rows=table_max,
+        )
+        for model_name in config.all_models():
+            model_dir = run_dir / "models" / model_name
+            log_tables_from_csv(
+                wandb_run,
+                f"{model_name}_metrics_by_gene",
+                model_dir / "metrics_by_gene.csv",
+                max_rows=table_max,
+            )
+            if config.wandb.log_predictions_table:
+                log_tables_from_csv(
+                    wandb_run,
+                    f"{model_name}_predictions",
+                    model_dir / "predictions_raw.csv",
+                    max_rows=table_max,
+                )
 
+    if wandb_run is not None and config.wandb.log_media:
+        max_media = config.wandb.media_max_items
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=[
+                "models/*/scatter_*.png",
+                "models/*/residuals_*.png",
+                "models/*/feature_importance_mean.png",
+                "models/*/histories/*.png",
+            ],
+            max_items=max_media,
+            prefix="plots",
+        )
+
+    if wandb_run is not None and config.wandb.log_artifacts:
+        log_run_artifacts(wandb_run, run_dir)
+
+    return run_dir
 
 def _run_cellwise_pipeline(
     config: PipelineConfig,
@@ -1011,6 +1269,7 @@ def _run_cellwise_pipeline(
     chunk_index: int = 0,
     chunk_total: int = 1,
     gene_expression_fraction: Optional[Dict[str, float]] = None,
+    wandb_run: Optional[Any] = None,
 ) -> Path:
     base_dir = config.paths.output_dir / "spear_results"
     run_dir = base_dir / config.run_name if config.run_name else base_dir
@@ -1077,8 +1336,20 @@ def _run_cellwise_pipeline(
             _export_run_configuration(config, run_dir, model_run_details, extra_context)
 
         export_run_configuration_snapshot()
+        wandb_update_summary(
+            wandb_run,
+            {
+                "mode": "multi_output",
+                "chunk_index": chunk_index,
+                "chunk_total": chunk_total,
+                "num_genes": dataset.num_genes(),
+                "num_cells": dataset.num_cells(),
+                "num_features": dataset.num_features(),
+                "models": config.all_models(),
+            },
+        )
 
-        for model_name in config.all_models():
+        for model_idx, model_name in enumerate(config.all_models(), start=1):
             model_dir = _ensure_directory(models_dir / model_name)
 
             _LOG.info(
@@ -1110,6 +1381,7 @@ def _run_cellwise_pipeline(
                             model_name,
                             config.training,
                             artifacts_dir=artifacts_dir,
+                            cache_dir=config.cache_dir,
                         )
             except Exception as exc:  # pragma: no cover - defensive logging
                 _LOG.error("Model %s failed in multi-output mode: %s", model_name, exc)
@@ -1141,6 +1413,55 @@ def _run_cellwise_pipeline(
                             model_dir / f"training_history_{metric}.png",
                             title=f"{model_name.upper()} | {metric.title()}",
                         )
+                    plot_training_history_series(
+                        history_df,
+                        "gpu_util_pct",
+                        model_dir / "training_history_gpu_util.png",
+                        title=f"{model_name.upper()} | GPU Utilization",
+                        ylabel="GPU Utilization (%)",
+                    )
+                    plot_training_history_series(
+                        history_df,
+                        "gpu_peak_alloc_mb",
+                        model_dir / "training_history_gpu_mem.png",
+                        title=f"{model_name.upper()} | GPU Peak Alloc",
+                        ylabel="GPU Peak Alloc (MB)",
+                    )
+                    plot_training_history_series(
+                        history_df,
+                        "gpu_alloc_mb",
+                        model_dir / "training_history_gpu_alloc.png",
+                        title=f"{model_name.upper()} | GPU Allocated",
+                        ylabel="GPU Allocated (MB)",
+                    )
+                    plot_training_history_series(
+                        history_df,
+                        "gpu_reserved_mb",
+                        model_dir / "training_history_gpu_reserved.png",
+                        title=f"{model_name.upper()} | GPU Reserved",
+                        ylabel="GPU Reserved (MB)",
+                    )
+                    plot_training_history_series(
+                        history_df,
+                        "cpu_percent",
+                        model_dir / "training_history_cpu_util.png",
+                        title=f"{model_name.upper()} | CPU Utilization",
+                        ylabel="CPU Utilization (%)",
+                    )
+                    plot_training_history_series(
+                        history_df,
+                        "rss_gib",
+                        model_dir / "training_history_rss_gib.png",
+                        title=f"{model_name.upper()} | RSS Memory",
+                        ylabel="RSS (GiB)",
+                    )
+                    plot_training_history_series(
+                        history_df,
+                        "thread_count",
+                        model_dir / "training_history_threads.png",
+                        title=f"{model_name.upper()} | Thread Count",
+                        ylabel="Threads",
+                    )
 
                 if getattr(result, "feature_importances", None) is not None and getattr(result, "feature_names", None) is not None:
                     _export_feature_importance_artifacts(
@@ -1151,6 +1472,8 @@ def _run_cellwise_pipeline(
                         method=getattr(result, "feature_importance_method", None),
                         gene_names=result.gene_names,
                         feature_block_slices=getattr(result, "feature_block_slices", None),
+                        feature_block_indices=getattr(result, "feature_block_indices", None),
+                        gene_infos=getattr(result, "gene_infos", None),
                     )
                 if getattr(result, "shap_importances_mean", None) is not None and getattr(result, "feature_names", None) is not None:
                     _export_shap_importance_artifacts(
@@ -1168,6 +1491,12 @@ def _run_cellwise_pipeline(
                         key = f"{split}_{metric_name}"
                         metric_payload[key] = metrics.get(metric_name)
                 summary_records.append(metric_payload)
+                wandb_payload = {}
+                for key, value in metric_payload.items():
+                    if key == "model" or key == "num_genes":
+                        continue
+                    wandb_payload[f"{model_name}/{key}"] = value
+                wandb_log_metrics(wandb_run, wandb_payload, step=model_idx)
 
                 # Verify all critical files were written before logging completion
                 critical_files = [
@@ -1203,10 +1532,64 @@ def _run_cellwise_pipeline(
         export_run_configuration_snapshot()
 
         if failures:
+            wandb_update_summary(wandb_run, {"status": "failed", "failures": len(failures)})
             raise RuntimeError(
                 "One or more models failed in multi-output mode: "
                 + "; ".join(failures)
             )
+
+        if wandb_run is not None and config.wandb.log_tables:
+            table_max = config.wandb.table_max_rows
+            log_tables_from_csv(
+                wandb_run,
+                "summary_metrics",
+                run_dir / "summary_metrics.csv",
+                max_rows=table_max,
+            )
+            for model_name in config.all_models():
+                model_dir = run_dir / "models" / model_name
+                log_tables_from_csv(
+                    wandb_run,
+                    f"{model_name}_metrics_aggregate",
+                    model_dir / "metrics_aggregate.csv",
+                    max_rows=table_max,
+                )
+                log_tables_from_csv(
+                    wandb_run,
+                    f"{model_name}_metrics_per_gene",
+                    model_dir / "metrics_per_gene.csv",
+                    max_rows=table_max,
+                )
+                if config.wandb.log_predictions_table:
+                    log_tables_from_csv(
+                        wandb_run,
+                        f"{model_name}_predictions",
+                        model_dir / "predictions_raw.csv",
+                        max_rows=table_max,
+                    )
+                log_tables_from_csv(
+                    wandb_run,
+                    f"{model_name}_training_history",
+                    model_dir / "training_history.csv",
+                    max_rows=table_max,
+                )
+
+        if wandb_run is not None and config.wandb.log_media:
+            max_media = config.wandb.media_max_items
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=[
+                    "models/*/training_history_*.png",
+                    "models/*/feature_importance_mean.png",
+                    "models/*/shap_importance_mean.png",
+                ],
+                max_items=max_media,
+                prefix="plots",
+            )
+
+        if wandb_run is not None and config.wandb.log_artifacts:
+            log_run_artifacts(wandb_run, run_dir)
 
         overall_status = "succeeded"
         return run_dir
@@ -1235,6 +1618,18 @@ def _run_cellwise_pipeline(
                     _LOG.info("═" * 80)
                     _LOG.info("Run resource peaks | %s", " | ".join(summary_parts))
                     _LOG.info("═" * 80)
+                if wandb_run is not None:
+                    wandb_update_summary(
+                        wandb_run,
+                        {
+                            "peak_rss_gib": resource_summary.get("peak_rss_gib"),
+                            "peak_cpu_pct": resource_summary.get("peak_cpu_pct"),
+                            "peak_gpu_allocated_mb": resource_summary.get("peak_gpu_allocated_mb"),
+                            "peak_gpu_reserved_mb": resource_summary.get("peak_gpu_reserved_mb"),
+                            "min_gpu_free_mb": resource_summary.get("peak_gpu_free_mb"),
+                            "gpu_devices": resource_summary.get("max_gpu_devices"),
+                        },
+                    )
         except Exception:  # pragma: no cover
             _LOG.debug("Failed to log resource summary", exc_info=True)
         
@@ -1539,7 +1934,7 @@ def _plot_cellwise_diagnostics(model_dir: Path, result: CellwiseModelResult) -> 
         axes[1].set_ylabel("")
 
         fig.tight_layout()
-        fig.savefig(model_dir / "spearman_by_split.png")
+        fig.savefig(model_dir / "spearman_by_split.png", dpi=300)
         plt.close(fig)
 
     per_gene_val = result.per_gene_metrics.get("val", [])
@@ -1571,7 +1966,7 @@ def _plot_cellwise_diagnostics(model_dir: Path, result: CellwiseModelResult) -> 
                 axes[1].axis("off")
             fig.suptitle(f"{result.model_name.upper()} | Validation Correlations", y=0.92)
             fig.tight_layout(rect=(0, 0, 1, 0.95))
-            fig.savefig(model_dir / "correlation_boxplots_val.png")
+            fig.savefig(model_dir / "correlation_boxplots_val.png", dpi=300)
             plt.close(fig)
 
 
@@ -1592,6 +1987,7 @@ def _persist_cellwise_model(
         "gene_names": result.gene_names,
         "feature_names": result.feature_names,
         "feature_block_slices": result.feature_block_slices,
+        "feature_block_indices": _serialize_value(result.feature_block_indices),
         "reshape": result.reshape,
         "training": _serialize_value(training),
     }
@@ -1716,6 +2112,7 @@ def _export_run_configuration(
         "paths": _serialize_value(config.paths),
         "training": _serialize_value(config.training),
         "models": _serialize_value(config.models),
+        "wandb": _serialize_value(config.wandb),
         "genes": _serialize_value(genes_payload),
         "chromosomes": _serialize_value(config.chromosomes),
         "max_genes": config.max_genes,

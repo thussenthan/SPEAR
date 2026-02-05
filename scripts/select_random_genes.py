@@ -127,10 +127,11 @@ def write_manifest(
     output_path: Path,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["gene_name,gene_id,chrom,expression_fraction"]
-    for gene in sorted(genes, key=lambda g: g.gene_name):
-        frac = fractions.get(gene.gene_name, fractions.get(gene.gene_id, float("nan")))
-        lines.append(f"{gene.gene_name},{gene.gene_id},{gene.chrom},{frac}")
+    gene_list = list(genes)
+    lines = ["gene_name,chrom,expression_fraction"]
+    for gene in sorted(gene_list, key=lambda g: g.gene_name):
+        frac = fractions.get(gene.gene_name, fractions.get(gene.gene_id, 0.0))
+        lines.append(f"{gene.gene_name},{gene.chrom},{frac}")
     output_path.write_text("\n".join(lines) + "\n")
 
 
