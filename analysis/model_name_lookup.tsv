@@ -5,6 +5,7 @@ rnn	Recurrent Neural Network	RNN
 lstm	Long Short-Term Memory Network	LSTM
 transformer	Transformer Encoder	Transformer
 graph	Graph Neural Network	GNN
+dcn	Deep & Cross Network	DCN
 mlp	Multilayer Perceptron	MLP
 random_forest	Random Forest	RF
 extra_trees	Extra Trees (Random Forest Variant)	Extra Trees

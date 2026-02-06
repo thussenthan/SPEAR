@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 def _netrc_has_wandb() -> bool:
-    netrc_path = Path.home() / ".netrc"
+    netrc_path = Path(os.environ.get("NETRC", str(Path.home() / ".netrc")))
     if not netrc_path.exists():
         return False
     try:
@@ -29,17 +29,9 @@ def _netrc_has_wandb() -> bool:
 
 
 def _has_api_key_env() -> bool:
-    return bool(os.getenv("WANDB_API_KEY"))
+    api_key = os.getenv("WANDB_API_KEY")
+    return bool(api_key and api_key.strip())
 
-
-_WANDB_API_KEY_RE = re.compile(r"^(?:local-)?[A-Za-z0-9]{40}$")
-
-
-def _is_probably_valid_wandb_api_key(value: str) -> bool:
-    stripped = value.strip()
-    if not stripped:
-        return False
-    return bool(_WANDB_API_KEY_RE.fullmatch(stripped))
 
 
 def _wandb_disabled_by_env() -> bool:
@@ -119,18 +111,26 @@ def maybe_init_wandb(config: PipelineConfig, *, extra_context: Optional[Dict[str
 
     try:
         api_key_raw = os.getenv("WANDB_API_KEY")
-        api_key = api_key_raw.strip() if api_key_raw is not None else None
-        if api_key_raw is not None:
-            if _is_probably_valid_wandb_api_key(api_key_raw):
+        api_key = api_key_raw.strip() if api_key_raw else None
+        if api_key:
+            _LOG.info("W&B login: attempting WANDB_API_KEY authentication.")
+            try:
                 wandb.login(key=api_key, relogin=True)
-            elif _netrc_has_wandb():
-                _LOG.warning("Ignoring malformed WANDB_API_KEY; falling back to ~/.netrc credentials.")
-                wandb.login(relogin=True)
-            else:
-                _LOG.warning("Ignoring malformed WANDB_API_KEY; no ~/.netrc credentials found.")
-                return None
+            except Exception as exc:
+                if _netrc_has_wandb():
+                    _LOG.warning(
+                        "W&B login with WANDB_API_KEY failed, ignoring key and retrying with ~/.netrc; error=%s",
+                        exc,
+                    )
+                    # Fall back to credentials from ~/.netrc
+                    _LOG.info("W&B login: attempting ~/.netrc authentication.")
+                    wandb.login(relogin=True)
+                else:
+                    # No netrc credentials to fall back to; let the outer handler log and skip
+                    raise
         else:
             # Rely on credentials from ~/.netrc, already checked by _netrc_has_wandb()
+            _LOG.info("W&B login: attempting ~/.netrc authentication.")
             wandb.login(relogin=True)
     except Exception as exc:
         _LOG.warning("W&B login failed; skipping. error=%s", exc)

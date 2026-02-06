@@ -204,6 +204,7 @@ Data files are not published with the repository; treat the defaults above as lo
 | `lstm`        | Same conv front-end as RNN, `hidden_size=128` LSTM, dense head with dropout 0.2.                                                                |
 | `transformer` | Conv projection to 128 channels, adaptive pooling, transformer encoder (`embed_dim=128`, `num_layers=2`, `num_heads<=8`), dense head with GELU. |
 | `graph`       | Implicit 1D graph message-passing network that chunkifies ATAC bins, applies learned edge weights, and aggregates through residual MLP layers.  |
+| `dcn`         | Deep & Cross Network with 3 cross layers and a 256→256→128 deep tower; concatenated outputs are linearly projected to targets.                  |
 | `mlp`         | Fully connected stack: 256→256→128 with LayerNorm + ReLU + dropout 0.2, output layer sized to target dimension.                                 |
 
 Torch optimizers use `Adam(lr=1e-3, weight_decay=1e-5)` with automatic mixed precision when CUDA is available.

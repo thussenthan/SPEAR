@@ -31,7 +31,7 @@ SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibil
 
 - Predict the full RNA expression vector for every cell directly from its paired single-cell ATAC accessibility profile.
 - Build feature matrices using ±10 kb windows around each gene's transcription start site, binned at 500 bp (40 bins per gene) and recomputed for every run.
-- Provide a modular model zoo spanning convolutional, recurrent, transformer, graph-based, gradient boosting (XGBoost, CatBoost), multilayer perceptron, tree ensembles, and linear baselines (Ridge, Elastic Net, Lasso, OLS) so comparative experiments are one CLI flag away.
+- Provide a modular model zoo spanning convolutional, recurrent, transformer, graph-based, deep & cross networks, gradient boosting (XGBoost, CatBoost), multilayer perceptron, tree ensembles, and linear baselines (Ridge, Elastic Net, Lasso, OLS) so comparative experiments are one CLI flag away.
 - Produce test-set diagnostics (scatter plots, per-gene Pearson summaries, epoch histories) while persisting raw predictions for reproducibility and downstream analysis.
 
 - **Modal-specific normalization:**
@@ -41,7 +41,7 @@ SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibil
 - **k-NN smoothing:** Each cell is smoothed by averaging with its k nearest neighbors (default k=19 for `smoothing_k=20`) using PCA-informed nearest-neighbor search to reduce sparsity while maintaining dataset size.
 - **Optional pseudobulk aggregation:** PCA-informed, group-aware pooling within each sample when `pseudobulk_group_size > 1`.
 - **Group-aware splitting:** 70/15/15 train/val/test splits with `GroupShuffleSplit` keyed by `group_key` (default `sample`; falls back to random when insufficient groups), plus 5-fold cross-validation using `GroupKFold` when possible.
-- **Model zoo:** CNN, ResNet, RNN, LSTM, Transformer, Graph (implicit message passing), PyTorch MLP, Random Forest, Extra Trees, HistGradientBoosting, XGBoost, CatBoost, SVR, Ridge, Elastic Net, Lasso, and OLS. Each model is defined in `spear.models` and accessible through the CLI.
+- **Model zoo:** CNN, ResNet, RNN, LSTM, Transformer, Graph (implicit message passing), DCN (Deep & Cross Network), PyTorch MLP, Random Forest, Extra Trees, HistGradientBoosting, XGBoost, CatBoost, SVR, Ridge, Elastic Net, Lasso, and OLS. Each model is defined in `spear.models` and accessible through the CLI.
 - **Unified diagnostics:** `analysis/spear_results_analysis.ipynb` replaces prior plotting scripts, generating per-gene Pearson summaries, violin plots, top-genes scatter plots, RMSE comparisons, prediction-vs-truth charts, and epoch history curves directly from run outputs.
 
 ### Datasets
@@ -181,6 +181,7 @@ The following identifiers can be supplied to `--models` (and combined arbitraril
 - `lstm`
 - `transformer`
 - `graph`
+- `dcn`
 - `mlp`
 - `random_forest`
 - `extra_trees`

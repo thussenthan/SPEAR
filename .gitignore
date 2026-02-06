@@ -2,6 +2,8 @@
 data/
 jobs/
 work/
+output/
+wandb/
 
 # Local editor settings
 .vscode/
@@ -10,3 +12,5 @@ work/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+*.egg-info/
+*cache/

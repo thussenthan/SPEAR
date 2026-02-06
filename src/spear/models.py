@@ -379,6 +379,77 @@ class MLPRegressor(nn.Module):
         return out
 
 
+class CrossLayer(nn.Module):
+    """Cross layer from Deep & Cross Network (DCN).
+
+    Implements x_{l+1} = x0 * (w_l^T x_l) + b_l + x_l.
+    """
+
+    def __init__(self, input_dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(input_dim))
+        nn.init.normal_(self.weight, mean=0.0, std=1.0 / math.sqrt(input_dim))
+        self.bias = nn.Parameter(torch.zeros(input_dim))
+
+    def forward(self, x0: torch.Tensor, xl: torch.Tensor) -> torch.Tensor:
+        # (batch, d) @ (d,) -> (batch,)
+        cross = torch.matmul(xl, self.weight).unsqueeze(1)
+        return x0 * cross + self.bias + xl
+
+
+class DCNRegressor(nn.Module):
+    """Deep & Cross Network for explicit feature interactions + deep representation.
+
+    Architecture:
+        - Cross network with L cross layers (default 3) that builds bounded-degree
+          feature crosses via x_{l+1} = x0 * (w_l^T x_l) + b_l + x_l.
+        - Deep network with configurable MLP stack (default 256→256→128).
+        - Concatenate cross output with deep output, then linear projection to target.
+
+    Input: (batch, input_dim) → dense feature vector
+    Output: (batch, output_dim) predictions
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1,
+        num_cross_layers: int = 3,
+        deep_layers: tuple[int, ...] = (256, 256, 128),
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        if num_cross_layers < 1:
+            raise ValueError("num_cross_layers must be >= 1")
+        self.cross_layers = nn.ModuleList([CrossLayer(input_dim) for _ in range(num_cross_layers)])
+
+        if deep_layers:
+            deep: list[nn.Module] = []
+            in_dim = input_dim
+            for units in deep_layers:
+                deep.append(nn.Linear(in_dim, units))
+                deep.append(nn.LayerNorm(units))
+                deep.append(nn.ReLU())
+                deep.append(nn.Dropout(dropout))
+                in_dim = units
+            self.deep = nn.Sequential(*deep)
+            deep_out_dim = deep_layers[-1]
+        else:
+            self.deep = nn.Identity()
+            deep_out_dim = input_dim
+
+        self.output = nn.Linear(input_dim + deep_out_dim, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = x
+        xl = x
+        for layer in self.cross_layers:
+            xl = layer(x0, xl)
+        deep_out = self.deep(x)
+        combined = torch.cat([xl, deep_out], dim=-1)
+        return self.output(combined)
+
+
 class TransformerRegressor(nn.Module):
     """Transformer-based architecture with multi-head self-attention for pattern discovery.
     
@@ -553,6 +624,8 @@ def build_model(
         return TorchModelBundle(TransformerRegressor(input_dim, output_dim=output_dim), reshape="sequence")
     if name == "mlp":
         return TorchModelBundle(MLPRegressor(input_dim, output_dim=output_dim))
+    if name == "dcn":
+        return TorchModelBundle(DCNRegressor(input_dim, output_dim=output_dim))
     if name == "graph":
         return TorchModelBundle(GraphRegressor(input_dim, output_dim=output_dim), reshape="flat")
     if name == "svr":
