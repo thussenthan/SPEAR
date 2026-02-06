@@ -227,10 +227,11 @@ def _log_resource_snapshot(label: str) -> None:
         rss_gib = float("nan")
     try:
         if not _CPU_PRIMED:
-            # Prime the CPU percent sampler so subsequent reads are meaningful.
-            process.cpu_percent(interval=0.1)
+            # Prime the CPU percent sampler and use the priming sample as the first value.
+            cpu_pct = process.cpu_percent(interval=0.1)
             _CPU_PRIMED = True
-        cpu_pct = process.cpu_percent(interval=None)
+        else:
+            cpu_pct = process.cpu_percent(interval=None)
         _RESOURCE_TRACKER["peak_cpu_pct"] = max(_RESOURCE_TRACKER["peak_cpu_pct"], cpu_pct)
     except Exception:  # pragma: no cover - defensive fallback
         cpu_pct = float("nan")

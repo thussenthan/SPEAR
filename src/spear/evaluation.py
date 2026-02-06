@@ -1543,7 +1543,7 @@ def _run_cellwise_pipeline(
         export_run_configuration_snapshot()
 
         if failures:
-            wandb_update_summary(wandb_run, {"status": "failed", "failure_count": len(failures)})
+            wandb_update_summary(wandb_run, {"status": "failed"})
             raise RuntimeError(
                 "One or more models failed in multi-output mode: "
                 + "; ".join(failures)
@@ -1629,20 +1629,8 @@ def _run_cellwise_pipeline(
                     _LOG.info("═" * 80)
                     _LOG.info("Run resource peaks | %s", " | ".join(summary_parts))
                     _LOG.info("═" * 80)
-                if wandb_run is not None:
-                    summary_payload = {
-                        "peak_rss_gib": resource_summary.get("peak_rss_gib"),
-                        "peak_cpu_pct": resource_summary.get("peak_cpu_pct"),
-                        "peak_gpu_allocated_mb": resource_summary.get("peak_gpu_allocated_mb"),
-                        "peak_gpu_reserved_mb": resource_summary.get("peak_gpu_reserved_mb"),
-                        "min_gpu_free_mb": resource_summary.get("peak_gpu_free_mb"),
-                    }
-                    if resource_summary.get("max_gpu_devices", 0) > 1:
-                        summary_payload["gpu_devices"] = resource_summary.get("max_gpu_devices")
-                    wandb_update_summary(
-                        wandb_run,
-                        summary_payload,
-                    )
+                # W&B already logs system metrics; omit our resource summary from W&B to avoid redundancy.
+                pass
         except Exception:  # pragma: no cover
             _LOG.debug("Failed to log resource summary", exc_info=True)
         

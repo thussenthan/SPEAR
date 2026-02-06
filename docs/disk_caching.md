@@ -140,11 +140,11 @@ Train models using cached preprocessing:
 
 ```bash
 # First model: cache lookup, then compute (if needed)
-python -m spear.cli train --dataset embryonic --model ridge --cache-dir data/.spear_cache
+python -m spear.cli train --dataset embryonic --models ridge --cache-dir data/.spear_cache
 
 # Subsequent models: preprocessing loads from cache in 5–10 sec
-python -m spear.cli train --dataset embryonic --model elasticnet --cache-dir data/.spear_cache
-python -m spear.cli train --dataset endothelial --model ridge --cache-dir data/.spear_cache
+python -m spear.cli train --dataset embryonic --models elasticnet --cache-dir data/.spear_cache
+python -m spear.cli train --dataset endothelial --models ridge --cache-dir data/.spear_cache
 ```
 
 ### API Usage

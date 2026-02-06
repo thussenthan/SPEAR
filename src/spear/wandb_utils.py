@@ -107,9 +107,13 @@ def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
         "max_genes": config.max_genes,
         "num_requested_genes": len(config.genes) if config.genes else None,
         "chromosomes": config.chromosomes,
-        "models": config.all_models(),
+        "model": (config.all_models()[0] if config.all_models() else None),
         "training": asdict(config.training),
     }
+    # Remove noisy training fields from W&B config to avoid redundancy.
+    payload["training"].pop("track_history", None)
+    payload["training"].pop("history_metrics", None)
+    payload["training"].pop("resource_sample_seconds", None)
     if config.chunk_total > 1 or config.chunk_index > 0:
         payload["chunk_index"] = config.chunk_index
         payload["chunk_total"] = config.chunk_total
