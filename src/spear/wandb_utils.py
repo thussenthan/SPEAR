@@ -78,18 +78,41 @@ def _clean_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+_DATASET_PATTERN = re.compile(r"(embryonic|endothelial)", re.IGNORECASE)
+
+
+def _infer_dataset_name(config: PipelineConfig) -> Optional[str]:
+    explicit = getattr(config, "dataset", None)
+    if explicit:
+        return str(explicit).strip().lower()
+    paths = config.paths
+    candidates = [
+        str(paths.base_dir),
+        str(paths.atac_path),
+        str(paths.rna_path),
+        str(paths.gtf_path),
+    ]
+    for candidate in candidates:
+        match = _DATASET_PATTERN.search(candidate)
+        if match:
+            return match.group(1).lower()
+    return None
+
+
 def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
     payload = {
         "run_name": config.run_name,
+        "dataset": _infer_dataset_name(config),
         "multi_output": config.multi_output,
-        "chunk_index": config.chunk_index,
-        "chunk_total": config.chunk_total,
         "max_genes": config.max_genes,
         "num_requested_genes": len(config.genes) if config.genes else None,
         "chromosomes": config.chromosomes,
         "models": config.all_models(),
         "training": asdict(config.training),
     }
+    if config.chunk_total > 1 or config.chunk_index > 0:
+        payload["chunk_index"] = config.chunk_index
+        payload["chunk_total"] = config.chunk_total
     return _clean_payload(payload)
 
 

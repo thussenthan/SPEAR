@@ -944,12 +944,14 @@ def _run_per_gene_pipeline(
         wandb_run,
         {
             "mode": "per_gene",
-            "chunk_index": chunk_index,
-            "chunk_total": chunk_total,
             "total_models": len(config.all_models()),
             "requested_genes": len(genes),
             "num_genes": len(genes),
-            "models": config.all_models(),
+            **(
+                {"chunk_index": chunk_index, "chunk_total": chunk_total}
+                if chunk_total > 1 or chunk_index > 0
+                else {}
+            ),
         },
     )
     
@@ -1093,11 +1095,14 @@ def _run_per_gene_pipeline(
             metrics_payload: Dict[str, Any] = {
             }
             for key, value in metrics_mean.items():
-                metrics_payload[f"{model_name}/{key}"] = value
+                if "_" in key:
+                    split, metric = key.split("_", 1)
+                    metrics_payload[f"{split}/{metric}"] = value
+                else:
+                    metrics_payload[key] = value
             wandb_log_metrics(
                 wandb_run,
                 metrics_payload,
-                step=model_order.get(model_name),
             )
     
         feature_importances = store["feature_importances"]
@@ -1340,12 +1345,14 @@ def _run_cellwise_pipeline(
             wandb_run,
             {
                 "mode": "multi_output",
-                "chunk_index": chunk_index,
-                "chunk_total": chunk_total,
                 "num_genes": dataset.num_genes(),
                 "num_cells": dataset.num_cells(),
                 "num_features": dataset.num_features(),
-                "models": config.all_models(),
+                **(
+                    {"chunk_index": chunk_index, "chunk_total": chunk_total}
+                    if chunk_total > 1 or chunk_index > 0
+                    else {}
+                ),
             },
         )
 
@@ -1495,8 +1502,12 @@ def _run_cellwise_pipeline(
                 for key, value in metric_payload.items():
                     if key == "model" or key == "num_genes":
                         continue
-                    wandb_payload[f"{model_name}/{key}"] = value
-                wandb_log_metrics(wandb_run, wandb_payload, step=model_idx)
+                    if "_" in key:
+                        split, metric = key.split("_", 1)
+                        wandb_payload[f"{split}/{metric}"] = value
+                    else:
+                        wandb_payload[key] = value
+                wandb_log_metrics(wandb_run, wandb_payload)
 
                 # Verify all critical files were written before logging completion
                 critical_files = [
@@ -1532,7 +1543,7 @@ def _run_cellwise_pipeline(
         export_run_configuration_snapshot()
 
         if failures:
-            wandb_update_summary(wandb_run, {"status": "failed", "failures": len(failures)})
+            wandb_update_summary(wandb_run, {"status": "failed", "failure_count": len(failures)})
             raise RuntimeError(
                 "One or more models failed in multi-output mode: "
                 + "; ".join(failures)
@@ -1619,16 +1630,18 @@ def _run_cellwise_pipeline(
                     _LOG.info("Run resource peaks | %s", " | ".join(summary_parts))
                     _LOG.info("═" * 80)
                 if wandb_run is not None:
+                    summary_payload = {
+                        "peak_rss_gib": resource_summary.get("peak_rss_gib"),
+                        "peak_cpu_pct": resource_summary.get("peak_cpu_pct"),
+                        "peak_gpu_allocated_mb": resource_summary.get("peak_gpu_allocated_mb"),
+                        "peak_gpu_reserved_mb": resource_summary.get("peak_gpu_reserved_mb"),
+                        "min_gpu_free_mb": resource_summary.get("peak_gpu_free_mb"),
+                    }
+                    if resource_summary.get("max_gpu_devices", 0) > 1:
+                        summary_payload["gpu_devices"] = resource_summary.get("max_gpu_devices")
                     wandb_update_summary(
                         wandb_run,
-                        {
-                            "peak_rss_gib": resource_summary.get("peak_rss_gib"),
-                            "peak_cpu_pct": resource_summary.get("peak_cpu_pct"),
-                            "peak_gpu_allocated_mb": resource_summary.get("peak_gpu_allocated_mb"),
-                            "peak_gpu_reserved_mb": resource_summary.get("peak_gpu_reserved_mb"),
-                            "min_gpu_free_mb": resource_summary.get("peak_gpu_free_mb"),
-                            "gpu_devices": resource_summary.get("max_gpu_devices"),
-                        },
+                        summary_payload,
                     )
         except Exception:  # pragma: no cover
             _LOG.debug("Failed to log resource summary", exc_info=True)

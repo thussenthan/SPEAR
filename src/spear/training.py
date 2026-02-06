@@ -50,6 +50,7 @@ _RESOURCE_TRACKER = {
     "peak_gpu_free_mb": float("inf"),
     "max_gpu_devices": 0,
 }
+_CPU_PRIMED = False
 
 
 def _get_gpu_utilization_pct(device_index: int = 0) -> Optional[float]:
@@ -214,6 +215,7 @@ def _seed_everything(seed: int) -> None:
 
 
 def _log_resource_snapshot(label: str) -> None:
+    global _CPU_PRIMED
     if psutil is None:
         return
     process = psutil.Process()
@@ -224,6 +226,10 @@ def _log_resource_snapshot(label: str) -> None:
     except Exception:  # pragma: no cover - defensive fallback
         rss_gib = float("nan")
     try:
+        if not _CPU_PRIMED:
+            # Prime the CPU percent sampler so subsequent reads are meaningful.
+            process.cpu_percent(interval=0.1)
+            _CPU_PRIMED = True
         cpu_pct = process.cpu_percent(interval=None)
         _RESOURCE_TRACKER["peak_cpu_pct"] = max(_RESOURCE_TRACKER["peak_cpu_pct"], cpu_pct)
     except Exception:  # pragma: no cover - defensive fallback
