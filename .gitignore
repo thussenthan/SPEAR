@@ -4,6 +4,7 @@ jobs/
 work/
 output/
 wandb/
+todo.md
 
 # Local editor settings
 .vscode/

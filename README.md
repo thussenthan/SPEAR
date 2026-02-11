@@ -16,7 +16,7 @@ SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibil
 ## Outputs
 
 - Run artifacts under `output/results/` (metrics, predictions, histories, model files).
-- Logs under `output/logs`.
+- Logs under `output/logs` (pipeline logs: `<run_name>.log`; Slurm logs: `spear_<jobid>_<task>.out/.err`).
 - Figures under `analysis/figs`.
 
 ## Usage
@@ -102,7 +102,8 @@ Environment / CLI highlights:
 - `--gene-manifest` guarantees that every model trains on the same gene subset.
 - `--cache-dir` enables on-disk reuse of preprocessing (recommended for repeated model runs).
 - `--chromosomes genome-wide` explicitly disables chromosome filtering; provide a list to restrict loci.
-- `--run-name` customises the output directory name.
+- `--run-name` customises the output directory name (default: `spear_<model>_<genes>_<dataset>_<cpu/gpu>_<timestamp>`; missing components are omitted).
+- W&B run name defaults to `<model>_<genes>_<dataset>` unless `--wandb-run-name` is provided.
 - `--device` supports `cuda`, `cpu`, or `auto` (prefers CUDA when available; falls back otherwise).
 - `--disable-pseudobulk` is a quick toggle to benchmark true single-cell training (equivalent to setting `--pseudobulk-group-size 1`).
 - `--atac-layer` lets you swap CPM for alternative ATAC transforms such as `tfidf` or disable normalisation entirely.
@@ -159,7 +160,7 @@ Only per-gene **test-set** Pearson correlations are emphasised in the visualizat
 
 ### Output Layout
 
-Run artifacts are written under `output/results/spear_results/<run_name>/` with subfolders for each model. Each model directory includes metrics, predictions, histories, and (when enabled) feature-importance/SHAP exports.
+Run artifacts are written under `output/results/<run_name>/` with subfolders for each model. Each model directory includes metrics, predictions, histories, and (when enabled) feature-importance/SHAP exports.
 
 ### Feature Importance & SHAP Artifacts
 
@@ -227,7 +228,7 @@ Use the inference helper to generate predictions from a trained run directory:
 
 ```bash
 python -m spear.predict \
-  --run-dir output/results/spear_results/<run_name> \
+  --run-dir output/results/<run_name> \
   --model mlp \
   --atac-path /path/to/new_atac.h5ad \
   --output /path/to/predictions_inference.csv

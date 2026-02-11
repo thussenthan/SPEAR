@@ -99,16 +99,21 @@ def _infer_dataset_name(config: PipelineConfig) -> Optional[str]:
     return None
 
 
+def infer_dataset_name(config: PipelineConfig) -> Optional[str]:
+    return _infer_dataset_name(config)
+
+
 def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
+    slurm_job_id = os.getenv("SLURM_JOB_ID") or os.getenv("SLURM_JOBID")
     payload = {
-        "run_name": config.run_name,
-        "dataset": _infer_dataset_name(config),
+        "dataset": infer_dataset_name(config),
         "multi_output": config.multi_output,
         "max_genes": config.max_genes,
         "num_requested_genes": len(config.genes) if config.genes else None,
         "chromosomes": config.chromosomes,
         "model": (config.all_models()[0] if config.all_models() else None),
         "training": asdict(config.training),
+        "slurm_job_id": slurm_job_id,
     }
     # Remove noisy training fields from W&B config to avoid redundancy.
     payload["training"].pop("track_history", None)
@@ -118,6 +123,18 @@ def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
         payload["chunk_index"] = config.chunk_index
         payload["chunk_total"] = config.chunk_total
     return _clean_payload(payload)
+
+
+def _default_wandb_run_name(config_payload: Dict[str, Any]) -> str:
+    model = config_payload.get("model") or "model"
+    dataset = config_payload.get("dataset") or "unknown"
+    gene_count = config_payload.get("max_genes")
+    if gene_count is None:
+        gene_count = config_payload.get("num_requested_genes")
+    gene_label = f"{gene_count}genes" if gene_count not in (None, 0) else "allgenes"
+    return f"{model}_{gene_label}_{dataset}"
+
+
 
 
 def maybe_init_wandb(config: PipelineConfig, *, extra_context: Optional[Dict[str, Any]] = None) -> Optional[Any]:
@@ -166,6 +183,8 @@ def maybe_init_wandb(config: PipelineConfig, *, extra_context: Optional[Dict[str
     config_payload = _build_wandb_config_payload(config)
     if extra_context:
         config_payload["context"] = _clean_payload(extra_context)
+    if not wandb_cfg.run_name:
+        wandb_cfg.run_name = _default_wandb_run_name(config_payload)
 
     try:
         run = wandb.init(
@@ -178,6 +197,11 @@ def maybe_init_wandb(config: PipelineConfig, *, extra_context: Optional[Dict[str
             config=config_payload,
         )
         _LOG.info("W&B run initialized | project=%s | name=%s", wandb_cfg.project, run.name)
+        if wandb_cfg.log_code:
+            try:
+                run.log_code(str(config.paths.base_dir))
+            except Exception:
+                _LOG.debug("W&B code logging failed", exc_info=True)
         return run
     except Exception as exc:
         _LOG.warning("W&B initialization failed; skipping. error=%s", exc)
@@ -294,11 +318,11 @@ def wandb_finish(run: Optional[Any], *, status: str, run_dir: Optional[Path] = N
     if run is None:
         return
     try:
-        summary: Dict[str, Any] = {"status": status}
         if run_dir is not None:
-            summary["output_dir"] = str(run_dir)
-        run.summary.update(_clean_payload(summary))
-        run.finish()
+            run.summary.update(_clean_payload({"output_dir": str(run_dir)}))
+        status_norm = (status or "").strip().lower()
+        exit_code = 0 if status_norm in {"succeeded", "success"} else 1
+        run.finish(exit_code=exit_code)
     except Exception:
         _LOG.debug("W&B finish failed", exc_info=True)
 
@@ -317,7 +341,9 @@ def log_run_artifacts(run: Optional[Any], run_dir: Path, *, include: Optional[It
     if not include_patterns:
         include_patterns = [
             "run_configuration.json",
+            "dataset_manifest.json",
             "summary_metrics.csv",
+            "summary_metrics_per_gene.csv",
             "selected_genes.csv",
             "models/*/metrics_aggregate.csv",
             "models/*/metrics_per_gene.csv",
@@ -326,8 +352,16 @@ def log_run_artifacts(run: Optional[Any], run_dir: Path, *, include: Optional[It
             "models/*/metrics_cv.csv",
             "models/*/training_history.csv",
             "models/*/histories/*.csv",
+            "models/*/model_meta.json",
+            "models/*/feature_scaler.pkl",
+            "models/*/model.pt",
             "models/*/feature_importances_mean.csv",
             "models/*/feature_importances_per_gene.csv",
+            "models/*/feature_importance_per_gene_summary.csv",
+            "models/*/feature_importance_summary.json",
+            "models/*/shap_importances_mean.csv",
+            "models/*/shap_importance_summary.json",
+            "models/*/per_gene_panels/*.png",
         ]
 
     if wandb is None:
@@ -389,6 +423,63 @@ def log_tables_from_csv(
         _LOG.debug("Failed to log W&B table %s", table_name, exc_info=True)
 
 
+def log_training_history_charts_from_csv(
+    run: Optional[Any],
+    csv_path: Path,
+    *,
+    prefix: str,
+) -> None:
+    if run is None:
+        return
+    if wandb is None:
+        return
+    if not csv_path.exists():
+        return
+    try:
+        import pandas as pd
+    except Exception:
+        _LOG.debug("pandas unavailable for W&B history charts", exc_info=True)
+        return
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        _LOG.debug("Failed to read CSV for W&B history charts: %s", csv_path, exc_info=True)
+        return
+    if df.empty or "epoch" not in df.columns:
+        return
+
+    metric_groups = {
+        "Loss": ("train_loss", "val_loss"),
+        "Pearson": ("train_pearson", "val_pearson"),
+        "R2": ("train_r2", "val_r2"),
+        "Spearman": ("train_spearman", "val_spearman"),
+        "RMSE": ("train_rmse", "val_rmse"),
+        "MSE": ("train_mse", "val_mse"),
+        "MAE": ("train_mae", "val_mae"),
+    }
+
+    try:
+        table = wandb.Table(dataframe=df)
+    except Exception:
+        _LOG.debug("Failed to build W&B table for history charts: %s", csv_path, exc_info=True)
+        return
+
+    for label, (train_col, val_col) in metric_groups.items():
+        y_cols = [c for c in (train_col, val_col) if c in df.columns]
+        if not y_cols:
+            continue
+        try:
+            chart = wandb.plot.line_series(
+                table,
+                x="epoch",
+                y=y_cols,
+                title=f"{prefix} {label}",
+            )
+            run.log({f"Charts/{prefix}/{label}": chart})
+        except Exception:
+            _LOG.debug("Failed to log W&B history chart %s (%s)", label, csv_path, exc_info=True)
+
+
 def log_images_from_globs(
     run: Optional[Any],
     run_dir: Path,
@@ -396,6 +487,7 @@ def log_images_from_globs(
     patterns: Iterable[str],
     max_items: int,
     prefix: Optional[str] = None,
+    group_key: Optional[str] = None,
 ) -> None:
     if run is None or max_items == 0:
         return
@@ -403,6 +495,7 @@ def log_images_from_globs(
         return
 
     logged = 0
+    grouped_images = [] if group_key else None
     for pattern in patterns:
         for path in run_dir.glob(pattern):
             if not path.is_file():
@@ -412,9 +505,19 @@ def log_images_from_globs(
             name = str(path.relative_to(run_dir))
             key = f"{prefix}/{name}" if prefix else name
             try:
-                run.log({key: wandb.Image(str(path))})
+                if group_key:
+                    grouped_images.append(wandb.Image(str(path), caption=name))
+                else:
+                    run.log({key: wandb.Image(str(path))})
                 logged += 1
             except Exception:
                 _LOG.debug("Failed to log W&B image %s", path, exc_info=True)
             if max_items > 0 and logged >= max_items:
-                return
+                break
+        if max_items > 0 and logged >= max_items:
+            break
+    if group_key and grouped_images:
+        try:
+            run.log({group_key: grouped_images})
+        except Exception:
+            _LOG.debug("Failed to log grouped W&B images for %s", group_key, exc_info=True)

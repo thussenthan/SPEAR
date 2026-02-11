@@ -6,9 +6,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import torch
+
 from .config import ModelConfig, PipelineConfig, PathsConfig, TrainingConfig, WandbConfig
 from .evaluation import run_pipeline
 from .logging_utils import configure_logging, get_logger
+from .wandb_utils import infer_dataset_name
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -398,11 +401,30 @@ def main(argv: Optional[list[str]] = None) -> None:
         if args.cache_dir:
             config.cache_dir = Path(args.cache_dir)
 
-    run_name = args.run_name or f"spear_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if args.run_name:
+        run_name = args.run_name
+    else:
+        dataset = infer_dataset_name(config)
+        models_list = config.all_models()
+        model = models_list[0] if models_list else None
+        device = (config.training.device_preference or "").lower()
+        if device not in {"cpu", "cuda", "auto"}:
+            device = ""
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        gene_count = config.max_genes
+        if gene_count is None:
+            gene_count = len(config.genes) if config.genes else None
+        gene_label = None if gene_count in (None, 0) else f"{gene_count}genes"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        parts = ["spear", model, gene_label, dataset, device, timestamp]
+        run_name = "_".join([part for part in parts if part])
     config.run_name = run_name
     config.ensure_directories()
 
-    log_path = configure_logging(config.paths.logs_dir, run_name)
+    log_path, run_context = configure_logging(config.paths.logs_dir, run_name)
+    config.run_context = run_context
+    config.log_path = log_path
     logger = get_logger(__name__)
     logger.info("Logging to %s", log_path)
 

@@ -55,7 +55,7 @@ For interactive visualization and figure generation, use:
 
 - `analysis/manuscript_figures.ipynb` – Interactive analysis and manuscript figure generation
 
-The notebook expects results in `output/results/spear_results/` and will generate publication-ready figures.
+The notebook expects results in `output/results/` and will generate publication-ready figures.
 
 Run any script with `python scripts/<name>.py --help` for available options.
 

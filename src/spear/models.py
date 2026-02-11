@@ -6,6 +6,7 @@ from typing import Optional
 
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.compose import TransformedTargetRegressor
@@ -26,6 +27,41 @@ except ImportError:  # pragma: no cover - optional
     CatBoostRegressor = None  # type: ignore
 
 from .config import TrainingConfig
+
+
+class _CatBoostRegressorCompat(BaseEstimator, RegressorMixin):
+    """Compatibility wrapper so sklearn meta-estimators can clone CatBoost.
+
+    Newer scikit-learn releases rely on BaseEstimator tags; CatBoost's
+    estimator doesn't expose them, so we wrap it with a thin adapter.
+    """
+
+    def __init__(self, **params):
+        self._params = dict(params)
+        if CatBoostRegressor is None:
+            raise RuntimeError("catboost is not installed. Install with `pip install catboost` to enable this model.")
+        self._model = CatBoostRegressor(**self._params)
+
+    def fit(self, X, y, **fit_params):
+        self._model.fit(X, y, **fit_params)
+        return self
+
+    def predict(self, X):
+        return self._model.predict(X)
+
+    def __getattr__(self, name):
+        # Delegate CatBoost-specific attributes (e.g., feature_importances_) to the wrapped model.
+        return getattr(self._model, name)
+
+    def get_params(self, deep: bool = True):
+        return dict(self._params)
+
+    def set_params(self, **params):
+        self._params.update(params)
+        if CatBoostRegressor is None:
+            raise RuntimeError("catboost is not installed. Install with `pip install catboost` to enable this model.")
+        self._model = CatBoostRegressor(**self._params)
+        return self
 
 
 def _rf_params(
@@ -717,7 +753,7 @@ def build_model(
             catboost_params["allow_writing_files"] = True
         else:
             catboost_params["allow_writing_files"] = False
-        base_model = CatBoostRegressor(**catboost_params)
+        base_model = _CatBoostRegressorCompat(**catboost_params)
         if output_dim == 1:
             return base_model
         return MultiOutputRegressor(base_model)

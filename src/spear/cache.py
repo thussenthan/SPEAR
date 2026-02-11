@@ -1,110 +1,23 @@
 """On-disk caching utilities for preprocessed data."""
 
-import json
 import logging
 from pathlib import Path
 from typing import Optional
 import pickle
 import numpy as np
 import scipy.sparse as sp
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 from .data_types import PreparedData, PreparedCellwiseData, SplitData, CellwiseSplitData
 
 _LOG = logging.getLogger(__name__)
 
 
-def _jsonify_value(value):
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.floating, np.integer)):
-        return value.item()
-    if isinstance(value, (list, tuple)):
-        return [_jsonify_value(item) for item in value]
-    return value
-
-
-def _serialize_scaler(scaler):
-    if scaler is None:
-        return None
-    if isinstance(scaler, StandardScaler):
-        state = {
-            "mean_": scaler.mean_,
-            "scale_": scaler.scale_,
-            "var_": scaler.var_,
-            "n_samples_seen_": scaler.n_samples_seen_,
-            "feature_names_in_": getattr(scaler, "feature_names_in_", None),
-            "n_features_in_": getattr(scaler, "n_features_in_", None),
-        }
-        return {
-            "class": "StandardScaler",
-            "params": scaler.get_params(),
-            "state": {key: _jsonify_value(value) for key, value in state.items() if value is not None},
-        }
-    if isinstance(scaler, MinMaxScaler):
-        state = {
-            "data_min_": scaler.data_min_,
-            "data_max_": scaler.data_max_,
-            "data_range_": scaler.data_range_,
-            "scale_": scaler.scale_,
-            "min_": scaler.min_,
-            "n_samples_seen_": scaler.n_samples_seen_,
-            "feature_names_in_": getattr(scaler, "feature_names_in_", None),
-            "n_features_in_": getattr(scaler, "n_features_in_", None),
-        }
-        return {
-            "class": "MinMaxScaler",
-            "params": scaler.get_params(),
-            "state": {key: _jsonify_value(value) for key, value in state.items() if value is not None},
-        }
-    raise TypeError(
-        f"Unsupported scaler type: {type(scaler).__name__}. "
-        "Supported types: StandardScaler, MinMaxScaler"
-    )
-
-
-def _restore_array(value):
-    if isinstance(value, list):
-        return np.array(value)
-    return value
-
-
-def _deserialize_scaler(payload):
-    if payload is None:
-        return None
-    scaler_class = payload.get("class")
-    params = payload.get("params", {})
-    state = payload.get("state", {})
-    if scaler_class == "StandardScaler":
-        scaler = StandardScaler(**params)
-    elif scaler_class == "MinMaxScaler":
-        scaler = MinMaxScaler(**params)
-    else:
-        raise ValueError(
-            f"Unsupported scaler class: {scaler_class}. "
-            "Supported classes: StandardScaler, MinMaxScaler"
-        )
-    for key, value in state.items():
-        setattr(scaler, key, _restore_array(value))
-    return scaler
-
-
 def _load_scalers(cache_dir: Path, cache_key: str, prefix: str):
     scaler_file_pickle = cache_dir / f"{cache_key}_{prefix}_scalers.pkl"
-    scaler_file_json = cache_dir / f"{cache_key}_{prefix}_scalers.json"
-
-    # Load scalers (pickle primary, JSON fallback)
-    if scaler_file_pickle.exists():
-        with open(scaler_file_pickle, "rb") as f:
-            scaler_data = pickle.load(f)
-        feature_scaler = scaler_data["feature_scaler"]
-        target_scaler = scaler_data["target_scaler"]
-    else:
-        with open(scaler_file_json, "r", encoding="utf-8") as f:
-            scaler_payload = json.load(f)
-        feature_scaler = _deserialize_scaler(scaler_payload.get("feature_scaler"))
-        target_scaler = _deserialize_scaler(scaler_payload.get("target_scaler"))
-
+    with open(scaler_file_pickle, "rb") as f:
+        scaler_data = pickle.load(f)
+    feature_scaler = scaler_data["feature_scaler"]
+    target_scaler = scaler_data["target_scaler"]
     return feature_scaler, target_scaler
 
 
@@ -185,9 +98,8 @@ def load_prepared_data(cache_dir: Path, cache_key: str) -> Optional[PreparedData
     cache_dir = Path(cache_dir)
     split_file = cache_dir / f"{cache_key}_gene_splits.npz"
     scaler_file_pickle = cache_dir / f"{cache_key}_gene_scalers.pkl"
-    scaler_file_json = cache_dir / f"{cache_key}_gene_scalers.json"
     
-    if not split_file.exists() or (not scaler_file_pickle.exists() and not scaler_file_json.exists()):
+    if not split_file.exists() or not scaler_file_pickle.exists():
         return None
     
     try:
@@ -363,9 +275,8 @@ def load_prepared_cellwise_data(cache_dir: Path, cache_key: str) -> Optional[Pre
     cache_dir = Path(cache_dir)
     split_file = cache_dir / f"{cache_key}_cellwise_splits.npz"
     scaler_file_pickle = cache_dir / f"{cache_key}_cellwise_scalers.pkl"
-    scaler_file_json = cache_dir / f"{cache_key}_cellwise_scalers.json"
     
-    if not split_file.exists() or (not scaler_file_pickle.exists() and not scaler_file_json.exists()):
+    if not split_file.exists() or not scaler_file_pickle.exists():
         return None
     
     try:

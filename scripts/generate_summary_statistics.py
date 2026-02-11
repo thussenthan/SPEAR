@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate summary statistics for all SPEAR model runs.
-This script scans output/results/spear_results/ and creates a comprehensive summary table.
+This script scans output/results/ and creates a comprehensive summary table.
 """
 
 from pathlib import Path
@@ -279,7 +279,7 @@ def print_summary_report(df: pd.DataFrame):
 def main():
     """Main entry point."""
     project_root = Path(__file__).parent.parent
-    results_root = project_root / "output" / "results" / "spear_results"
+    results_root = project_root / "output" / "results"
     reports_dir = project_root / "analysis" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     

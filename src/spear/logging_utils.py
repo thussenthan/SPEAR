@@ -9,7 +9,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 
 class _MaxLevelFilter(logging.Filter):
@@ -21,7 +23,27 @@ class _MaxLevelFilter(logging.Filter):
         return record.levelno <= self._max_level
 
 
-def configure_logging(logs_dir: Path, run_name: str, log_level: int = logging.INFO) -> Path:
+def build_run_context(run_name: str) -> Dict[str, Optional[str]]:
+    cwd = os.getcwd()
+    host = socket.gethostname()
+    user = os.getenv("USER") or os.getenv("LOGNAME") or ""
+    slurm_job = os.getenv("SLURM_JOB_ID")
+    slurm_task = os.getenv("SLURM_ARRAY_TASK_ID")
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    return {
+        "run_name": run_name,
+        "user": user,
+        "cwd": cwd,
+        "host": host,
+        "timestamp_utc": timestamp,
+        "slurm_job": slurm_job,
+        "slurm_task": slurm_task,
+    }
+
+
+def configure_logging(
+    logs_dir: Path, run_name: str, log_level: int = logging.INFO
+) -> Tuple[Path, Optional[Dict[str, Optional[str]]]]:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"{run_name}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,28 +74,24 @@ def configure_logging(logs_dir: Path, run_name: str, log_level: int = logging.IN
     logging.getLogger("numexpr").setLevel(logging.WARNING)
 
     # Emit an initial run-context record so the file log contains node/time info
+    run_context: Optional[Dict[str, Optional[str]]] = None
     try:
-        cwd = os.getcwd()
-        host = socket.gethostname()
-        user = os.getenv("USER") or os.getenv("LOGNAME") or ""
-        slurm_job = os.getenv("SLURM_JOB_ID")
-        slurm_task = os.getenv("SLURM_ARRAY_TASK_ID")
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        run_context = build_run_context(run_name)
         root.info(
             "Run context | run_name=%s | user=%s | cwd=%s | host=%s | timestamp_utc=%s | slurm_job=%s | slurm_task=%s",
-            run_name,
-            user,
-            cwd,
-            host,
-            timestamp,
-            slurm_job,
-            slurm_task,
+            run_context.get("run_name"),
+            run_context.get("user"),
+            run_context.get("cwd"),
+            run_context.get("host"),
+            run_context.get("timestamp_utc"),
+            run_context.get("slurm_job"),
+            run_context.get("slurm_task"),
         )
     except Exception:
         # Never fail logging setup due to environment introspection
-        pass
+        run_context = None
 
-    return log_path
+    return log_path, run_context
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
@@ -248,8 +266,9 @@ class ResourceUsageTracker:
         )
 
     def _write_csv(self) -> None:
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        path = self._output_dir / f"{self._safe_name}_resource_usage.csv"
+        output_dir = self._output_dir / self._safe_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "model_resource_usage.csv"
         try:
             with path.open("w", newline="") as handle:
                 writer = csv.writer(handle)
@@ -298,33 +317,47 @@ class ResourceUsageTracker:
         if not times:
             return
 
-        fig, ax_left = plt.subplots(figsize=(8, 4.5))
-        ax_left.plot(times, rss, label="RSS (GiB)", color="#1f77b4")
-        ax_left.set_xlabel("Time (s)")
-        ax_left.set_ylabel("Memory (GiB)", color="#1f77b4")
-        ax_left.tick_params(axis="y", labelcolor="#1f77b4")
+        output_dir = self._output_dir / self._safe_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        time_min = min(times)
+        time_max = max(times)
 
-        ax_right = ax_left.twinx()
-        ax_right.plot(times, cpu, label="CPU %", color="#ff7f0e", linestyle="--")
-        ax_right.set_ylabel("Utilization / GPU Memory", color="#ff7f0e")
-        ax_right.tick_params(axis="y", labelcolor="#ff7f0e")
-
+        series_to_plot: list[tuple[str, list[float], str, str]] = [
+            ("RSS (GiB)", rss, "RSS (GiB)", "#1f77b4"),
+            ("CPU %", cpu, "CPU %", "#ff7f0e"),
+        ]
         if any(value > 0.0 for value in gpu):
-            ax_right.plot(times, gpu, label="GPU mem (GiB)", color="#2ca02c", linestyle=":")
+            series_to_plot.append(("GPU mem (GiB)", gpu, "GPU mem (GiB)", "#2ca02c"))
         if any(value > 0.0 for value in gpu_reserved):
-            ax_right.plot(times, gpu_reserved, label="GPU reserved (GiB)", color="#17becf", linestyle=":")
+            series_to_plot.append(("GPU reserved (GiB)", gpu_reserved, "GPU reserved (GiB)", "#17becf"))
         if any(value == value for value in gpu_util):
-            ax_right.plot(times, gpu_util, label="GPU %", color="#9467bd", linestyle="-.")
+            series_to_plot.append(("GPU %", gpu_util, "GPU %", "#9467bd"))
+        if any(value > 0 for value in threads):
+            series_to_plot.append(("Threads", threads, "Threads", "#8c564b"))
 
-        ax_left.set_title(f"Resource usage | {self._name}")
-        lines_left, labels_left = ax_left.get_legend_handles_labels()
-        lines_right, labels_right = ax_right.get_legend_handles_labels()
-        if lines_left or lines_right:
-            ax_left.legend(lines_left + lines_right, labels_left + labels_right, loc="upper right")
-        fig.tight_layout()
+        if not series_to_plot:
+            return
 
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        path = self._output_dir / f"{self._safe_name}_resource_usage.png"
+        cols = 2
+        rows = int(np.ceil(len(series_to_plot) / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(8 * cols, 3.8 * rows), sharex=True)
+        axes = np.atleast_1d(axes).ravel()
+
+        for ax, (label, values, ylabel, color) in zip(axes, series_to_plot):
+            ax.plot(times, values, color=color, linewidth=2.0)
+            ax.set_title(label)
+            ax.set_ylabel(ylabel)
+            ax.set_xlim(time_min, time_max)
+            ax.grid(True, alpha=0.3)
+        for ax in axes[len(series_to_plot):]:
+            ax.axis("off")
+
+        for ax in axes:
+            ax.set_xlabel("Time (s)")
+
+        fig.suptitle(f"Resource usage | {self._name}", y=0.98)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        path = output_dir / "model_resource_usage.png"
         try:
             fig.savefig(path, dpi=300)
             self._log.info("Wrote resource usage plot to %s", path)
@@ -332,20 +365,3 @@ class ResourceUsageTracker:
             self._log.warning("Failed to write resource usage plot to %s", path, exc_info=True)
         finally:
             plt.close(fig)
-
-        if threads:
-            fig_threads, ax_threads = plt.subplots(figsize=(8, 4.5))
-            ax_threads.plot(times, threads, label="Threads", color="#8c564b", linewidth=2.0)
-            ax_threads.set_xlabel("Time (s)")
-            ax_threads.set_ylabel("Thread Count")
-            ax_threads.set_title(f"Thread count | {self._name}")
-            ax_threads.legend(loc="upper right")
-            fig_threads.tight_layout()
-            thread_path = self._output_dir / f"{self._safe_name}_resource_threads.png"
-            try:
-                fig_threads.savefig(thread_path, dpi=300)
-                self._log.info("Wrote thread usage plot to %s", thread_path)
-            except Exception:  # pragma: no cover - IO errors shouldn't crash pipeline
-                self._log.warning("Failed to write thread usage plot to %s", thread_path, exc_info=True)
-            finally:
-                plt.close(fig_threads)

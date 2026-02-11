@@ -64,11 +64,11 @@ their defaults.
 | `--export-raw-predictions`        | flag      | `False`                                                | Export per-cell predictions (adds runtime and output size).                                              |
 | `--device`                        | enum      | `cuda`                                                 | Run device (`cuda`, `cpu`, `auto`).                                                                      |
 | `--atac-layer`                    | enum      | `tfidf`                                                | ATAC normalization (`counts_per_million`, `tfidf`, `log1p_cpm`, `none`).                                 |
-| `--run-name`                      | str       | Timestamped string                                     | Output run directory name.                                                                               |
+| `--run-name`                      | str       | `spear_<model>_<genes>_<dataset>_<cpu/gpu>_<timestamp>` | Output run directory name.                                                                               |
 | `--wandb`                         | flag      | `False`                                                | Enable Weights & Biases logging (requires `wandb` + login).                                              |
 | `--wandb-project`                 | str       | `SPEAR`                                                | W&B project name.                                                                                        |
 | `--wandb-entity`                  | str       | `None`                                                 | W&B entity/team name.                                                                                    |
-| `--wandb-run-name`                | str       | `None`                                                 | Override W&B run name (defaults to `--run-name`).                                                        |
+| `--wandb-run-name`                | str       | `None`                                                 | Override W&B run name (defaults to `<model>_<genes>_<dataset>`).                                          |
 | `--wandb-tags`                    | list[str] | `None`                                                 | Optional W&B tags.                                                                                       |
 | `--wandb-group`                   | str       | `None`                                                 | Optional W&B group.                                                                                      |
 | `--wandb-job-type`                | str       | `None`                                                 | Optional W&B job type.                                                                                   |
@@ -108,6 +108,7 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `epochs`                        | `100`                          | Torch training epochs.                                                                                                            |
 | `learning_rate`                 | `1e-3`                         | Adam learning rate.                                                                                                               |
 | `weight_decay`                  | `1e-5`                         | Adam weight decay.                                                                                                                |
+| `max_grad_norm`                 | `5.0`                          | Gradient clipping for torch models (cnn/rnn/lstm/transformer/mlp/dcn/resnet/graph).                                                |
 | `early_stopping_patience`       | `10`                           | Epoch patience on validation loss.                                                                                                |
 | `random_state`                  | `42`                           | RNG seed for reproducibility.                                                                                                     |
 | `device_preference`             | `cuda`                         | Preferred compute device.                                                                                                         |

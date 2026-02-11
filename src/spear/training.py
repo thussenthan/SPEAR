@@ -53,17 +53,11 @@ _RESOURCE_TRACKER = {
 _CPU_PRIMED = False
 
 
-def _get_gpu_utilization_pct(device_index: int = 0) -> Optional[float]:
+def _get_gpu_utilization_pct() -> Optional[float]:
     """Return GPU utilization percentage if available.
     
     Queries GPU utilization via the thread-safe NVML interface from logging_utils.
     Returns None if GPU is unavailable or utilization cannot be determined.
-    
-    Parameters
-    ----------
-    device_index : int
-        GPU device index (currently unused; utilization is averaged across all devices).
-        Included for API compatibility.
     
     Returns
     -------
@@ -91,12 +85,6 @@ try:  # optional GPU utilization reporting
 except ImportError:  # pragma: no cover - optional dependency
     pynvml = None
 
-try:  # torch.amp compatibility varies by version/installation
-    from torch.cuda import amp as _cuda_amp  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover - CPU-only environments
-    _cuda_amp = None
-
-
 class _NoopGradScaler:
     """Minimal stand-in when AMP is disabled or unavailable."""
 
@@ -114,15 +102,9 @@ class _NoopGradScaler:
 
 
 if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler") and hasattr(torch.amp, "autocast"):
-    _AMP_BACKEND = "torch.amp"
     _AMP_GRAD_SCALER = torch.amp.GradScaler
     _AMP_AUTOCAST = torch.amp.autocast
-elif _cuda_amp is not None and hasattr(_cuda_amp, "GradScaler") and hasattr(_cuda_amp, "autocast"):
-    _AMP_BACKEND = "torch.cuda.amp"
-    _AMP_GRAD_SCALER = _cuda_amp.GradScaler  # type: ignore[attr-defined]
-    _AMP_AUTOCAST = _cuda_amp.autocast  # type: ignore[attr-defined]
 else:  # pragma: no cover - AMP unavailable
-    _AMP_BACKEND = None
     _AMP_GRAD_SCALER = None
     _AMP_AUTOCAST = None
 
@@ -130,18 +112,13 @@ else:  # pragma: no cover - AMP unavailable
 def _make_grad_scaler(use_amp: bool):
     if not use_amp or _AMP_GRAD_SCALER is None:
         return _NoopGradScaler()
-    try:
-        return _AMP_GRAD_SCALER(enabled=True)
-    except TypeError:  # pragma: no cover - legacy signature
-        return _AMP_GRAD_SCALER()
+    return _AMP_GRAD_SCALER(enabled=True)
 
 
 def _amp_autocast(device_type: str, use_amp: bool):
     if not use_amp or _AMP_AUTOCAST is None:
         return contextlib.nullcontext()
-    if _AMP_BACKEND == "torch.amp":
-        return _AMP_AUTOCAST(device_type=device_type, enabled=True)
-    return _AMP_AUTOCAST(enabled=True)
+    return _AMP_AUTOCAST(device_type=device_type, enabled=True)
 
 
 def _reshape_tensor_for_model(tens: torch.Tensor, reshape: str | None) -> torch.Tensor:
@@ -1670,6 +1647,18 @@ def _fit_torch_model(
     model = bundle.model.to(device)
     model = _wrap_model_for_multi_gpu(model, device)
 
+    def _sanitize_array(name: str, arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr)
+        if not np.isfinite(arr).all():
+            _LOG.warning("Non-finite values detected in %s; replacing with 0.", name)
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        return arr
+
+    X_train = _sanitize_array("X_train", X_train)
+    X_val = _sanitize_array("X_val", X_val)
+    y_train = _sanitize_array("y_train", y_train)
+    y_val = _sanitize_array("y_val", y_val)
+
     y_train_arr = np.asarray(y_train)
     target_dim = y_train_arr.shape[1] if y_train_arr.ndim > 1 else 1
 
@@ -1765,6 +1754,7 @@ def _fit_torch_model(
         model.train()
         train_loss_accum = 0.0
         train_samples = 0
+        nan_detected = False
         for batch_x, batch_y in train_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
@@ -1772,12 +1762,25 @@ def _fit_torch_model(
             with _amp_autocast(device.type, use_amp):
                 outputs = model(batch_x)
                 loss = criterion(outputs, batch_y)
+            if not torch.isfinite(loss):
+                _LOG.warning(
+                    "Non-finite training loss detected at epoch %d; stopping early.",
+                    epoch + 1,
+                )
+                nan_detected = True
+                break
             scaler.scale(loss).backward()
+            if config.max_grad_norm is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
             batch_size_curr = batch_x.size(0)
             train_loss_accum += float(loss.item()) * batch_size_curr
             train_samples += batch_size_curr
+
+        if nan_detected:
+            break
 
         model.eval()
         running = []
@@ -1795,6 +1798,12 @@ def _fit_torch_model(
                     val_preds_epoch.append(preds.detach().cpu().numpy())
                     val_true_epoch.append(val_y.detach().cpu().numpy())
         mean_val = float(np.mean(running)) if running else best_val
+        if not np.isfinite(mean_val):
+            _LOG.warning(
+                "Non-finite validation loss detected at epoch %d; stopping early.",
+                epoch + 1,
+            )
+            break
         should_stop = False
         if mean_val < best_val - 1e-6:
             best_val = mean_val
@@ -2265,7 +2274,7 @@ def _compute_multi_metrics(
         metrics_with_gene["gene"] = gene
         per_gene.append(metrics_with_gene)
 
-    metric_keys = ["mse", "rmse", "mae", "r2", "spearman", "pearson"]
+    metric_keys = ["pearson", "r2", "spearman", "rmse", "mse", "mae"]
     aggregate = {
         key: float(np.nanmean([entry.get(key, float("nan")) for entry in per_gene]))
         for key in metric_keys

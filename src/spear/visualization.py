@@ -2,6 +2,7 @@
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence
 
+from matplotlib.collections import PolyCollection
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
@@ -10,6 +11,32 @@ import pandas as pd
 from .metrics import regression_metrics
 
 sns.set_style("whitegrid")
+
+# Shared figure size for split-distribution plots to keep W&B groups consistent.
+BY_SPLIT_FIGSIZE = (8.4, 4.9)
+# Shared figure size for feature-importance style plots to keep W&B groups consistent.
+FEATURE_IMPORTANCE_FIGSIZE = (9.0, 5.0)
+
+
+def _iter_violin_collections(ax: plt.Axes, collection_start: int) -> list[PolyCollection]:
+    return [
+        collection
+        for collection in ax.collections[collection_start:]
+        if isinstance(collection, PolyCollection)
+    ]
+
+
+def _violin_centers(polys: Sequence[PolyCollection]) -> list[tuple[float, PolyCollection]]:
+    centers: list[tuple[float, PolyCollection]] = []
+    for poly in polys:
+        paths = poly.get_paths()
+        if not paths:
+            continue
+        verts = np.concatenate([path.vertices for path in paths])
+        if verts.size == 0:
+            continue
+        centers.append((float(np.median(verts[:, 0])), poly))
+    return sorted(centers, key=lambda item: item[0])
 
 
 def plot_predictions_vs_actual(
@@ -89,6 +116,217 @@ def plot_predictions_vs_actual(
     plt.close()
 
 
+def plot_predictions_vs_actual_by_split(
+    y_true_by_split: Dict[str, np.ndarray],
+    y_pred_by_split: Dict[str, np.ndarray],
+    output_path: Path,
+    title_prefix: str,
+    annotation_metrics_by_split: Optional[Dict[str, Dict[str, float]]] = None,
+    sample_size: Optional[int] = 200_000,
+) -> None:
+    if not y_true_by_split or not y_pred_by_split:
+        return
+    splits = [s for s in ("train", "val", "test") if s in y_true_by_split and s in y_pred_by_split]
+    if not splits:
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, len(splits), figsize=(6 * len(splits), 5), squeeze=False)
+    axes = axes[0]
+
+    for ax, split in zip(axes, splits):
+        y_true = np.asarray(y_true_by_split[split], dtype=np.float64)
+        y_pred = np.asarray(y_pred_by_split[split], dtype=np.float64)
+        mask = (~np.isnan(y_true)) & (~np.isnan(y_pred)) & (~np.isinf(y_true)) & (~np.isinf(y_pred))
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+        if y_true.size == 0:
+            ax.axis("off")
+            continue
+
+        if sample_size is not None and y_true.size > sample_size:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(y_true.size, size=sample_size, replace=False)
+            y_true = y_true[idx]
+            y_pred = y_pred[idx]
+
+        min_val = float(min(y_true.min(), y_pred.min()))
+        max_val = float(max(y_true.max(), y_pred.max()))
+        if min_val == max_val:
+            max_val = min_val + 1.0
+
+        ax.scatter(y_true, y_pred, s=10, alpha=0.3, edgecolor="none")
+        ax.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="crimson", linewidth=1.5)
+        ax.set_xlabel("Actual expression")
+        ax.set_ylabel("Predicted expression")
+        ax.set_title(f"{title_prefix} | {split}")
+
+        metrics = None
+        if annotation_metrics_by_split is not None:
+            metrics = annotation_metrics_by_split.get(split)
+        if metrics is None:
+            metrics = regression_metrics(y_true, y_pred)
+
+        def _fmt(value: float) -> str:
+            return "nan" if not np.isfinite(value) else f"{value:.3f}"
+
+        lines = []
+        r2_val = metrics.get("r2") if metrics is not None else None
+        if r2_val is not None:
+            lines.append(f"$R^2={_fmt(r2_val)}$")
+        pearson_val = metrics.get("pearson") if metrics is not None else None
+        if pearson_val is not None:
+            lines.append(f"Pearson={_fmt(pearson_val)}")
+        spearman_val = metrics.get("spearman") if metrics is not None else None
+        if spearman_val is not None:
+            lines.append(f"Spearman={_fmt(spearman_val)}")
+        text = "\n".join(lines)
+        if text:
+            ax.text(
+                min_val + 0.05 * (max_val - min_val),
+                max_val - 0.12 * (max_val - min_val),
+                text,
+                fontsize=11,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
+            )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_box_violin_half_split(
+    values_by_group: Dict[str, Sequence[float]],
+    output_path: Path,
+    title: str,
+    ylabel: str,
+    *,
+    order: Optional[Sequence[str]] = None,
+) -> None:
+    if not values_by_group:
+        return
+    group_order = list(order) if order is not None else list(values_by_group.keys())
+    group_order = [g for g in group_order if g in values_by_group]
+    if not group_order:
+        return
+
+    series = []
+    for group in group_order:
+        arr = np.asarray(values_by_group[group], dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            series.append(np.asarray([], dtype=np.float64))
+        else:
+            series.append(arr)
+
+    if all(s.size == 0 for s in series):
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=BY_SPLIT_FIGSIZE)
+    positions = np.arange(len(group_order), dtype=float)
+    palette = sns.color_palette("Set2", n_colors=len(group_order))
+
+    rows: list[pd.DataFrame] = []
+    for idx, arr in enumerate(series):
+        if arr.size == 0:
+            continue
+        rows.append(pd.DataFrame({"group": group_order[idx], "value": arr}))
+    if not rows:
+        return
+    plot_df = pd.concat(rows, ignore_index=True)
+
+    collection_start = len(ax.collections)
+    sns.violinplot(
+        data=plot_df,
+        x="group",
+        y="value",
+        hue="group",
+        order=group_order,
+        palette="Set2",
+        legend=False,
+        inner=None,
+        cut=0,
+        width=0.4,
+        linewidth=1.0,
+        ax=ax,
+    )
+    violin_polys = _iter_violin_collections(ax, collection_start)
+    for center, poly in _violin_centers(violin_polys):
+        for path in poly.get_paths():
+            verts = path.vertices
+            verts[:, 0] = np.clip(verts[:, 0], center, np.inf)
+
+    box_positions = positions - 0.2
+    box = ax.boxplot(
+        series,
+        positions=box_positions,
+        widths=0.2,
+        patch_artist=True,
+        showfliers=False,
+        medianprops={"color": "#222222", "linewidth": 1.0},
+    )
+    def _mix_with_white(color: tuple[float, float, float], factor: float = 0.45) -> tuple[float, float, float]:
+        r, g, b = color
+        return (1 - (1 - r) * factor, 1 - (1 - g) * factor, 1 - (1 - b) * factor)
+
+    for idx, patch in enumerate(box["boxes"]):
+        base = palette[idx] if idx < len(palette) else (0.7, 0.7, 0.7)
+        patch.set(facecolor=_mix_with_white(base, factor=0.4), edgecolor="#222222", linewidth=1.0)
+    for whisker in box["whiskers"]:
+        whisker.set(color="#222222", linewidth=1.0)
+    for cap in box["caps"]:
+        cap.set(color="#222222", linewidth=1.0)
+
+    rng = np.random.default_rng(42)
+    for idx, arr in enumerate(series):
+        if arr.size == 0:
+            continue
+        jitter = rng.normal(0, 0.03, size=arr.size)
+        base = palette[idx] if idx < len(palette) else (0.2, 0.2, 0.2)
+        scatter_color = tuple(max(0.0, c * 0.72) for c in base)
+        ax.scatter(
+            np.full(arr.size, box_positions[idx]) + jitter,
+            arr,
+            s=10,
+            alpha=0.42,
+            color=scatter_color,
+            linewidth=0,
+            zorder=4,
+        )
+
+    ax.set_xlabel("")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(group_order)
+    ax.set_xlim(-0.6, len(group_order) - 0.4)
+    sns.despine(ax=ax, left=True, bottom=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_single_box_violin(
+    values: Sequence[float],
+    output_path: Path,
+    title: str,
+    ylabel: str,
+) -> None:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return
+    values_by_group = {"": arr}
+    plot_box_violin_half_split(
+        values_by_group,
+        output_path,
+        title,
+        ylabel,
+        order=[""],
+    )
+
+
 def plot_residual_histogram(y_true: np.ndarray, y_pred: np.ndarray, output_path: Path, title: str) -> None:
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
@@ -98,6 +336,50 @@ def plot_residual_histogram(y_true: np.ndarray, y_pred: np.ndarray, output_path:
     sns.histplot(residuals, bins=50, kde=True)
     plt.xlabel("Residual (prediction - actual)")
     plt.ylabel("Count")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+
+
+def plot_residual_histogram_by_split(
+    residuals_by_split: Dict[str, np.ndarray],
+    output_path: Path,
+    title: str,
+) -> None:
+    if not residuals_by_split:
+        return
+    ordered_splits = [s for s in ("train", "val", "test") if s in residuals_by_split]
+    if not ordered_splits:
+        ordered_splits = list(residuals_by_split.keys())
+    rows = []
+    for split in ordered_splits:
+        residuals = residuals_by_split[split]
+        arr = np.asarray(residuals, dtype=np.float64).ravel()
+        mask = np.isfinite(arr)
+        arr = arr[mask]
+        if arr.size == 0:
+            continue
+        rows.append(pd.DataFrame({"residual": arr, "split": split}))
+    if not rows:
+        return
+    df = pd.concat(rows, ignore_index=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 4.5))
+    sns.histplot(
+        data=df,
+        x="residual",
+        hue="split",
+        hue_order=ordered_splits,
+        bins=50,
+        stat="density",
+        common_norm=False,
+        element="step",
+        alpha=0.35,
+    )
+    plt.axvline(0.0, color="#555", linestyle="--", linewidth=1.0)
+    plt.xlabel("Residual (prediction - actual)")
+    plt.ylabel("Density")
     plt.title(title)
     plt.tight_layout()
     plt.savefig(output_path, dpi=300)
@@ -122,8 +404,7 @@ def plot_feature_importance(
     sorted_importances = importances[ranked]
     sorted_names = names[ranked]
 
-    fig_height = max(4.0, 0.35 * limit)
-    fig, ax = plt.subplots(figsize=(9, fig_height))
+    fig, ax = plt.subplots(figsize=FEATURE_IMPORTANCE_FIGSIZE)
     bars = ax.barh(np.arange(limit), sorted_importances, color="#4C72B0")
     ax.set_yticks(np.arange(limit))
     ax.set_yticklabels(sorted_names)
@@ -257,6 +538,85 @@ def plot_residual_barplot(
     plt.close(fig)
 
 
+def plot_residual_barplot_by_split(
+    residuals_by_split: Dict[str, np.ndarray],
+    gene_names: Sequence[str],
+    output_path: Path,
+    title: str,
+    top_n: int = 30,
+) -> None:
+    if not residuals_by_split:
+        return
+    gene_names_arr = np.asarray(gene_names)
+    split_means: Dict[str, np.ndarray] = {}
+    ordered_splits = [s for s in ("train", "val", "test") if s in residuals_by_split]
+    if not ordered_splits:
+        ordered_splits = list(residuals_by_split.keys())
+    for split in ordered_splits:
+        residuals = residuals_by_split[split]
+        arr = np.asarray(residuals, dtype=np.float64)
+        if arr.ndim != 2:
+            continue
+        if arr.shape[1] != gene_names_arr.size:
+            continue
+        split_means[split] = np.nanmean(arr, axis=0)
+    if not split_means:
+        return
+
+    splits = ordered_splits
+    stacked = np.vstack([split_means[split] for split in splits])
+    max_abs = np.nanmax(np.abs(stacked), axis=0)
+    finite_mask = np.isfinite(max_abs)
+    if max_abs.size == 0 or not finite_mask.any():
+        return
+    finite_indices = np.flatnonzero(finite_mask)
+    order = finite_indices[np.argsort(max_abs[finite_mask])[::-1]]
+    limit = int(min(top_n, order.size))
+    idx = order[:limit]
+
+    selected_genes = gene_names_arr[idx]
+    values_by_split = {split: split_means[split][idx] for split in splits}
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig_height = max(4.0, limit * 0.35)
+    fig, ax = plt.subplots(figsize=(10, fig_height))
+
+    y_positions = np.arange(limit)
+    bar_height = 0.8 / max(1, len(splits))
+    offsets = (np.arange(len(splits)) - (len(splits) - 1) / 2.0) * bar_height
+    palette = sns.color_palette("Set2", n_colors=len(splits))
+
+    for idx_split, split in enumerate(splits):
+        ax.barh(
+            y_positions + offsets[idx_split],
+            values_by_split[split],
+            height=bar_height,
+            label=split,
+            color=palette[idx_split],
+        )
+
+    ax.axvline(0.0, color="#555", linestyle="--", linewidth=1.0)
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(selected_genes)
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean residual (prediction - actual)")
+    ax.set_ylabel("Gene")
+    ax.set_title(title)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_correlation_box_violin(
+    values: Sequence[float],
+    output_path: Path,
+    title: str,
+    metric_label: str,
+) -> None:
+    plot_single_box_violin(values, output_path, title, metric_label)
+
+
 def plot_correlation_boxplot(
     values: Sequence[float],
     output_path: Path,
@@ -264,30 +624,72 @@ def plot_correlation_boxplot(
     metric_label: str,
     axes: plt.Axes | None = None,
 ) -> None:
-    arr = np.asarray(values, dtype=np.float64)
-    mask = np.isfinite(arr)
-    arr = arr[mask]
-    if arr.size == 0:
+    if axes is not None:
+        arr = np.asarray(values, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return
+        plot_df = pd.DataFrame({"group": ["" for _ in range(arr.size)], "value": arr})
+        collection_start = len(axes.collections)
+        sns.violinplot(
+            data=plot_df,
+            x="group",
+            y="value",
+            hue="group",
+            order=[""],
+            palette="Set2",
+            legend=False,
+            inner=None,
+            cut=0,
+            width=0.4,
+            linewidth=1.0,
+            ax=axes,
+        )
+        violin_polys = _iter_violin_collections(axes, collection_start)
+        for center, poly in _violin_centers(violin_polys):
+            for path in poly.get_paths():
+                verts = path.vertices
+                verts[:, 0] = np.clip(verts[:, 0], center, np.inf)
+        box = axes.boxplot(
+            [arr],
+            positions=[-0.2],
+            widths=0.2,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "#222222", "linewidth": 1.0},
+        )
+        palette = sns.color_palette("Set2", n_colors=1)
+        r, g, b = palette[0]
+        box["boxes"][0].set(
+            facecolor=(1 - (1 - r) * 0.4, 1 - (1 - g) * 0.4, 1 - (1 - b) * 0.4),
+            edgecolor="#222222",
+            linewidth=1.0,
+        )
+        for whisker in box["whiskers"]:
+            whisker.set(color="#222222", linewidth=1.0)
+        for cap in box["caps"]:
+            cap.set(color="#222222", linewidth=1.0)
+        rng = np.random.default_rng(42)
+        jitter = rng.normal(0, 0.03, size=arr.size)
+        scatter_color = tuple(max(0.0, c * 0.72) for c in (r, g, b))
+        axes.scatter(
+            np.full(arr.size, -0.2) + jitter,
+            arr,
+            s=10,
+            alpha=0.42,
+            color=scatter_color,
+            linewidth=0,
+            zorder=4,
+        )
+        axes.set_xlim(-0.6, 0.4)
+        axes.set_xlabel("")
+        axes.set_ylabel(metric_label)
+        axes.set_xticks([0])
+        axes.set_xticklabels([""])
+        axes.set_title(title)
+        sns.despine(ax=axes, left=True, bottom=True)
         return
-
-    if axes is None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.figure(figsize=(6.5, 4.0))
-        ax = plt.gca()
-        save_and_close = True
-    else:
-        ax = axes
-        save_and_close = False
-
-    sns.boxplot(y=arr, color="#4C72B0", orient="v", ax=ax)
-    sns.stripplot(y=arr, orient="v", color="#1f77b4", alpha=0.7, size=4, jitter=0.15, ax=ax)
-    ax.set_ylabel(metric_label)
-    ax.set_xticks([])
-    ax.set_title(title)
-    if save_and_close:
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300)
-        plt.close()
+    plot_correlation_box_violin(values, output_path, title, metric_label)
 
 
 def plot_correlation_violin(
@@ -297,30 +699,14 @@ def plot_correlation_violin(
     metric_label: str,
     axes: plt.Axes | None = None,
 ) -> None:
-    arr = np.asarray(values, dtype=np.float64)
-    mask = np.isfinite(arr)
-    arr = arr[mask]
-    if arr.size == 0:
+    if axes is not None:
+        arr = np.asarray(values, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return
+        plot_correlation_boxplot(values, output_path, title, metric_label, axes=axes)
         return
-
-    if axes is None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.figure(figsize=(6.5, 4.0))
-        ax = plt.gca()
-        save_and_close = True
-    else:
-        ax = axes
-        save_and_close = False
-
-    sns.violinplot(y=arr, color="#A6CEE3", inner="quartile", cut=0, linewidth=1.1, ax=ax)
-    sns.stripplot(y=arr, orient="v", color="#1f77b4", alpha=0.45, size=3.5, jitter=0.18, ax=ax)
-    ax.set_ylabel(metric_label)
-    ax.set_xticks([])
-    ax.set_title(title)
-    if save_and_close:
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300)
-        plt.close()
+    plot_correlation_box_violin(values, output_path, title, metric_label)
 
 
 def plot_importance_distance_scatter(

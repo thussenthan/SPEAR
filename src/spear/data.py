@@ -530,9 +530,10 @@ def _build_shared_bin_matrix(
     peak_indexer: PeakIndexer,
     training: TrainingConfig,
 ) -> tuple[np.ndarray, List[str], List[np.ndarray]]:
-    bin_map: Dict[Tuple[str, int, int], int] = {}
     bin_records: List[Tuple[str, int, int]] = []
+    feature_names: List[str] = []
     feature_block_indices: List[np.ndarray] = []
+    bin_map: Dict[Tuple[str, int, int], int] = {}
 
     for gene in genes:
         start = gene.tss - training.window_bp
@@ -544,13 +545,14 @@ def _build_shared_bin_matrix(
         bin_ends = bin_starts + training.bin_size_bp
 
         indices: List[int] = []
-        for bstart, bend in zip(bin_starts, bin_ends):
-            key = (gene.chrom, int(bstart), int(bend))
-            idx = bin_map.get(key)
+        for bidx, (bstart, bend) in enumerate(zip(bin_starts, bin_ends)):
+            record = (gene.chrom, int(bstart), int(bend))
+            idx = bin_map.get(record)
             if idx is None:
                 idx = len(bin_records)
-                bin_map[key] = idx
-                bin_records.append(key)
+                bin_records.append(record)
+                feature_names.append(f"{record[0]}:{record[1]}-{record[2]}")
+                bin_map[record] = idx
             indices.append(idx)
 
         if gene.strand == "-":
@@ -573,7 +575,6 @@ def _build_shared_bin_matrix(
             summed = np.sum(matrix, axis=1)
         X[:, col_idx] = summed
 
-    feature_names = [f"{chrom}:{start}-{end}" for chrom, start, end in bin_records]
     return X, feature_names, feature_block_indices
 
 

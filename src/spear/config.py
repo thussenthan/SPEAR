@@ -1,7 +1,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -71,6 +71,8 @@ class TrainingConfig:
     epochs: int = 100
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
+    # Gradient clipping for torch-based models (cnn/rnn/lstm/transformer/mlp/dcn/resnet/graph).
+    max_grad_norm: Optional[float] = 5.0
     early_stopping_patience: int = 10
     random_state: int = 42
     device_preference: str = "cuda"
@@ -99,7 +101,9 @@ class TrainingConfig:
     svr_max_iter: int = 50_000
     svr_tol: float = 1e-4
     track_history: bool = True
-    history_metrics: List[str] = field(default_factory=lambda: ["mse", "pearson", "spearman"])
+    history_metrics: List[str] = field(
+        default_factory=lambda: ["pearson", "r2", "spearman", "rmse", "mse", "mae"]
+    )
     group_key: Optional[str] = "sample"
     atac_layer: Optional[str] = "tfidf"
     rna_expression_layer: Optional[str] = "log1p_cpm"
@@ -157,6 +161,8 @@ class TrainingConfig:
             raise ValueError("svr_max_iter must be positive")
         if self.svr_tol <= 0:
             raise ValueError("svr_tol must be positive")
+        if self.max_grad_norm is not None and self.max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be positive when specified")
         if self.k_folds > 1 and self.group_key is not None and not self.group_key:
             raise ValueError("group_key must be a non-empty string when provided")
         if self.enable_feature_importance:
@@ -182,6 +188,8 @@ class WandbConfig:
     tags: List[str] = field(default_factory=list)
     group: Optional[str] = None
     job_type: Optional[str] = None
+    log_code: bool = True
+    log_dataset_manifest: bool = True
     log_artifacts: bool = True
     log_tables: bool = True
     log_media: bool = True
@@ -220,6 +228,8 @@ class PipelineConfig:
     # Default to cell-wise multi-output unless explicitly turned off
     multi_output: bool = True
     run_name: Optional[str] = None
+    run_context: Optional[Dict[str, Optional[str]]] = None
+    log_path: Optional[Path] = None
     cache_dir: Optional[Path] = None
 
 

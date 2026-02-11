@@ -13,7 +13,8 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 ## Outputs
 
 - Model checkpoints, metrics, summaries, and figures under `output/` and `analysis/figs`.
-- Log files under `output/logs`.
+- Log files under `output/logs` (pipeline logs: `<run_name>.log`; Slurm logs: `spear_<jobid>_<task>.out/.err`).
+- Default run naming: `spear_<model>_<genes>_<dataset>_<cpu/gpu>_<timestamp>`; W&B run names default to `<model>_<genes>_<dataset>` unless overridden.
 
 ## Usage
 

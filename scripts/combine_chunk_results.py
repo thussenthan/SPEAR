@@ -5,7 +5,7 @@ Combine per-chunk training outputs into unified result folders.
 Typical usage:
 
     python scripts/combine_chunk_results.py \
-        --input-root output/results/spear_results \
+        --input-root output/results \
         --run-prefix spear_1000genes_k5_pg20_20251106 \
         --include-predictions
 
@@ -319,7 +319,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Combine results from chunked runs.")
     parser.add_argument(
         "--input-root",
-        default="output/results/spear_results",
+        default="output/results",
         type=Path,
         help="Directory containing chunked run outputs.",
     )
