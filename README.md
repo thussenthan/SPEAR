@@ -37,7 +37,7 @@ SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibil
 - **Modal-specific normalization:**
   - ATAC/RNA matrices are subset to shared barcodes and aligned to a common ordering; by default ATAC uses TF–IDF (`tfidf` layer), with alternatives (`counts_per_million`, `log1p_cpm`, or none) available via the `atac_layer` setting.
   - RNA counts are converted to counts-per-million and log-transformed (`log1p_cpm` layer) if needed; double log1p transforms are skipped when a normalized layer already exists.
-  - Optional `StandardScaler`/`MinMaxScaler` may be applied on features and targets (target scaling is skipped for log-transformed targets unless `force_target_scaling=True`).
+  - Optional `StandardScaler`/`MinMaxScaler` may be applied on features and targets (target scaling is forced by default via `force_target_scaling=True`).
 - **k-NN smoothing:** Each cell is smoothed by averaging with its k nearest neighbors (default k=19 for `smoothing_k=20`) using PCA-informed nearest-neighbor search to reduce sparsity while maintaining dataset size.
 - **Optional pseudobulk aggregation:** PCA-informed, group-aware pooling within each sample when `pseudobulk_group_size > 1`.
 - **Group-aware splitting:** 70/15/15 train/val/test splits with `GroupShuffleSplit` keyed by `group_key` (default `sample`; falls back to random when insufficient groups), plus 5-fold cross-validation using `GroupKFold` when possible.
@@ -218,7 +218,7 @@ All dependencies (runtime, dev, and notebooks) are listed in `requirements.txt`.
 4. **Expression filtering:** Genes must have at least `min_cells_per_gene` cells above `min_expression` (defaults: 100 cells, 0.0 expression).
 5. **k-NN smoothing:** Each cell is smoothed by averaging with its k nearest neighbors (k = `smoothing_k - 1`, default 19) using PCA-informed neighbor search within each split to reduce sparsity while maintaining dataset size.
 6. **Pseudobulk (optional):** If `pseudobulk_group_size > 1`, PCA-guided, group-aware pooling within each `group_key` (default `sample`) produces meta-cells of the requested size.
-7. **Scaling:** Feature scalers run on the training split; target scaling is skipped automatically when expression values are already log-transformed (set `force_target_scaling=True` to override).
+7. **Scaling:** Feature scalers run on the training split; target scaling is applied by default even when expression values are already log-transformed (`force_target_scaling=True`).
 8. **Splitting:** Train/val/test fractions default to 0.70/0.15/0.15 with `GroupShuffleSplit` by `group_key` (fallback to random splits when too few groups).
 9. **Cross-validation:** Within the training split, models run 5-fold CV grouped by `group_key` when possible (else shuffled KFold) before fitting on the full training set.
 
