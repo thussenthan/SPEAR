@@ -116,8 +116,8 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `min_cells_per_gene`            | `100`                          | Minimum expressing cells per gene (per-gene mode).                                                                                |
 | `min_expression`                | `0.0`                          | Raw expression threshold.                                                                                                         |
 | `log1p_transform`               | `False`                        | Additional log1p on targets if raw layer selected.                                                                                |
-| `target_scaler`                 | `standard`                     | Target scaling strategy. With the default `force_target_scaling=True`, scaling is applied even for log-transformed RNA layers.    |
-| `force_target_scaling`          | `True`                         | Apply target scaling even when targets are already log-transformed. Set to `False` to allow skip logic.                          |
+| `target_scaler`                 | `standard`                     | Target scaling (skipped when `log1p_transform=True` or the RNA layer name starts with `log`, unless `force_target_scaling=True`). |
+| `force_target_scaling`          | `False`                        | Apply target scaling even when targets are already log-transformed.                                                               |
 | `enable_smoothing`              | `True`                         | Whether to apply k-NN smoothing within each split.                                                                                |
 | `smoothing_k`                   | `20`                           | Neighborhood size for smoothing (use 1 to disable).                                                                               |
 | `smoothing_pca_components`      | `10`                           | PCA components for smoothing neighbor search.                                                                                     |

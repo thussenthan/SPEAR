@@ -81,8 +81,7 @@ class TrainingConfig:
     min_expression: float = 0.0
     log1p_transform: bool = False
     target_scaler: Optional[str] = "standard"
-    # Enforce target scaling by default, even when RNA targets are already log-transformed.
-    force_target_scaling: bool = True
+    force_target_scaling: bool = False
     enable_smoothing: bool = True
     smoothing_k: int = 20
     smoothing_pca_components: int = 10
