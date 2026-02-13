@@ -54,7 +54,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--epochs", type=int, help="Training epochs for neural models")
     parser.add_argument("--learning-rate", type=float, help="Learning rate for neural models")
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=["none", "cosine"],
+        help="Learning-rate schedule for torch models (default cosine with warmup)",
+    )
+    parser.add_argument("--warmup-epochs", type=int, help="Warmup epochs for LR scheduling")
+    parser.add_argument("--warmup-ratio", type=float, help="Fallback warmup ratio if warmup epochs not set")
+    parser.add_argument("--min-lr-ratio", type=float, help="Minimum LR ratio for cosine decay floor")
     parser.add_argument("--batch-size", type=int, help="Batch size for neural models")
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        help="Number of micro-batches to accumulate before each optimizer step",
+    )
     parser.add_argument(
         "--effective-batch-cap",
         type=int,
@@ -98,6 +111,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--resource-sample-seconds",
         type=float,
         help="Interval (in seconds) between resource usage samples (default 60)",
+    )
+    parser.add_argument("--transformer-embed-dim", type=int, help="Transformer embedding dimension")
+    parser.add_argument("--transformer-num-layers", type=int, help="Transformer encoder layer count")
+    parser.add_argument("--transformer-dropout", type=float, help="Transformer dropout rate")
+    parser.add_argument(
+        "--transformer-num-heads",
+        type=int,
+        help="Transformer attention heads (must divide transformer-embed-dim)",
     )
     parser.add_argument(
         "--enable-feature-importance",
@@ -251,6 +272,20 @@ def main(argv: Optional[list[str]] = None) -> None:
         paths.atac_path = _override_path(paths.atac_path, args.atac_path, "ATAC path")
         paths.rna_path = _override_path(paths.rna_path, args.rna_path, "RNA path")
         paths.gtf_path = _override_path(paths.gtf_path, args.gtf_path, "GTF path")
+        # Dataset-aware GTF fallback: endothelial runs generally use human symbols.
+        # If the user did not explicitly pass --gtf-path, prefer the bundled
+        # human GTF when endothelial paths/manifests are detected.
+        if not args.gtf_path:
+            endothelial_hints = [
+                args.atac_path or "",
+                args.rna_path or "",
+                args.gene_manifest or "",
+            ]
+            if any("endothelial" in hint.lower() for hint in endothelial_hints):
+                base_root = Path(args.base_dir).expanduser().resolve()
+                human_gtf = base_root / "data" / "references" / "gencode.v44.annotation.gtf.gz"
+                if human_gtf.exists():
+                    paths.gtf_path = human_gtf.resolve()
 
         training = TrainingConfig()
         if args.k_folds:
@@ -279,8 +314,18 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.epochs = args.epochs
         if args.learning_rate:
             training.learning_rate = args.learning_rate
+        if args.lr_scheduler:
+            training.lr_scheduler = args.lr_scheduler
+        if args.warmup_epochs is not None:
+            training.warmup_epochs = args.warmup_epochs
+        if args.warmup_ratio is not None:
+            training.warmup_ratio = args.warmup_ratio
+        if args.min_lr_ratio is not None:
+            training.min_lr_ratio = args.min_lr_ratio
         if args.batch_size:
             training.batch_size = args.batch_size
+        if args.gradient_accumulation_steps is not None:
+            training.gradient_accumulation_steps = args.gradient_accumulation_steps
         if args.effective_batch_cap is not None:
             training.effective_batch_cap = args.effective_batch_cap
         if args.smoothing_k is not None:
@@ -313,6 +358,14 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.shap_max_samples = args.shap_max_samples
         if args.shap_background_samples is not None:
             training.shap_background_samples = args.shap_background_samples
+        if args.transformer_embed_dim is not None:
+            training.transformer_embed_dim = args.transformer_embed_dim
+        if args.transformer_num_layers is not None:
+            training.transformer_num_layers = args.transformer_num_layers
+        if args.transformer_dropout is not None:
+            training.transformer_dropout = args.transformer_dropout
+        if args.transformer_num_heads is not None:
+            training.transformer_num_heads = args.transformer_num_heads
         if args.rf_n_estimators is not None:
             training.rf_n_estimators = args.rf_n_estimators
         if args.rf_max_depth is not None:

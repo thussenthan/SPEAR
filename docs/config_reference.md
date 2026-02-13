@@ -46,7 +46,12 @@ their defaults.
 | `--force-target-scaling`          | flag      | `False`                                                | Apply target scaling even when targets are already log-transformed.                                      |
 | `--epochs`                        | int       | `100`                                                  | Training epochs for neural models.                                                                       |
 | `--learning-rate`                 | float     | `1e-3`                                                 | Optimizer learning rate (torch models).                                                                  |
+| `--lr-scheduler`                  | enum      | `cosine`                                               | LR scheduler for torch models (`none`, `cosine`).                                                         |
+| `--warmup-epochs`                 | int       | `5`                                                    | Warmup epochs for LR scheduling.                                                                         |
+| `--warmup-ratio`                  | float     | `0.1`                                                  | Warmup ratio fallback when warmup epochs are not set.                                                    |
+| `--min-lr-ratio`                  | float     | `0.01`                                                 | Minimum LR floor as a ratio of base LR for cosine decay.                                                 |
 | `--batch-size`                    | int       | `512`                                                  | Mini-batch size (torch models).                                                                          |
+| `--gradient-accumulation-steps`   | int       | `1`                                                    | Number of micro-batches accumulated before each optimizer step.                                           |
 | `--effective-batch-cap`           | int       | `48000`                                                | Cap used to scale effective batch size in multi-output mode (`cap // target_dim`).                       |
 | `--pseudobulk-group-size`         | int       | `1`                                                    | Cells per pseudobulk neighborhood.                                                                       |
 | `--pseudobulk-pca-components`     | int       | `10`                                                   | PCA components for pseudobulk grouping.                                                                  |
@@ -55,6 +60,10 @@ their defaults.
 | `--smoothing-pca-components`      | int       | `10`                                                   | PCA components for k-NN smoothing.                                                                       |
 | `--disable-smoothing`             | flag      | `False`                                                | Disable k-NN smoothing of cells.                                                                         |
 | `--resource-sample-seconds`       | float     | `60`                                                   | Interval (seconds) between resource usage samples.                                                       |
+| `--transformer-embed-dim`         | int       | `128`                                                  | Transformer embedding dimension.                                                                         |
+| `--transformer-num-layers`        | int       | `2`                                                    | Number of transformer encoder layers.                                                                    |
+| `--transformer-dropout`           | float     | `0.2`                                                  | Transformer dropout for encoder and prediction head.                                                     |
+| `--transformer-num-heads`         | int       | `None` (auto)                                          | Transformer attention heads (must divide `transformer_embed_dim`).                                       |
 | `--enable-feature-importance`     | flag      | `False`                                                | Enable feature importance computation.                                                                   |
 | `--feature-importance-samples`    | int       | `None` (all samples)                                   | Max samples for feature importance computation.                                                          |
 | `--feature-importance-batch-size` | int       | `256`                                                  | Batch size for feature importance gradient accumulation.                                                 |
@@ -107,6 +116,11 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `effective_batch_cap`           | `48000`                        | Cap used to scale effective batch size in multi-output mode (`cap // target_dim`).                                                |
 | `epochs`                        | `100`                          | Torch training epochs.                                                                                                            |
 | `learning_rate`                 | `1e-3`                         | Adam learning rate.                                                                                                               |
+| `lr_scheduler`                  | `cosine`                       | Learning-rate scheduling strategy (`none` or `cosine`).                                                                           |
+| `warmup_epochs`                 | `5`                            | Warmup in epochs before cosine decay.                                                                                             |
+| `warmup_ratio`                  | `0.1`                          | Warmup fraction fallback used when warmup epochs are zero.                                                                        |
+| `min_lr_ratio`                  | `0.01`                         | Minimum LR as ratio of base LR under cosine decay.                                                                                |
+| `gradient_accumulation_steps`   | `1`                            | Number of gradient accumulation steps per optimizer update.                                                                        |
 | `weight_decay`                  | `1e-5`                         | Adam weight decay.                                                                                                                |
 | `max_grad_norm`                 | `5.0`                          | Gradient clipping for torch models (cnn/rnn/lstm/transformer/mlp/dcn/resnet/graph).                                                |
 | `early_stopping_patience`       | `10`                           | Epoch patience on validation loss.                                                                                                |
@@ -123,6 +137,10 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `smoothing_pca_components`      | `10`                           | PCA components for smoothing neighbor search.                                                                                     |
 | `pseudobulk_group_size`         | `1`                            | Cells per pseudobulk aggregate (1 disables pooling).                                                                              |
 | `pseudobulk_pca_components`     | `10`                           | PCA dims for pseudobulk neighborhood search.                                                                                      |
+| `transformer_embed_dim`         | `128`                          | Transformer embedding size.                                                                                                       |
+| `transformer_num_layers`        | `2`                            | Transformer encoder depth.                                                                                                        |
+| `transformer_dropout`           | `0.2`                          | Transformer dropout for attention/MLP and final head.                                                                             |
+| `transformer_num_heads`         | `None`                         | Attention heads; auto-selected when unset, must divide embedding dim when set.                                                    |
 | `min_expression_fraction`       | `0.10`                         | Fraction of cells expressing a gene for multi-output sampling.                                                                    |
 | `enable_feature_importance`     | `False`                        | Whether to compute feature importance for torch models.                                                                           |
 | `feature_importance_samples`    | `None` (all)                   | Max samples for feature importance computation.                                                                                   |
@@ -203,12 +221,12 @@ Data files are not published with the repository; treat the defaults above as lo
 | `resnet`      | 1D ResNet with strided stem, three residual stages (32→64→128 channels), adaptive pooling, 256-unit dense head, dropout 0.2.                    |
 | `rnn`         | Conv down-sampling followed by RNN (`hidden_size=96`, `num_layers=1`), dense head with dropout 0.2.                                             |
 | `lstm`        | Same conv front-end as RNN, `hidden_size=128` LSTM, dense head with dropout 0.2.                                                                |
-| `transformer` | Conv projection to 128 channels, adaptive pooling, transformer encoder (`embed_dim=128`, `num_layers=2`, `num_heads<=8`), dense head with GELU. |
+| `transformer` | Conv projection to 128 channels, adaptive pooling, configurable transformer encoder (`embed_dim`, `num_layers`, auto/explicit `num_heads`), dense head with GELU and configurable dropout. |
 | `graph`       | Implicit 1D graph message-passing network that chunkifies ATAC bins, applies learned edge weights, and aggregates through residual MLP layers.  |
 | `dcn`         | Deep & Cross Network with 3 cross layers and a 256→256→128 deep tower; concatenated outputs are linearly projected to targets.                  |
 | `mlp`         | Fully connected stack: 256→256→128 with LayerNorm + ReLU + dropout 0.2, output layer sized to target dimension.                                 |
 
-Torch optimizers use `Adam(lr=1e-3, weight_decay=1e-5)` with automatic mixed precision when CUDA is available.
+Torch optimizers use `Adam(lr=1e-3, weight_decay=1e-5)` with automatic mixed precision when CUDA is available, plus optional cosine LR decay with warmup.
 
 #### Scikit-learn / XGBoost Models
 

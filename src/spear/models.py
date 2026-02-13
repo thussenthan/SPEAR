@@ -514,9 +514,17 @@ class TransformerRegressor(nn.Module):
         output_dim: int = 1,
         embed_dim: int = 128,
         num_layers: int = 2,
-        num_heads: int = 8,
+        num_heads: Optional[int] = None,
+        dropout: float = 0.2,
     ) -> None:
         super().__init__()
+        if embed_dim <= 0:
+            raise ValueError(f"embed_dim must be positive, got {embed_dim}")
+        if num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {num_layers}")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError(f"dropout must be within [0, 1), got {dropout}")
+
         target_segments = max(8, min(256, max(1, input_dim // 32)))
         self.project = nn.Sequential(
             nn.Conv1d(1, 64, kernel_size=7, stride=4, padding=3),
@@ -532,13 +540,20 @@ class TransformerRegressor(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(target_segments)
         self.channel_proj = nn.Conv1d(128, embed_dim, kernel_size=1)
         self.positional = nn.Parameter(torch.randn(1, target_segments, embed_dim) * 0.02)
-        head_options = [h for h in (8, 4, 2, 1) if embed_dim % h == 0]
-        head_count = head_options[0] if head_options else 1
+        if num_heads is None:
+            head_options = [h for h in (8, 6, 4, 3, 2, 1) if embed_dim % h == 0]
+            head_count = head_options[0] if head_options else 1
+        else:
+            if num_heads <= 0:
+                raise ValueError(f"num_heads must be positive, got {num_heads}")
+            if embed_dim % num_heads != 0:
+                raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+            head_count = num_heads
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=head_count,
             dim_feedforward=embed_dim * 4,
-            dropout=0.1,
+            dropout=dropout,
             batch_first=True,
             activation="gelu",
         )
@@ -547,7 +562,7 @@ class TransformerRegressor(nn.Module):
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(dropout),
             nn.Linear(embed_dim, output_dim),
         )
 
@@ -657,7 +672,17 @@ def build_model(
     if name == "lstm":
         return TorchModelBundle(LSTMRegressor(input_dim, output_dim=output_dim), reshape="sequence")
     if name == "transformer":
-        return TorchModelBundle(TransformerRegressor(input_dim, output_dim=output_dim), reshape="sequence")
+        return TorchModelBundle(
+            TransformerRegressor(
+                input_dim,
+                output_dim=output_dim,
+                embed_dim=training.transformer_embed_dim,
+                num_layers=training.transformer_num_layers,
+                num_heads=training.transformer_num_heads,
+                dropout=training.transformer_dropout,
+            ),
+            reshape="sequence",
+        )
     if name == "mlp":
         return TorchModelBundle(MLPRegressor(input_dim, output_dim=output_dim))
     if name == "dcn":

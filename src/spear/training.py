@@ -2,6 +2,7 @@
 import hashlib
 import json
 import logging
+import math
 import random
 import threading
 import time
@@ -1680,6 +1681,30 @@ def _fit_torch_model(
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    accumulation_steps = max(1, int(config.gradient_accumulation_steps))
+    updates_per_epoch = max(1, math.ceil(max(1, len(train_loader)) / accumulation_steps))
+
+    scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
+    total_scheduler_steps = 0
+    warmup_scheduler_steps = 0
+    if config.lr_scheduler == "cosine":
+        total_scheduler_steps = max(1, updates_per_epoch * max(1, int(config.epochs)))
+        warmup_from_epochs = max(0, int(config.warmup_epochs)) * updates_per_epoch
+        warmup_from_ratio = int(round(total_scheduler_steps * float(config.warmup_ratio)))
+        warmup_scheduler_steps = warmup_from_epochs if warmup_from_epochs > 0 else warmup_from_ratio
+        warmup_scheduler_steps = min(max(0, warmup_scheduler_steps), max(0, total_scheduler_steps - 1))
+        min_lr_ratio = float(config.min_lr_ratio)
+
+        def _lr_lambda(step: int) -> float:
+            if step < warmup_scheduler_steps:
+                return float(step + 1) / float(max(1, warmup_scheduler_steps))
+            progress_denom = max(1, total_scheduler_steps - warmup_scheduler_steps - 1)
+            progress = min(1.0, float(step - warmup_scheduler_steps) / float(progress_denom))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
     use_amp = device.type == "cuda"
     scaler = _make_grad_scaler(use_amp)
 
@@ -1740,12 +1765,22 @@ def _fit_torch_model(
         return summary
 
     _LOG.info(
-        "Starting training | model=%s | device=%s | epochs=%d | batch_size=%d",
+        "Starting training | model=%s | device=%s | epochs=%d | batch_size=%d | grad_accum_steps=%d | optimizer_step_batch_size=%d | lr_scheduler=%s",
         type(model).__name__,
         device.type,
         config.epochs,
         batch_size,
+        accumulation_steps,
+        batch_size * accumulation_steps,
+        config.lr_scheduler,
     )
+    if scheduler is not None:
+        _LOG.info(
+            "LR scheduler enabled | type=cosine | warmup_steps=%d | total_steps=%d | min_lr_ratio=%.4f",
+            warmup_scheduler_steps,
+            total_scheduler_steps,
+            config.min_lr_ratio,
+        )
     _log_gpu_memory_snapshot("Before training start")
 
     for epoch in range(config.epochs):
@@ -1755,10 +1790,10 @@ def _fit_torch_model(
         train_loss_accum = 0.0
         train_samples = 0
         nan_detected = False
-        for batch_x, batch_y in train_loader:
+        optimizer.zero_grad(set_to_none=True)
+        for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
-            optimizer.zero_grad(set_to_none=True)
             with _amp_autocast(device.type, use_amp):
                 outputs = model(batch_x)
                 loss = criterion(outputs, batch_y)
@@ -1769,12 +1804,18 @@ def _fit_torch_model(
                 )
                 nan_detected = True
                 break
-            scaler.scale(loss).backward()
-            if config.max_grad_norm is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            loss_for_backward = loss / accumulation_steps
+            scaler.scale(loss_for_backward).backward()
+            should_step = ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(train_loader))
+            if should_step:
+                if config.max_grad_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler is not None:
+                    scheduler.step()
             batch_size_curr = batch_x.size(0)
             train_loss_accum += float(loss.item()) * batch_size_curr
             train_samples += batch_size_curr
@@ -1834,7 +1875,10 @@ def _fit_torch_model(
                 "epoch": float(epoch + 1),
                 "train_loss": float(train_loss_mean),
                 "val_loss": float(mean_val),
-                "effective_batch_size": float(batch_size),
+                "effective_batch_size": float(batch_size * accumulation_steps),
+                "micro_batch_size": float(batch_size),
+                "grad_accum_steps": float(accumulation_steps),
+                "lr": float(optimizer.param_groups[0]["lr"]),
             }
             if process is not None:
                 try:
@@ -1880,11 +1924,12 @@ def _fit_torch_model(
                     epoch + 1,
                     config.epochs,
                     type(model).__name__,
-                    batch_size,
+                    batch_size * accumulation_steps,
                     recent.get("train_loss", float("nan")),
                     recent.get("val_loss", float("nan")),
                 )
             )
+            log_msg += f" | lr={optimizer.param_groups[0]['lr']:.6g}"
             for metric_name in config.history_metrics:
                 key = metric_name.lower()
                 if key == "loss":
@@ -1917,11 +1962,12 @@ def _fit_torch_model(
                     epoch + 1,
                     config.epochs,
                     type(model).__name__,
-                    batch_size,
+                    batch_size * accumulation_steps,
                     train_loss_accum / max(train_samples, 1),
                     mean_val,
                 )
             )
+            log_msg += f" | lr={optimizer.param_groups[0]['lr']:.6g}"
             if gpu_peak_mb is not None:
                 log_msg += f" | gpu_peak_alloc_mb={gpu_peak_mb:.0f}"
             if gpu_util_pct is not None:

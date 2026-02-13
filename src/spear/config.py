@@ -71,6 +71,15 @@ class TrainingConfig:
     epochs: int = 100
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
+    lr_scheduler: str = "cosine"
+    warmup_epochs: int = 5
+    warmup_ratio: float = 0.1
+    min_lr_ratio: float = 0.01
+    gradient_accumulation_steps: int = 1
+    transformer_embed_dim: int = 128
+    transformer_num_layers: int = 2
+    transformer_dropout: float = 0.2
+    transformer_num_heads: Optional[int] = None
     # Gradient clipping for torch-based models (cnn/rnn/lstm/transformer/mlp/dcn/resnet/graph).
     max_grad_norm: Optional[float] = 5.0
     early_stopping_patience: int = 10
@@ -163,6 +172,27 @@ class TrainingConfig:
             raise ValueError("svr_tol must be positive")
         if self.max_grad_norm is not None and self.max_grad_norm <= 0:
             raise ValueError("max_grad_norm must be positive when specified")
+        if self.lr_scheduler not in {"none", "cosine"}:
+            raise ValueError("lr_scheduler must be 'none' or 'cosine'")
+        if self.warmup_epochs < 0:
+            raise ValueError("warmup_epochs must be >= 0")
+        if not (0.0 <= self.warmup_ratio <= 1.0):
+            raise ValueError("warmup_ratio must be within [0, 1]")
+        if not (0.0 < self.min_lr_ratio <= 1.0):
+            raise ValueError("min_lr_ratio must be within (0, 1]")
+        if self.gradient_accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps must be positive")
+        if self.transformer_embed_dim <= 0:
+            raise ValueError("transformer_embed_dim must be positive")
+        if self.transformer_num_layers <= 0:
+            raise ValueError("transformer_num_layers must be positive")
+        if not (0.0 <= self.transformer_dropout < 1.0):
+            raise ValueError("transformer_dropout must be within [0, 1)")
+        if self.transformer_num_heads is not None:
+            if self.transformer_num_heads <= 0:
+                raise ValueError("transformer_num_heads must be positive when specified")
+            if self.transformer_embed_dim % self.transformer_num_heads != 0:
+                raise ValueError("transformer_embed_dim must be divisible by transformer_num_heads")
         if self.k_folds > 1 and self.group_key is not None and not self.group_key:
             raise ValueError("group_key must be a non-empty string when provided")
         if self.enable_feature_importance:

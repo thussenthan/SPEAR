@@ -1,0 +1,43 @@
+method: grid
+metric:
+  goal: maximize
+  name: val_r2
+parameters:
+  transformer_embed_dim:
+    values: [128, 192, 256]
+  transformer_num_layers:
+    values: [2, 4, 6]
+  transformer_dropout:
+    values: [0.1, 0.2, 0.3]
+  transformer_num_heads:
+    value: 8
+  lr_scheduler:
+    value: cosine
+  warmup_epochs:
+    value: 5
+  min_lr_ratio:
+    value: 0.01
+  gradient_accumulation_steps:
+    value: 1
+
+command:
+  - ${env}
+  - python
+  - -m
+  - spear.cli
+  - --base-dir
+  - .
+  - --models
+  - transformer
+  - --multi-output
+  - --wandb
+  - --wandb-sweep
+  - --enable-shap
+  - --gene-manifest
+  - data/endothelial/manifests/1000_random_genes.csv
+  - --rna-path
+  - data/endothelial/processed/combined_RNA_qc_<15%mito.h5ad
+  - --atac-path
+  - data/endothelial/processed/combined_ATAC_qc_<15%mito.h5ad
+  - --cache-dir
+  - data/.spear_cache

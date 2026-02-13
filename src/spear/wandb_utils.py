@@ -104,7 +104,6 @@ def infer_dataset_name(config: PipelineConfig) -> Optional[str]:
 
 
 def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
-    slurm_job_id = os.getenv("SLURM_JOB_ID") or os.getenv("SLURM_JOBID")
     payload = {
         "dataset": infer_dataset_name(config),
         "multi_output": config.multi_output,
@@ -113,12 +112,24 @@ def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
         "chromosomes": config.chromosomes,
         "model": (config.all_models()[0] if config.all_models() else None),
         "training": asdict(config.training),
-        "slurm_job_id": slurm_job_id,
     }
     # Remove noisy training fields from W&B config to avoid redundancy.
     payload["training"].pop("track_history", None)
     payload["training"].pop("history_metrics", None)
     payload["training"].pop("resource_sample_seconds", None)
+    # During sweeps, W&B exposes tuned keys under parameters.*.
+    # Drop mirrored training fields to avoid duplicate UI columns.
+    if config.wandb.sweep_overrides:
+        for key in (
+            "gradient_accumulation_steps",
+            "lr_scheduler",
+            "min_lr_ratio",
+            "warmup_epochs",
+            "transformer_num_layers",
+            "transformer_embed_dim",
+            "transformer_dropout",
+        ):
+            payload["training"].pop(key, None)
     if config.chunk_total > 1 or config.chunk_index > 0:
         payload["chunk_index"] = config.chunk_index
         payload["chunk_total"] = config.chunk_total
@@ -137,7 +148,7 @@ def _default_wandb_run_name(config_payload: Dict[str, Any]) -> str:
 
 
 
-def maybe_init_wandb(config: PipelineConfig, *, extra_context: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+def maybe_init_wandb(config: PipelineConfig) -> Optional[Any]:
     wandb_cfg: WandbConfig = config.wandb
     if not wandb_cfg.enabled:
         return None
@@ -181,8 +192,6 @@ def maybe_init_wandb(config: PipelineConfig, *, extra_context: Optional[Dict[str
         return None
 
     config_payload = _build_wandb_config_payload(config)
-    if extra_context:
-        config_payload["context"] = _clean_payload(extra_context)
     if not wandb_cfg.run_name:
         wandb_cfg.run_name = _default_wandb_run_name(config_payload)
 

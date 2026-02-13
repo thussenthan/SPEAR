@@ -766,14 +766,16 @@ except ImportError:  # pragma: no cover - torch optional during some tests
 def run_pipeline(config: PipelineConfig) -> Path:
     config.ensure_directories()
 
-    extra_context = None
-    if config.run_context:
-        extra_context = {"run_context": config.run_context}
-    wandb_run = maybe_init_wandb(config, extra_context=extra_context)
+    wandb_run = maybe_init_wandb(config)
     if wandb_run is not None:
         summary_payload: Dict[str, Any] = {}
         if config.run_context:
-            summary_payload["run_context"] = config.run_context
+            # Keep runtime provenance fields that are not already first-class W&B metadata.
+            summary_payload["run_context"] = {
+                key: value
+                for key, value in config.run_context.items()
+                if key not in {"host", "run_name", "timestamp_utc"}
+            }
         if config.log_path is not None:
             summary_payload["log_path"] = str(config.log_path)
         if summary_payload:
@@ -1291,8 +1293,6 @@ def _run_per_gene_pipeline(
                         summary_payload[key] = value
                 summary_payload["model"] = model_name
                 summary_payload["num_genes"] = len(metrics_df)
-                summary_payload["dataset"] = infer_dataset_name(config)
-                summary_payload["slurm_job_id"] = os.getenv("SLURM_JOB_ID") or os.getenv("SLURM_JOBID")
                 if summary_payload:
                     wandb_update_summary(wandb_run, summary_payload)
             base_row: Dict[str, Any] = {
@@ -1831,7 +1831,9 @@ def _run_cellwise_pipeline(
                             prefix=f"shap/{model_name}",
                         )
                         if shap_metric_payload:
-                            wandb_log_metrics(wandb_run, shap_metric_payload)
+                            # SHAP summary scalars are run-level artifacts; keep them in summary
+                            # to avoid noisy single-point metric charts.
+                            wandb_update_summary(wandb_run, shap_metric_payload)
 
                 metric_payload = {
                     "model": model_name,
@@ -1848,11 +1850,9 @@ def _run_cellwise_pipeline(
                     summary_payload = {
                         key: value
                         for key, value in metric_payload.items()
-                        if key != "model"
+                        if key not in {"model", "dataset"}
                     }
                     summary_payload["model"] = model_name
-                    summary_payload["dataset"] = infer_dataset_name(config)
-                    summary_payload["slurm_job_id"] = os.getenv("SLURM_JOB_ID") or os.getenv("SLURM_JOBID")
                     wandb_update_summary(wandb_run, summary_payload)
 
                 # Verify all critical files were written before logging completion
@@ -2048,21 +2048,21 @@ def _run_cellwise_pipeline(
                 run_dir,
                 patterns=["models/*/shap_importance_mean.png"],
                 max_items=max_media,
-                group_key="Plots/SHAP/Importance",
+                prefix="Plots/SHAP/Importance",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
                 patterns=["models/*/shap_vs_tss.png"],
                 max_items=max_media,
-                group_key="Plots/SHAP/TSS",
+                prefix="Plots/SHAP/TSS",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
                 patterns=["models/*/shap_vs_tss_zoomed.png"],
                 max_items=max_media,
-                group_key="Plots/SHAP/TSS_Zoomed",
+                prefix="Plots/SHAP/TSS_Zoomed",
             )
             metric_labels = {
                 "pearson": "Pearson",
@@ -2508,11 +2508,6 @@ def _plot_cellwise_diagnostics(
                     {
                         "generalization_gap_train_test_pearson_mean": gap_mean,
                         "model": result.model_name,
-                        **(
-                            {"dataset": infer_dataset_name(config)}
-                            if config is not None
-                            else {}
-                        ),
                     },
                 )
             plot_single_box_violin(
