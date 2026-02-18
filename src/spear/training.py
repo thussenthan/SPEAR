@@ -346,9 +346,11 @@ class CellwiseModelResult:
     fitted_model: Optional[object] = None
     history: Optional[List[Dict[str, float]]] = None
     feature_importances: Optional[np.ndarray] = None
+    feature_importance_mean_signed: Optional[np.ndarray] = None
     feature_names: Optional[List[str]] = None
     feature_importance_method: Optional[str] = None
-    shap_importances_mean: Optional[np.ndarray] = None
+    shap_importance_mean: Optional[np.ndarray] = None
+    shap_value_mean_signed: Optional[np.ndarray] = None
     shap_importance_method: Optional[str] = None
     feature_block_slices: Optional[List[Tuple[int, int]]] = None
     feature_block_indices: Optional[List[np.ndarray]] = None
@@ -1122,8 +1124,11 @@ def _compute_torch_feature_importance(
     max_samples: int = 2000,
     batch_size: int = 256,
     target_scaler: Optional[StandardScaler | MinMaxScaler] = None,
-) -> Optional[np.ndarray]:
-    """Estimate global feature importance via mean absolute input gradients with permutation fallback."""
+) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+    """Estimate global feature importance via input gradients with permutation fallback.
+
+    Returns mean absolute gradients (for ranking) and mean signed gradients (for directionality).
+    """
 
     X_ref = np.asarray(X_reference, dtype=np.float32)
     y_ref = np.asarray(y_reference, dtype=np.float64) if y_reference is not None else None
@@ -1152,7 +1157,8 @@ def _compute_torch_feature_importance(
     model = _wrap_model_for_multi_gpu(model, device)
     model.eval()
 
-    totals = np.zeros(X_ref.shape[1], dtype=np.float64)
+    totals_abs = np.zeros(X_ref.shape[1], dtype=np.float64)
+    totals_signed = np.zeros(X_ref.shape[1], dtype=np.float64)
     count = 0
 
     grad_success = False
@@ -1175,17 +1181,18 @@ def _compute_torch_feature_importance(
             if bundle.reshape == "sequence":
                 grads = grads.reshape(grads.shape[0], -1)
 
-            grad_batch = grads.detach().abs().cpu().numpy()
-            totals += grad_batch.sum(axis=0)
-            count += grad_batch.shape[0]
+            grad_np = grads.detach().cpu().numpy()
+            totals_signed += grad_np.sum(axis=0)
+            totals_abs += np.abs(grad_np).sum(axis=0)
+            count += grad_np.shape[0]
         if count > 0:
             grad_success = True
-            return totals / float(count)
+            return totals_abs / float(count), totals_signed / float(count)
     except Exception:
         grad_success = False
 
     if not grad_success and y_ref is not None:
-        return _compute_torch_permutation_importance(
+        perm = _compute_torch_permutation_importance(
             bundle,
             X_ref,
             y_ref,
@@ -1194,6 +1201,9 @@ def _compute_torch_feature_importance(
             max_samples=max_samples,
             batch_size=batch_size,
         )
+        if perm is None:
+            return None
+        return perm, None
     return None
 
 
@@ -1204,8 +1214,8 @@ def _compute_torch_shap_importance(
     device: torch.device,
     max_samples: Optional[int] = 500,
     background_samples: int = 100,
-) -> Optional[np.ndarray]:
-    """Estimate mean absolute SHAP values for a torch model (best-effort)."""
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Estimate mean absolute and mean signed SHAP values for a torch model (best-effort)."""
     try:
         import shap
     except Exception as exc:  # pragma: no cover - optional dependency
@@ -1278,14 +1288,18 @@ def _compute_torch_shap_importance(
             shap_arr = shap_arr.reshape(shap_arr.shape[0], shap_arr.shape[1], -1)
         if shap_arr.ndim != 3:
             return None
-        return np.mean(np.abs(shap_arr), axis=(0, 1))
+        mean_abs = np.mean(np.abs(shap_arr), axis=(0, 1))
+        mean_signed = np.mean(shap_arr, axis=(0, 1))
+        return mean_abs, mean_signed
 
     shap_arr = np.asarray(shap_values)
     if shap_arr.ndim > 2:
         shap_arr = shap_arr.reshape(shap_arr.shape[0], -1)
     if shap_arr.ndim != 2:
         return None
-    return np.mean(np.abs(shap_arr), axis=0)
+    mean_abs = np.mean(np.abs(shap_arr), axis=0)
+    mean_signed = np.mean(shap_arr, axis=0)
+    return mean_abs, mean_signed
 
 
 def _compute_torch_permutation_importance(
@@ -1513,8 +1527,10 @@ def train_multi_output_model(
     _log_resource_snapshot(f"train_multi_output:{model_name}:fit:end")
 
     feature_importances: Optional[np.ndarray] = None
+    feature_importance_mean_signed: Optional[np.ndarray] = None
     feature_importance_method: Optional[str] = None
-    shap_importances_mean: Optional[np.ndarray] = None
+    shap_importance_mean: Optional[np.ndarray] = None
+    shap_value_mean_signed: Optional[np.ndarray] = None
     shap_importance_method: Optional[str] = None
     if isinstance(model, TorchModelBundle) and config.enable_feature_importance:
         fi_start = time.perf_counter()
@@ -1522,7 +1538,7 @@ def train_multi_output_model(
         fi_batch_size = config.feature_importance_batch_size
         try:
             device = _select_device(config.device_preference)
-            feature_importances = _compute_torch_feature_importance(
+            fi_result = _compute_torch_feature_importance(
                 model,
                 splits.X_val,
                 splits.y_val,
@@ -1531,11 +1547,13 @@ def train_multi_output_model(
                 batch_size=fi_batch_size,
                 target_scaler=prepared.target_scaler,
             )
-            if feature_importances is not None:
+            if fi_result is not None:
+                feature_importances, feature_importance_mean_signed = fi_result
                 feature_importance_method = "input_gradient_abs_mean"
         except Exception as exc:  # pragma: no cover - best-effort diagnostics
             _LOG.warning("Failed to compute feature importances for %s: %s", model_name, exc)
             feature_importances = None
+            feature_importance_mean_signed = None
             feature_importance_method = None
         finally:
             fi_elapsed = time.perf_counter() - fi_start
@@ -1552,18 +1570,20 @@ def train_multi_output_model(
         shap_start = time.perf_counter()
         try:
             device = _select_device(config.device_preference)
-            shap_importances_mean = _compute_torch_shap_importance(
+            shap_result = _compute_torch_shap_importance(
                 model,
                 splits.X_val,
                 device=device,
                 max_samples=config.shap_max_samples,
                 background_samples=config.shap_background_samples,
             )
-            if shap_importances_mean is not None:
+            if shap_result is not None:
+                shap_importance_mean, shap_value_mean_signed = shap_result
                 shap_importance_method = "shap_gradient_explainer_mean_abs"
         except Exception as exc:  # pragma: no cover - best-effort diagnostics
             _LOG.warning("Failed to compute SHAP importances for %s: %s", model_name, exc)
-            shap_importances_mean = None
+            shap_importance_mean = None
+            shap_value_mean_signed = None
             shap_importance_method = None
         finally:
             shap_elapsed = time.perf_counter() - shap_start
@@ -1621,9 +1641,11 @@ def train_multi_output_model(
         fitted_model=fitted_model,
         history=history,
         feature_importances=feature_importances,
+        feature_importance_mean_signed=feature_importance_mean_signed,
         feature_names=getattr(dataset, "feature_names", None),
         feature_importance_method=feature_importance_method,
-        shap_importances_mean=shap_importances_mean,
+        shap_importance_mean=shap_importance_mean,
+        shap_value_mean_signed=shap_value_mean_signed,
         shap_importance_method=shap_importance_method,
         feature_block_slices=getattr(dataset, "feature_block_slices", None),
         feature_block_indices=getattr(dataset, "feature_block_indices", None),
@@ -1680,6 +1702,27 @@ def _fit_torch_model(
         )
 
     criterion = nn.MSELoss()
+    pearson_loss_weight = float(getattr(config, "torch_pearson_loss_weight", 0.0))
+
+    def _batch_pearson_loss(preds: torch.Tensor, targets: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        if preds.ndim == 1:
+            preds = preds.unsqueeze(1)
+        if targets.ndim == 1:
+            targets = targets.unsqueeze(1)
+        preds_centered = preds - preds.mean(dim=0, keepdim=True)
+        targets_centered = targets - targets.mean(dim=0, keepdim=True)
+        cov = torch.sum(preds_centered * targets_centered, dim=0)
+        pred_norm = torch.sqrt(torch.sum(preds_centered * preds_centered, dim=0) + eps)
+        target_norm = torch.sqrt(torch.sum(targets_centered * targets_centered, dim=0) + eps)
+        corr = cov / (pred_norm * target_norm + eps)
+        return 1.0 - corr.clamp(-1.0, 1.0).mean()
+
+    def _compute_loss(outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        mse = criterion(outputs, targets)
+        if pearson_loss_weight <= 0.0:
+            return mse
+        return mse + pearson_loss_weight * _batch_pearson_loss(outputs, targets)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     accumulation_steps = max(1, int(config.gradient_accumulation_steps))
     updates_per_epoch = max(1, math.ceil(max(1, len(train_loader)) / accumulation_steps))
@@ -1765,7 +1808,7 @@ def _fit_torch_model(
         return summary
 
     _LOG.info(
-        "Starting training | model=%s | device=%s | epochs=%d | batch_size=%d | grad_accum_steps=%d | optimizer_step_batch_size=%d | lr_scheduler=%s",
+        "Starting training | model=%s | device=%s | epochs=%d | batch_size=%d | grad_accum_steps=%d | optimizer_step_batch_size=%d | lr_scheduler=%s | pearson_loss_weight=%.4f",
         type(model).__name__,
         device.type,
         config.epochs,
@@ -1773,6 +1816,7 @@ def _fit_torch_model(
         accumulation_steps,
         batch_size * accumulation_steps,
         config.lr_scheduler,
+        pearson_loss_weight,
     )
     if scheduler is not None:
         _LOG.info(
@@ -1796,7 +1840,7 @@ def _fit_torch_model(
             batch_y = batch_y.to(device)
             with _amp_autocast(device.type, use_amp):
                 outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
+                loss = _compute_loss(outputs, batch_y)
             if not torch.isfinite(loss):
                 _LOG.warning(
                     "Non-finite training loss detected at epoch %d; stopping early.",
@@ -1811,10 +1855,18 @@ def _fit_torch_model(
                 if config.max_grad_norm is not None:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                did_optimizer_step = True
+                if use_amp and hasattr(scaler, "get_scale"):
+                    prev_scale = float(scaler.get_scale())
+                    scaler.step(optimizer)
+                    scaler.update()
+                    # When GradScaler skips an update due to inf/NaN grads, scale decreases.
+                    did_optimizer_step = float(scaler.get_scale()) >= prev_scale
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                if scheduler is not None:
+                if scheduler is not None and did_optimizer_step:
                     scheduler.step()
             batch_size_curr = batch_x.size(0)
             train_loss_accum += float(loss.item()) * batch_size_curr
@@ -1833,7 +1885,7 @@ def _fit_torch_model(
                 val_y = val_y.to(device)
                 with _amp_autocast(device.type, use_amp):
                     preds = model(val_x)
-                    val_loss = criterion(preds, val_y)
+                    val_loss = _compute_loss(preds, val_y)
                 running.append(val_loss.item())
                 if track_history:
                     val_preds_epoch.append(preds.detach().cpu().numpy())

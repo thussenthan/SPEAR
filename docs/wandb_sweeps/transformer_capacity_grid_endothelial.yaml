@@ -1,7 +1,7 @@
 method: grid
 metric:
   goal: maximize
-  name: val_r2
+  name: test_pearson
 parameters:
   transformer_embed_dim:
     values: [128, 192, 256]

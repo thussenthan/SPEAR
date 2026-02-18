@@ -121,6 +121,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Transformer attention heads (must divide transformer-embed-dim)",
     )
     parser.add_argument(
+        "--transformer-arch",
+        choices=["v1", "v2"],
+        help="Transformer architecture variant (default v1)",
+    )
+    parser.add_argument(
+        "--torch-pearson-loss-weight",
+        type=float,
+        help="Optional Pearson-correlation loss weight added to torch-model training objective",
+    )
+    parser.add_argument(
         "--enable-feature-importance",
         action="store_true",
         help="Enable feature importance for multi-output torch models",
@@ -134,6 +144,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--feature-importance-batch-size",
         type=int,
         help="Batch size for feature-importance gradient accumulation (default 128)",
+    )
+    parser.add_argument(
+        "--enable-per-gene-panels",
+        action="store_true",
+        help="Generate per-gene feature-importance panel images",
     )
     parser.add_argument(
         "--enable-shap",
@@ -351,6 +366,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.feature_importance_samples = args.feature_importance_samples
         if args.feature_importance_batch_size is not None:
             training.feature_importance_batch_size = args.feature_importance_batch_size
+        if args.enable_per_gene_panels:
+            training.enable_per_gene_panels = True
         if args.enable_shap:
             training.enable_shap = True
         training.export_raw_predictions = args.export_raw_predictions
@@ -366,6 +383,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.transformer_dropout = args.transformer_dropout
         if args.transformer_num_heads is not None:
             training.transformer_num_heads = args.transformer_num_heads
+        if args.transformer_arch is not None:
+            training.transformer_arch = args.transformer_arch
+        if args.torch_pearson_loss_weight is not None:
+            training.torch_pearson_loss_weight = args.torch_pearson_loss_weight
         if args.rf_n_estimators is not None:
             training.rf_n_estimators = args.rf_n_estimators
         if args.rf_max_depth is not None:

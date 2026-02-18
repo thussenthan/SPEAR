@@ -79,6 +79,33 @@ def _clean_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _DATASET_PATTERN = re.compile(r"(embryonic|endothelial)", re.IGNORECASE)
+_MODEL_SPECIFIC_TRAINING_PREFIXES = (
+    "catboost_",
+    "svr_",
+    "transformer_",
+    "rf_",
+)
+_MODEL_SPECIFIC_TRAINING_KEYS = {
+    "catboost_iterations",
+}
+
+
+def _split_model_specific_training_fields(
+    training_payload: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Split training payload into generic and model-specific fields."""
+
+    generic: Dict[str, Any] = {}
+    model_specific: Dict[str, Any] = {}
+    for key, value in training_payload.items():
+        is_model_specific = key in _MODEL_SPECIFIC_TRAINING_KEYS or key.startswith(
+            _MODEL_SPECIFIC_TRAINING_PREFIXES
+        )
+        if is_model_specific:
+            model_specific[key] = value
+        else:
+            generic[key] = value
+    return generic, model_specific
 
 
 def _infer_dataset_name(config: PipelineConfig) -> Optional[str]:
@@ -104,19 +131,20 @@ def infer_dataset_name(config: PipelineConfig) -> Optional[str]:
 
 
 def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
+    training_payload = asdict(config.training)
     payload = {
         "dataset": infer_dataset_name(config),
-        "multi_output": config.multi_output,
         "max_genes": config.max_genes,
         "num_requested_genes": len(config.genes) if config.genes else None,
         "chromosomes": config.chromosomes,
         "model": (config.all_models()[0] if config.all_models() else None),
-        "training": asdict(config.training),
+        "training": training_payload,
     }
     # Remove noisy training fields from W&B config to avoid redundancy.
     payload["training"].pop("track_history", None)
     payload["training"].pop("history_metrics", None)
     payload["training"].pop("resource_sample_seconds", None)
+    payload["training"].pop("enable_per_gene_panels", None)
     # During sweeps, W&B exposes tuned keys under parameters.*.
     # Drop mirrored training fields to avoid duplicate UI columns.
     if config.wandb.sweep_overrides:
@@ -130,6 +158,12 @@ def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
             "transformer_dropout",
         ):
             payload["training"].pop(key, None)
+
+    generic_training, model_specific_training = _split_model_specific_training_fields(payload["training"])
+    payload["training"] = generic_training
+    for key, value in model_specific_training.items():
+        payload[f"|training.{key}"] = value
+
     if config.chunk_total > 1 or config.chunk_index > 0:
         payload["chunk_index"] = config.chunk_index
         payload["chunk_total"] = config.chunk_total
@@ -327,9 +361,12 @@ def wandb_finish(run: Optional[Any], *, status: str, run_dir: Optional[Path] = N
     if run is None:
         return
     try:
-        if run_dir is not None:
-            run.summary.update(_clean_payload({"output_dir": str(run_dir)}))
         status_norm = (status or "").strip().lower()
+        summary_payload: Dict[str, Any] = {}
+        if run_dir is not None:
+            summary_payload["output_dir"] = str(run_dir)
+        if summary_payload:
+            run.summary.update(_clean_payload(summary_payload))
         exit_code = 0 if status_norm in {"succeeded", "success"} else 1
         run.finish(exit_code=exit_code)
     except Exception:
@@ -367,9 +404,10 @@ def log_run_artifacts(run: Optional[Any], run_dir: Path, *, include: Optional[It
             "models/*/feature_importances_mean.csv",
             "models/*/feature_importances_per_gene.csv",
             "models/*/feature_importance_per_gene_summary.csv",
+            "models/*/shapley_values_per_gene_summary.csv",
             "models/*/feature_importance_summary.json",
-            "models/*/shap_importances_mean.csv",
-            "models/*/shap_importance_summary.json",
+            "models/*/shapley_values_mean.csv",
+            "models/*/shapley_values_summary.json",
             "models/*/per_gene_panels/*.png",
         ]
 

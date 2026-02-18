@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.multioutput import MultiOutputRegressor
-from sklearn.svm import SVR
+from sklearn.svm import LinearSVR, SVR
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -582,6 +582,168 @@ class TransformerRegressor(nn.Module):
         return self.head(x)
 
 
+class _GEGLU(nn.Module):
+    """Gated GELU projection used in Transformer FFN blocks."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = x.chunk(2, dim=-1)
+        return a * F.gelu(b)
+
+
+class _TransformerBlockV2(nn.Module):
+    """Pre-norm Transformer block with GEGLU FFN and layer scaling."""
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.drop1 = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(embed_dim)
+        ffn_dim = embed_dim * 4
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, ffn_dim * 2),
+            _GEGLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, embed_dim),
+        )
+        self.drop2 = nn.Dropout(dropout)
+        self.gamma1 = nn.Parameter(torch.ones(embed_dim) * 1e-3)
+        self.gamma2 = nn.Parameter(torch.ones(embed_dim) * 1e-3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_in = self.norm1(x)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        x = x + self.drop1(attn_out) * self.gamma1
+        ffn_out = self.ffn(self.norm2(x))
+        x = x + self.drop2(ffn_out) * self.gamma2
+        return x
+
+
+class TransformerRegressorV2(nn.Module):
+    """Hybrid convolution-attention transformer with gated token pooling."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1,
+        embed_dim: int = 128,
+        num_layers: int = 2,
+        num_heads: Optional[int] = None,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        if embed_dim <= 0:
+            raise ValueError(f"embed_dim must be positive, got {embed_dim}")
+        if num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {num_layers}")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError(f"dropout must be within [0, 1), got {dropout}")
+
+        if num_heads is None:
+            head_options = [h for h in (8, 6, 4, 3, 2, 1) if embed_dim % h == 0]
+            head_count = head_options[0] if head_options else 1
+        else:
+            if num_heads <= 0:
+                raise ValueError(f"num_heads must be positive, got {num_heads}")
+            if embed_dim % num_heads != 0:
+                raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+            head_count = num_heads
+
+        stem_channels = max(64, embed_dim)
+        local_channels = stem_channels // 2
+        context_channels = stem_channels - local_channels
+
+        self.local_stem = nn.Sequential(
+            nn.Conv1d(1, local_channels, kernel_size=9, stride=4, padding=4, bias=False),
+            nn.BatchNorm1d(local_channels),
+            nn.GELU(),
+            nn.Conv1d(
+                local_channels,
+                local_channels,
+                kernel_size=5,
+                stride=1,
+                padding=2,
+                groups=local_channels,
+                bias=False,
+            ),
+            nn.BatchNorm1d(local_channels),
+            nn.GELU(),
+        )
+        self.context_stem = nn.Sequential(
+            nn.Conv1d(1, context_channels, kernel_size=15, stride=4, padding=7, bias=False),
+            nn.BatchNorm1d(context_channels),
+            nn.GELU(),
+            nn.Conv1d(
+                context_channels,
+                context_channels,
+                kernel_size=3,
+                stride=1,
+                padding=2,
+                dilation=2,
+                bias=False,
+            ),
+            nn.BatchNorm1d(context_channels),
+            nn.GELU(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv1d(stem_channels, embed_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(embed_dim),
+            nn.GELU(),
+        )
+
+        target_segments = max(16, min(384, max(1, input_dim // 24)))
+        self.pool = nn.AdaptiveAvgPool1d(target_segments)
+        self.token_norm = nn.LayerNorm(embed_dim)
+        self.positional = nn.Parameter(torch.randn(1, target_segments + 1, embed_dim) * 0.02)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.blocks = nn.ModuleList(
+            [_TransformerBlockV2(embed_dim, head_count, dropout=dropout) for _ in range(num_layers)]
+        )
+        self.final_norm = nn.LayerNorm(embed_dim)
+        self.attn_pool = nn.Linear(embed_dim, 1)
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim * 4),
+            nn.Linear(embed_dim * 4, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        elif x.dim() == 3 and x.size(-1) == 1:
+            x = x.transpose(1, 2)
+        local = self.local_stem(x)
+        context = self.context_stem(x)
+        x = torch.cat([local, context], dim=1)
+        x = self.fuse(x)
+        x = self.pool(x).transpose(1, 2)
+        x = self.token_norm(x)
+        batch_size = x.size(0)
+        cls = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.positional[:, : x.size(1), :]
+        for block in self.blocks:
+            x = block(x)
+        x = self.final_norm(x)
+
+        cls_token = x[:, 0, :]
+        tokens = x[:, 1:, :]
+        weights = torch.softmax(self.attn_pool(tokens).squeeze(-1), dim=1).unsqueeze(-1)
+        pooled = torch.sum(tokens * weights, dim=1)
+        mean_tokens = tokens.mean(dim=1)
+        max_tokens = tokens.amax(dim=1)
+        features = torch.cat([cls_token, pooled, mean_tokens, max_tokens], dim=-1)
+        return self.head(features)
+
+
 class GraphRegressor(nn.Module):
     """Graph Neural Network modeling ATAC-seq bins as 1D nodes with local spatial connectivity.
     
@@ -672,8 +834,10 @@ def build_model(
     if name == "lstm":
         return TorchModelBundle(LSTMRegressor(input_dim, output_dim=output_dim), reshape="sequence")
     if name == "transformer":
+        transformer_arch = getattr(training, "transformer_arch", "v1")
+        transformer_cls = TransformerRegressorV2 if transformer_arch == "v2" else TransformerRegressor
         return TorchModelBundle(
-            TransformerRegressor(
+            transformer_cls(
                 input_dim,
                 output_dim=output_dim,
                 embed_dim=training.transformer_embed_dim,
@@ -711,7 +875,19 @@ def build_model(
         epsilon = training.svr_epsilon
         max_iter = training.svr_max_iter
         tol = training.svr_tol
-        svr_estimator = SVR(C=C, epsilon=epsilon, kernel=kernel, max_iter=max_iter, tol=tol)
+        if kernel == "linear":
+            # LinearSVR scales much better than kernel SVR on large, high-dimensional
+            # multi-output workloads (e.g., 1k genes x 40k features).
+            svr_estimator = LinearSVR(
+                C=C,
+                epsilon=epsilon,
+                max_iter=max_iter,
+                tol=tol,
+                random_state=training.random_state,
+                dual="auto",
+            )
+        else:
+            svr_estimator = SVR(C=C, epsilon=epsilon, kernel=kernel, max_iter=max_iter, tol=tol)
         if output_dim == 1:
             return Pipeline(
                 [

@@ -17,10 +17,16 @@ sns.set_style("whitegrid")
 
 
 def _load_shap_table(model_dir: Path) -> pd.DataFrame:
-    table_path = model_dir / "shap_importances_mean.csv"
-    if not table_path.exists():
+    table_candidates = [
+        model_dir / "shapley_values_mean.csv",
+        model_dir / "shap_values_mean.csv",
+        model_dir / "shap_importance_mean.csv",
+        model_dir / "shap_importances_mean.csv",
+    ]
+    table_path = next((path for path in table_candidates if path.exists()), None)
+    if table_path is None:
         raise FileNotFoundError(
-            f"Could not locate SHAP importance table at {table_path}. "
+            f"Could not locate SHAP table at any of: {', '.join(str(p) for p in table_candidates)}. "
             "Ensure the pipeline was run with enable_shap=true."
         )
     df = pd.read_csv(table_path)
@@ -32,8 +38,14 @@ def _load_shap_table(model_dir: Path) -> pd.DataFrame:
 
 
 def _load_gene_summary(model_dir: Path) -> Optional[pd.DataFrame]:
-    summary_path = model_dir / "shap_importance_per_gene_summary.csv"
-    if not summary_path.exists():
+    summary_candidates = [
+        model_dir / "shapley_values_per_gene_summary.csv",
+        model_dir / "shap_values_per_gene_summary.csv",
+        model_dir / "shap_per_gene_summary.csv",
+        model_dir / "shap_importance_per_gene_summary.csv",
+    ]
+    summary_path = next((path for path in summary_candidates if path.exists()), None)
+    if summary_path is None:
         return None
     df = pd.read_csv(summary_path)
     if df.empty:
@@ -333,12 +345,12 @@ def main() -> None:
         "--model-dir",
         type=Path,
         required=True,
-        help="Path to model directory containing shap_importances_mean.csv",
+        help="Path to model directory containing shapley_values_mean.csv",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        help="Output path for main figure (default: <model_dir>/shap_vs_tss.png)",
+        help="Output path for main figure (default: <model_dir>/shapley_values_vs_tss.png)",
     )
     parser.add_argument(
         "--summary-output",
@@ -368,7 +380,7 @@ def main() -> None:
         parser.error(f"Model directory does not exist: {args.model_dir}")
 
     # Create main manuscript-style figure
-    output_path = args.output or (args.model_dir / "shap_vs_tss.png")
+    output_path = args.output or (args.model_dir / "shapley_values_vs_tss.png")
     create_manuscript_figure(args.model_dir, output_path, show_scatter=args.show_scatter)
     
     # Optionally create summary figure with multiple panels

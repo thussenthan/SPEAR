@@ -266,9 +266,9 @@ class ResourceUsageTracker:
         )
 
     def _write_csv(self) -> None:
-        output_dir = self._output_dir / self._safe_name
+        output_dir = self._output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / "model_resource_usage.csv"
+        path = output_dir / f"{self._safe_name}_resource_usage.csv"
         try:
             with path.open("w", newline="") as handle:
                 writer = csv.writer(handle)
@@ -317,7 +317,7 @@ class ResourceUsageTracker:
         if not times:
             return
 
-        output_dir = self._output_dir / self._safe_name
+        output_dir = self._output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
         time_min = min(times)
         time_max = max(times)
@@ -357,7 +357,7 @@ class ResourceUsageTracker:
 
         fig.suptitle(f"Resource usage | {self._name}", y=0.98)
         fig.tight_layout(rect=(0, 0, 1, 0.95))
-        path = output_dir / "model_resource_usage.png"
+        path = output_dir / f"{self._safe_name}_resource_usage.png"
         try:
             fig.savefig(path, dpi=300)
             self._log.info("Wrote resource usage plot to %s", path)

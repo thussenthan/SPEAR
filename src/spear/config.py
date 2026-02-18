@@ -80,6 +80,8 @@ class TrainingConfig:
     transformer_num_layers: int = 2
     transformer_dropout: float = 0.2
     transformer_num_heads: Optional[int] = None
+    transformer_arch: str = "v1"
+    torch_pearson_loss_weight: float = 0.0
     # Gradient clipping for torch-based models (cnn/rnn/lstm/transformer/mlp/dcn/resnet/graph).
     max_grad_norm: Optional[float] = 5.0
     early_stopping_patience: int = 10
@@ -124,6 +126,8 @@ class TrainingConfig:
     enable_feature_importance: bool = False
     feature_importance_samples: Optional[int] = None
     feature_importance_batch_size: int = 256
+    # Off by default to avoid generating a large number of panel images.
+    enable_per_gene_panels: bool = False
     enable_shap: bool = False
     shap_max_samples: Optional[int] = 500
     shap_background_samples: int = 100
@@ -193,6 +197,10 @@ class TrainingConfig:
                 raise ValueError("transformer_num_heads must be positive when specified")
             if self.transformer_embed_dim % self.transformer_num_heads != 0:
                 raise ValueError("transformer_embed_dim must be divisible by transformer_num_heads")
+        if self.transformer_arch not in {"v1", "v2"}:
+            raise ValueError("transformer_arch must be 'v1' or 'v2'")
+        if self.torch_pearson_loss_weight < 0.0:
+            raise ValueError("torch_pearson_loss_weight must be >= 0")
         if self.k_folds > 1 and self.group_key is not None and not self.group_key:
             raise ValueError("group_key must be a non-empty string when provided")
         if self.enable_feature_importance:

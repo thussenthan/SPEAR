@@ -168,7 +168,7 @@ Multi-output torch runs can emit feature-importance and SHAP summaries under eac
 
 - `feature_importances_mean.csv`, `feature_importances_raw.npz`, `feature_importance_per_gene_summary.csv`
 - `feature_importance_mean.png`, `feature_importance_vs_tss_distance.png`
-- `shap_importances_mean.csv`, `shap_importance_mean.png`
+- `shapley_values_mean.csv`, `shapley_values_mean.png`
 
 Use `scripts/plot_feature_importance_vs_tss.py` to build a publication-ready panel from these outputs.
 

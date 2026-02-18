@@ -48,7 +48,6 @@ from .wandb_utils import (
     log_tables_from_csv,
     maybe_init_wandb,
     wandb_finish,
-    wandb_log_metrics,
     wandb_update_summary,
 )
 from .visualization import (
@@ -144,6 +143,176 @@ def _flatten_numeric_metrics(payload: Dict[str, Any], *, prefix: str) -> Dict[st
     return flattened
 
 
+def _compact_shap_metric_payload(shap_summary: Dict[str, Any]) -> Dict[str, float]:
+    """Build short SHAP metric keys for W&B summary (e.g., ``shap.mse_mean``)."""
+
+    payload: Dict[str, float] = {}
+    num_features = shap_summary.get("num_features")
+    if isinstance(num_features, (int, float, np.integer, np.floating)) and np.isfinite(float(num_features)):
+        payload["shap.num_features"] = float(num_features)
+
+    mean_abs_sum = shap_summary.get("shap_mean_abs_sum")
+    if isinstance(mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_abs_sum)):
+        payload["shap.mean_abs_sum"] = float(mean_abs_sum)
+
+    mean_sum = shap_summary.get("shap_mean_sum")
+    if isinstance(mean_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_sum)):
+        payload["shap.mean_sum"] = float(mean_sum)
+
+    mean_abs_top1 = shap_summary.get("shap_mean_abs_top1")
+    if isinstance(mean_abs_top1, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_abs_top1)):
+        payload["shap.mean_abs_top1"] = float(mean_abs_top1)
+
+    mean_top1 = shap_summary.get("shap_mean_top1")
+    if isinstance(mean_top1, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_top1)):
+        payload["shap.mean_top1"] = float(mean_top1)
+
+    mean_signed_sum = shap_summary.get("shap_mean_signed_sum")
+    if isinstance(mean_signed_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_signed_sum)):
+        payload["shap.mean_signed_sum"] = float(mean_signed_sum)
+
+    mean_signed_top_positive = shap_summary.get("shap_mean_signed_top_positive")
+    if isinstance(mean_signed_top_positive, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_signed_top_positive)):
+        payload["shap.mean_signed_top_positive"] = float(mean_signed_top_positive)
+
+    mean_signed_top_negative = shap_summary.get("shap_mean_signed_top_negative")
+    if isinstance(mean_signed_top_negative, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_signed_top_negative)):
+        payload["shap.mean_signed_top_negative"] = float(mean_signed_top_negative)
+
+    per_gene_count = shap_summary.get("per_gene_count")
+    if isinstance(per_gene_count, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_count)):
+        payload["shap.per_gene_count"] = float(per_gene_count)
+
+    per_gene_mean_abs_sum = shap_summary.get("per_gene_mean_abs_sum")
+    if isinstance(per_gene_mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_mean_abs_sum)):
+        payload["shap.per_gene_mean_abs_sum"] = float(per_gene_mean_abs_sum)
+
+    per_gene_mean_sum = shap_summary.get("per_gene_mean_signed_sum")
+    if isinstance(per_gene_mean_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_mean_sum)):
+        payload["shap.per_gene_mean_sum"] = float(per_gene_mean_sum)
+
+    top10_weight_share = shap_summary.get("top10_weight_share")
+    if isinstance(top10_weight_share, (int, float, np.integer, np.floating)) and np.isfinite(float(top10_weight_share)):
+        payload["shap.top10_weight_share"] = float(top10_weight_share)
+
+    tss_near_2kb_share = shap_summary.get("tss_near_2kb_share")
+    if isinstance(tss_near_2kb_share, (int, float, np.integer, np.floating)) and np.isfinite(float(tss_near_2kb_share)):
+        payload["shap.tss_near_2kb_share"] = float(tss_near_2kb_share)
+
+    tss_corr = shap_summary.get("tss_correlation")
+    if isinstance(tss_corr, dict):
+        corr_pearson = tss_corr.get("pearson")
+        if isinstance(corr_pearson, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_pearson)):
+            payload["shap.tss_corr_pearson"] = float(corr_pearson)
+        corr_spearman = tss_corr.get("spearman")
+        if isinstance(corr_spearman, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_spearman)):
+            payload["shap.tss_corr_spearman"] = float(corr_spearman)
+        corr_count = tss_corr.get("count")
+        if isinstance(corr_count, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_count)):
+            payload["shap.tss_corr_count"] = float(corr_count)
+
+    model_metrics = shap_summary.get("model_metrics")
+    if not isinstance(model_metrics, dict):
+        return payload
+
+    for metric_name, metric_stats in model_metrics.items():
+        if not isinstance(metric_stats, dict):
+            continue
+        metric_token = str(metric_name).strip().lower()
+        if not metric_token:
+            continue
+        for stat_name in ("mean", "std", "count"):
+            value = metric_stats.get(stat_name)
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+                payload[f"shap.{metric_token}_{stat_name}"] = float(value)
+    return payload
+
+
+def _compact_feature_importance_metric_payload(fi_summary: Dict[str, Any]) -> Dict[str, float]:
+    """Build short FI metric keys (e.g., ``fi.pearson_mean``)."""
+
+    payload: Dict[str, float] = {}
+    num_features = fi_summary.get("num_features")
+    if isinstance(num_features, (int, float, np.integer, np.floating)) and np.isfinite(float(num_features)):
+        payload["fi.num_features"] = float(num_features)
+
+    importance_mean_sum = fi_summary.get("importance_mean_sum")
+    if isinstance(importance_mean_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_sum)):
+        payload["fi.mean_sum"] = float(importance_mean_sum)
+
+    importance_mean_abs_sum = fi_summary.get("importance_mean_abs_sum")
+    if isinstance(importance_mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_abs_sum)):
+        payload["fi.mean_abs_sum"] = float(importance_mean_abs_sum)
+
+    importance_mean_top1 = fi_summary.get("importance_mean_top1")
+    if isinstance(importance_mean_top1, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_top1)):
+        payload["fi.mean_top1"] = float(importance_mean_top1)
+
+    importance_mean_abs_top1 = fi_summary.get("importance_mean_abs_top1")
+    if isinstance(importance_mean_abs_top1, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_abs_top1)):
+        payload["fi.mean_abs_top1"] = float(importance_mean_abs_top1)
+
+    importance_mean_signed_sum = fi_summary.get("importance_mean_signed_sum")
+    if isinstance(importance_mean_signed_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_signed_sum)):
+        payload["fi.mean_signed_sum"] = float(importance_mean_signed_sum)
+
+    importance_mean_signed_top_positive = fi_summary.get("importance_mean_signed_top_positive")
+    if isinstance(importance_mean_signed_top_positive, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_signed_top_positive)):
+        payload["fi.mean_signed_top_positive"] = float(importance_mean_signed_top_positive)
+
+    importance_mean_signed_top_negative = fi_summary.get("importance_mean_signed_top_negative")
+    if isinstance(importance_mean_signed_top_negative, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_signed_top_negative)):
+        payload["fi.mean_signed_top_negative"] = float(importance_mean_signed_top_negative)
+
+    per_gene_count = fi_summary.get("per_gene_count")
+    if isinstance(per_gene_count, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_count)):
+        payload["fi.per_gene_count"] = float(per_gene_count)
+
+    per_gene_mean_importance_sum = fi_summary.get("per_gene_mean_importance_sum")
+    if isinstance(per_gene_mean_importance_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_mean_importance_sum)):
+        payload["fi.per_gene_mean_sum"] = float(per_gene_mean_importance_sum)
+
+    per_gene_mean_abs_sum = fi_summary.get("per_gene_mean_abs_sum")
+    if isinstance(per_gene_mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_mean_abs_sum)):
+        payload["fi.per_gene_mean_abs_sum"] = float(per_gene_mean_abs_sum)
+
+    top10_weight_share = fi_summary.get("top10_weight_share")
+    if isinstance(top10_weight_share, (int, float, np.integer, np.floating)) and np.isfinite(float(top10_weight_share)):
+        payload["fi.top10_weight_share"] = float(top10_weight_share)
+
+    tss_near_2kb_share = fi_summary.get("tss_near_2kb_share")
+    if isinstance(tss_near_2kb_share, (int, float, np.integer, np.floating)) and np.isfinite(float(tss_near_2kb_share)):
+        payload["fi.tss_near_2kb_share"] = float(tss_near_2kb_share)
+
+    tss_corr = fi_summary.get("tss_correlation")
+    if isinstance(tss_corr, dict):
+        corr_pearson = tss_corr.get("pearson")
+        if isinstance(corr_pearson, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_pearson)):
+            payload["fi.tss_corr_pearson"] = float(corr_pearson)
+        corr_spearman = tss_corr.get("spearman")
+        if isinstance(corr_spearman, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_spearman)):
+            payload["fi.tss_corr_spearman"] = float(corr_spearman)
+        corr_count = tss_corr.get("count")
+        if isinstance(corr_count, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_count)):
+            payload["fi.tss_corr_count"] = float(corr_count)
+
+    model_metrics = fi_summary.get("model_metrics")
+    if not isinstance(model_metrics, dict):
+        return payload
+
+    for metric_name, metric_stats in model_metrics.items():
+        if not isinstance(metric_stats, dict):
+            continue
+        metric_token = str(metric_name).strip().lower()
+        if not metric_token:
+            continue
+        for stat_name in ("mean", "std", "count"):
+            value = metric_stats.get(stat_name)
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+                payload[f"fi.{metric_token}_{stat_name}"] = float(value)
+    return payload
+
+
 def _feature_name_metadata(feature_name: str) -> Dict[str, object]:
     """Parse common naming schemes to attach TSS-relative metadata."""
 
@@ -218,13 +387,77 @@ def _parse_genomic_interval(feature_name: str) -> Optional[Tuple[str, int, int]]
     return chrom, int(start_str), int(end_str)
 
 
+def _infer_signed_distance_from_blocks(
+    feature_names: Sequence[str],
+    gene_names: Optional[Sequence[str]],
+    feature_block_indices: Optional[Sequence[Sequence[int]]],
+    gene_infos: Optional[Sequence[GeneInfo]],
+) -> Optional[np.ndarray]:
+    if not feature_names or not gene_names or not feature_block_indices or not gene_infos:
+        return None
+
+    feature_count = len(feature_names)
+    distance_lists: List[List[float]] = [[] for _ in range(feature_count)]
+    gene_info_by_name = {g.gene_name: g for g in gene_infos}
+    limit = min(len(gene_names), len(feature_block_indices))
+
+    for idx in range(limit):
+        gene_name = str(gene_names[idx])
+        gene_info = gene_info_by_name.get(gene_name)
+        if gene_info is None:
+            continue
+        block_indices = np.asarray(feature_block_indices[idx], dtype=np.int64)
+        if block_indices.size == 0:
+            continue
+        valid_mask = (block_indices >= 0) & (block_indices < feature_count)
+        block_indices = block_indices[valid_mask]
+        if block_indices.size == 0:
+            continue
+        for feat_idx in np.unique(block_indices):
+            parsed = _parse_genomic_interval(str(feature_names[int(feat_idx)]))
+            if not parsed:
+                continue
+            chrom, start, end = parsed
+            if chrom != gene_info.chrom:
+                continue
+            rel_start = start - gene_info.tss
+            rel_end = end - gene_info.tss
+            if gene_info.strand == "-":
+                rel_start, rel_end = -rel_end, -rel_start
+            center_kb = ((rel_start + rel_end) / 2.0) / 1_000.0
+            distance_lists[int(feat_idx)].append(float(center_kb))
+
+    inferred = np.full(feature_count, np.nan, dtype=np.float64)
+    filled = 0
+    for feat_idx, values in enumerate(distance_lists):
+        if values:
+            inferred[feat_idx] = float(np.mean(values))
+            filled += 1
+    if filled == 0:
+        return None
+    return inferred
+
+
+def _write_placeholder_plot(output_path: Path, title: str, message: str) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.0, 4.5))
+    ax.axis("off")
+    ax.text(0.5, 0.62, title, ha="center", va="center", fontsize=12, fontweight="bold")
+    ax.text(0.5, 0.42, message, ha="center", va="center", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
 def _export_feature_importance_artifacts(
     output_dir: Path,
     model_name: str,
     importances: np.ndarray,
     feature_names: Sequence[str],
     *,
+    feature_importance_mean_signed: Optional[np.ndarray] = None,
     method: Optional[str] = None,
+    export_per_gene_panels: bool = False,
     gene_names: Optional[Sequence[str]] = None,
     feature_block_slices: Optional[Sequence[Tuple[int, int]]] = None,
     feature_block_indices: Optional[Sequence[Sequence[int]]] = None,
@@ -287,8 +520,23 @@ def _export_feature_importance_artifacts(
             "importance_median": fi_median,
         }
     )
+    fi_signed: Optional[np.ndarray] = None
+    if feature_importance_mean_signed is not None:
+        signed_candidate = np.asarray(feature_importance_mean_signed, dtype=np.float64).reshape(-1)
+        if signed_candidate.shape[0] == fi_mean.shape[0]:
+            fi_signed = signed_candidate
+            aggregate_df["importance_mean_signed"] = signed_candidate
     if metadata_df is not None and not metadata_df.empty:
         aggregate_df = pd.concat([aggregate_df, metadata_df], axis=1)
+    if "signed_distance_to_tss_kb" not in aggregate_df.columns or not aggregate_df["signed_distance_to_tss_kb"].notna().any():
+        inferred_dist = _infer_signed_distance_from_blocks(
+            feature_names,
+            gene_names,
+            feature_block_indices,
+            gene_infos,
+        )
+        if inferred_dist is not None:
+            aggregate_df["signed_distance_to_tss_kb"] = inferred_dist
 
     aggregate_path = output_dir / "feature_importances_mean.csv"
     aggregate_df.to_csv(aggregate_path, index=False)
@@ -312,7 +560,38 @@ def _export_feature_importance_artifacts(
         )
         _LOG.info("Top feature importances | %s | %s", model_name, top_summary)
 
+    fi_signed_plot_path: Optional[Path] = None
+    if fi_signed is not None:
+        signed_df = pd.DataFrame(
+            {
+                "feature": feature_names,
+                "importance_mean_signed": fi_signed,
+            }
+        )
+        signed_df = signed_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["importance_mean_signed"])
+        if not signed_df.empty:
+            top_pos = signed_df.sort_values("importance_mean_signed", ascending=False).head(10)
+            top_neg = signed_df.sort_values("importance_mean_signed", ascending=True).head(10)
+            signed_top = pd.concat([top_neg, top_pos], axis=0).drop_duplicates(subset=["feature"], keep="first")
+            if not signed_top.empty:
+                fi_signed_plot_path = output_dir / "feature_importance_mean_signed.png"
+                signed_top = signed_top.sort_values("importance_mean_signed", ascending=True)
+                fig, ax = plt.subplots(figsize=(9.0, 6.0))
+                bar_colors = ["#1f77b4" if v < 0 else "#d62728" for v in signed_top["importance_mean_signed"]]
+                ax.barh(signed_top["feature"], signed_top["importance_mean_signed"], color=bar_colors)
+                ax.axvline(0.0, color="#666666", linestyle="--", linewidth=1)
+                ax.set_xlabel("Mean signed feature importance")
+                ax.set_ylabel("Feature")
+                ax.set_title(f"Mean signed feature importance | {model_name.upper()}")
+                plt.tight_layout()
+                fig.savefig(fi_signed_plot_path, dpi=300)
+                plt.close(fig)
+                _LOG.info("Saved signed feature importance plot to %s", fi_signed_plot_path)
+
     per_gene_summary_path: Optional[Path] = None
+    fi_per_gene_count: Optional[int] = None
+    fi_per_gene_mean_importance_sum: Optional[float] = None
+    fi_per_gene_mean_abs_sum: Optional[float] = None
     if feature_block_indices and gene_names:
         per_gene_records = []
         gene_block_indices: Dict[str, np.ndarray] = {}
@@ -349,10 +628,14 @@ def _export_feature_importance_artifacts(
                 "gene": gene_label,
                 "feature_count": int(block.shape[0]),
                 "importance_mean_sum": float(block["importance_mean"].sum()),
+                "importance_mean_abs_sum": float(np.abs(block["importance_mean"]).sum()),
                 "importance_mean_avg": float(block["importance_mean"].mean()),
                 "top_feature": str(block.loc[block["importance_mean"].idxmax(), "feature"]),
                 "top_feature_importance": float(block["importance_mean"].max()),
             }
+            if "importance_mean_signed" in block.columns:
+                record["importance_mean_signed_sum"] = float(block["importance_mean_signed"].sum())
+                record["importance_mean_signed_avg"] = float(block["importance_mean_signed"].mean())
             distances = None
             if "signed_distance_to_tss_kb" in block.columns and block["signed_distance_to_tss_kb"].notna().any():
                 distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
@@ -388,46 +671,55 @@ def _export_feature_importance_artifacts(
             per_gene_df = pd.DataFrame(per_gene_records)
             per_gene_summary_path = output_dir / "feature_importance_per_gene_summary.csv"
             per_gene_df.to_csv(per_gene_summary_path, index=False)
+            fi_per_gene_count = int(per_gene_df.shape[0])
+            fi_per_gene_mean_importance_sum = float(
+                pd.to_numeric(per_gene_df["importance_mean_sum"], errors="coerce").mean(skipna=True)
+            )
+            if "importance_mean_abs_sum" in per_gene_df.columns:
+                fi_per_gene_mean_abs_sum = float(
+                    pd.to_numeric(per_gene_df["importance_mean_abs_sum"], errors="coerce").mean(skipna=True)
+                )
             _LOG.info(
                 "Saved per-gene feature importance summary (%d genes) to %s",
                 per_gene_df.shape[0],
                 per_gene_summary_path,
             )
 
-            panel_dir = output_dir / "per_gene_panels"
-            panel_candidates = per_gene_df.sort_values("importance_mean_sum", ascending=False).head(12)
-            generated = 0
-            gene_info_map = {g.gene_name: g for g in gene_infos} if gene_infos is not None else {}
-            for gene_value in panel_candidates["gene"]:
-                block_indices = gene_block_indices.get(gene_value)
-                if block_indices is None or block_indices.size == 0:
-                    continue
-                block_slice = aggregate_df.iloc[block_indices].copy()
-                if block_slice.empty:
-                    continue
-                gene_info = gene_info_map.get(gene_value)
-                if gene_info is not None:
-                    # Compute relative centers only for features on the same chromosome
-                    rel_centers = np.full(block_slice.shape[0], np.nan, dtype=float)
-                    for row_idx, feature in enumerate(block_slice["feature"].astype(str)):
-                        parsed = _parse_genomic_interval(feature)
-                        if not parsed:
-                            continue
-                        chrom, start, end = parsed
-                        if chrom != gene_info.chrom:
-                            continue
-                        rel_start = start - gene_info.tss
-                        rel_end = end - gene_info.tss
-                        if gene_info.strand == "-":
-                            rel_start, rel_end = -rel_end, -rel_start
-                        rel_centers[row_idx] = (rel_start + rel_end) / 2.0
-                    block_slice["signed_distance_to_tss_kb"] = rel_centers / 1_000.0
-                safe_gene = re.sub(r"[^A-Za-z0-9._-]", "_", gene_value)
-                panel_path = panel_dir / f"{safe_gene}.png"
-                plot_per_gene_feature_panel(block_slice, gene_value, panel_path)
-                generated += 1
-            if generated:
-                _LOG.info("Generated %d per-gene feature panels in %s", generated, panel_dir)
+            if export_per_gene_panels:
+                panel_dir = output_dir / "per_gene_panels"
+                panel_candidates = per_gene_df.sort_values("importance_mean_sum", ascending=False).head(12)
+                generated = 0
+                gene_info_map = {g.gene_name: g for g in gene_infos} if gene_infos is not None else {}
+                for gene_value in panel_candidates["gene"]:
+                    block_indices = gene_block_indices.get(gene_value)
+                    if block_indices is None or block_indices.size == 0:
+                        continue
+                    block_slice = aggregate_df.iloc[block_indices].copy()
+                    if block_slice.empty:
+                        continue
+                    gene_info = gene_info_map.get(gene_value)
+                    if gene_info is not None:
+                        # Compute relative centers only for features on the same chromosome
+                        rel_centers = np.full(block_slice.shape[0], np.nan, dtype=float)
+                        for row_idx, feature in enumerate(block_slice["feature"].astype(str)):
+                            parsed = _parse_genomic_interval(feature)
+                            if not parsed:
+                                continue
+                            chrom, start, end = parsed
+                            if chrom != gene_info.chrom:
+                                continue
+                            rel_start = start - gene_info.tss
+                            rel_end = end - gene_info.tss
+                            if gene_info.strand == "-":
+                                rel_start, rel_end = -rel_end, -rel_start
+                            rel_centers[row_idx] = (rel_start + rel_end) / 2.0
+                        block_slice["signed_distance_to_tss_kb"] = rel_centers / 1_000.0
+                    safe_gene = re.sub(r"[^A-Za-z0-9._-]", "_", gene_value)
+                    panel_path = panel_dir / f"{safe_gene}.png"
+                    plot_per_gene_feature_panel(block_slice, gene_value, panel_path)
+                    generated += 1
+                if generated:
+                    _LOG.info("Generated %d per-gene feature panels in %s", generated, panel_dir)
     elif feature_block_slices and gene_names:
         per_gene_records = []
         gene_block_ranges: Dict[str, Tuple[int, int]] = {}
@@ -447,10 +739,14 @@ def _export_feature_importance_artifacts(
                 "gene": gene_label,
                 "feature_count": int(block.shape[0]),
                 "importance_mean_sum": float(block["importance_mean"].sum()),
+                "importance_mean_abs_sum": float(np.abs(block["importance_mean"]).sum()),
                 "importance_mean_avg": float(block["importance_mean"].mean()),
                 "top_feature": str(block.loc[block["importance_mean"].idxmax(), "feature"]),
                 "top_feature_importance": float(block["importance_mean"].max()),
             }
+            if "importance_mean_signed" in block.columns:
+                record["importance_mean_signed_sum"] = float(block["importance_mean_signed"].sum())
+                record["importance_mean_signed_avg"] = float(block["importance_mean_signed"].mean())
             if "signed_distance_to_tss_kb" in block.columns:
                 distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
                 mask = np.isfinite(distances) & np.isfinite(block["importance_mean"])
@@ -467,42 +763,86 @@ def _export_feature_importance_artifacts(
             per_gene_df = pd.DataFrame(per_gene_records)
             per_gene_summary_path = output_dir / "feature_importance_per_gene_summary.csv"
             per_gene_df.to_csv(per_gene_summary_path, index=False)
+            fi_per_gene_count = int(per_gene_df.shape[0])
+            fi_per_gene_mean_importance_sum = float(
+                pd.to_numeric(per_gene_df["importance_mean_sum"], errors="coerce").mean(skipna=True)
+            )
+            if "importance_mean_abs_sum" in per_gene_df.columns:
+                fi_per_gene_mean_abs_sum = float(
+                    pd.to_numeric(per_gene_df["importance_mean_abs_sum"], errors="coerce").mean(skipna=True)
+                )
             _LOG.info(
                 "Saved per-gene feature importance summary (%d genes) to %s",
                 per_gene_df.shape[0],
                 per_gene_summary_path,
             )
 
-            panel_dir = output_dir / "per_gene_panels"
-            panel_candidates = per_gene_df.sort_values("importance_mean_sum", ascending=False).head(12)
-            generated = 0
-            for gene_value in panel_candidates["gene"]:
-                block_range = gene_block_ranges.get(gene_value)
-                if not block_range:
-                    continue
-                start, end = block_range
-                block_slice = aggregate_df.iloc[start:end].copy()
-                if block_slice.empty:
-                    continue
-                safe_gene = re.sub(r"[^A-Za-z0-9._-]", "_", gene_value)
-                panel_path = panel_dir / f"{safe_gene}.png"
-                plot_per_gene_feature_panel(block_slice, gene_value, panel_path)
-                generated += 1
-            if generated:
-                _LOG.info("Generated %d per-gene feature panels in %s", generated, panel_dir)
+            if export_per_gene_panels:
+                panel_dir = output_dir / "per_gene_panels"
+                panel_candidates = per_gene_df.sort_values("importance_mean_sum", ascending=False).head(12)
+                generated = 0
+                for gene_value in panel_candidates["gene"]:
+                    block_range = gene_block_ranges.get(gene_value)
+                    if not block_range:
+                        continue
+                    start, end = block_range
+                    block_slice = aggregate_df.iloc[start:end].copy()
+                    if block_slice.empty:
+                        continue
+                    safe_gene = re.sub(r"[^A-Za-z0-9._-]", "_", gene_value)
+                    panel_path = panel_dir / f"{safe_gene}.png"
+                    plot_per_gene_feature_panel(block_slice, gene_value, panel_path)
+                    generated += 1
+                if generated:
+                    _LOG.info("Generated %d per-gene feature panels in %s", generated, panel_dir)
 
+    fi_mean_finite = fi_mean[np.isfinite(fi_mean)]
     summary_payload: Dict[str, object] = {
         "method": method or "unknown",
         "num_features": int(fi_mean.size),
+        "importance_mean_sum": float(fi_mean_finite.sum()) if fi_mean_finite.size else 0.0,
+        "importance_mean_top1": float(fi_mean_finite.max()) if fi_mean_finite.size else 0.0,
         "raw_importances_file": raw_path.name,
         "aggregate_file": aggregate_path.name,
     }
+    fi_abs = np.abs(fi_mean_finite)
+    summary_payload["importance_mean_abs_sum"] = float(fi_abs.sum()) if fi_abs.size else 0.0
+    summary_payload["importance_mean_abs_top1"] = float(fi_abs.max()) if fi_abs.size else 0.0
+    if fi_signed is not None:
+        fi_signed_finite = fi_signed[np.isfinite(fi_signed)]
+        if fi_signed_finite.size:
+            summary_payload["importance_mean_signed_sum"] = float(fi_signed_finite.sum())
+            summary_payload["importance_mean_signed_top_positive"] = float(fi_signed_finite.max())
+            summary_payload["importance_mean_signed_top_negative"] = float(fi_signed_finite.min())
+    fi_weights = np.abs(fi_mean_finite)
+    fi_weight_total = float(fi_weights.sum()) if fi_weights.size else 0.0
+    if fi_weight_total > 0.0:
+        top_k = min(10, int(fi_weights.size))
+        if top_k > 0:
+            top10_sum = float(np.sort(fi_weights)[-top_k:].sum())
+            summary_payload["top10_weight_share"] = top10_sum / fi_weight_total
     if per_gene_summary_path is not None:
         summary_payload["per_gene_summary_file"] = per_gene_summary_path.name
+    if fi_per_gene_count is not None:
+        summary_payload["per_gene_count"] = fi_per_gene_count
+    if fi_per_gene_mean_importance_sum is not None and np.isfinite(fi_per_gene_mean_importance_sum):
+        summary_payload["per_gene_mean_importance_sum"] = fi_per_gene_mean_importance_sum
+    if fi_per_gene_mean_abs_sum is not None and np.isfinite(fi_per_gene_mean_abs_sum):
+        summary_payload["per_gene_mean_abs_sum"] = fi_per_gene_mean_abs_sum
 
+    fi_scatter_path = output_dir / "feature_importance_vs_tss_distance.png"
+    fi_overview_path = output_dir / "feature_importance_distance_overview.png"
+    fi_distance_created = False
     if "signed_distance_to_tss_kb" in aggregate_df.columns:
         distances = pd.to_numeric(aggregate_df["signed_distance_to_tss_kb"], errors="coerce")
         mask = np.isfinite(distances) & np.isfinite(fi_mean)
+        if mask.any():
+            fi_weights_with_distance = np.abs(fi_mean[mask])
+            fi_weights_with_distance_total = float(fi_weights_with_distance.sum())
+            if fi_weights_with_distance_total > 0.0:
+                near_mask = np.abs(distances[mask].to_numpy(dtype=float)) <= 2.0
+                near_sum = float(fi_weights_with_distance[near_mask].sum())
+                summary_payload["tss_near_2kb_share"] = near_sum / fi_weights_with_distance_total
         if mask.any():
             imp = pd.Series(fi_mean[mask])
             dist = distances[mask]
@@ -516,32 +856,45 @@ def _export_feature_importance_artifacts(
                     "method": method or "unknown",
                 }
                 summary_payload["tss_correlation"] = corr_payload
-                scatter_path = output_dir / "feature_importance_vs_tss_distance.png"
                 plot_importance_distance_scatter(
                     fi_mean[mask],
                     dist,
-                    scatter_path,
+                    fi_scatter_path,
                     f"FI vs TSS distance | {model_name.upper()}",
                     annotation={"Spearman": spearman, "Pearson": pearson},
                 )
                 _LOG.info(
                     "Saved FI vs TSS scatter and correlation stats (n=%d) to %s",
                     mask.sum(),
-                    scatter_path,
+                    fi_scatter_path,
                 )
+                fi_distance_created = True
 
-            overlay_path = output_dir / "feature_importance_distance_overview.png"
             plot_cumulative_importance_overlay(
                 fi_mean[mask],
                 dist,
-                overlay_path,
+                fi_overview_path,
                 f"FI cumulative distance profile | {model_name.upper()}",
             )
-            _LOG.info("Saved FI distance overlay to %s", overlay_path)
+            _LOG.info("Saved FI distance overlay to %s", fi_overview_path)
+            fi_distance_created = True
+    if not fi_distance_created:
+        _write_placeholder_plot(
+            fi_scatter_path,
+            f"FI vs TSS distance | {model_name.upper()}",
+            "Distance-to-TSS metadata unavailable for this run.",
+        )
+        _write_placeholder_plot(
+            fi_overview_path,
+            f"FI cumulative distance profile | {model_name.upper()}",
+            "Distance-to-TSS metadata unavailable for this run.",
+        )
 
     model_metric_summary = _compute_model_metric_summary(output_dir)
     if model_metric_summary:
         summary_payload["model_metrics"] = model_metric_summary
+    if fi_signed_plot_path is not None:
+        summary_payload["plot_signed_path"] = str(fi_signed_plot_path)
 
     summary_path = output_dir / "feature_importance_summary.json"
     summary_path.write_text(json.dumps(summary_payload, indent=2))
@@ -561,13 +914,18 @@ def _export_feature_importance_artifacts(
 def _export_shap_importance_artifacts(
     output_dir: Path,
     model_name: str,
-    shap_importances: np.ndarray,
+    shap_importance: np.ndarray,
     feature_names: Sequence[str],
     *,
+    shap_value_mean_signed: Optional[np.ndarray] = None,
     method: Optional[str] = None,
+    gene_names: Optional[Sequence[str]] = None,
+    feature_block_slices: Optional[Sequence[Tuple[int, int]]] = None,
+    feature_block_indices: Optional[Sequence[Sequence[int]]] = None,
+    gene_infos: Optional[Sequence[GeneInfo]] = None,
 ) -> Dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    shap_values = np.asarray(shap_importances, dtype=np.float64)
+    shap_values = np.asarray(shap_importance, dtype=np.float64)
     if shap_values.size == 0 or shap_values.ndim != 1:
         _LOG.info("SHAP export skipped | model=%s | reason=no values", model_name)
         return {}
@@ -575,7 +933,7 @@ def _export_shap_importance_artifacts(
     plot_feature_importance(
         shap_values,
         feature_names,
-        output_dir / "shap_importance_mean.png",
+        output_dir / "shapley_values_mean.png",
         f"SHAP mean | {model_name.upper()}",
         top_n=30,
     )
@@ -590,13 +948,171 @@ def _export_shap_importance_artifacts(
             "shap_mean_abs": shap_values,
         }
     )
+    signed_shap_values: Optional[np.ndarray] = None
+    if shap_value_mean_signed is not None:
+        signed_candidate = np.asarray(shap_value_mean_signed, dtype=np.float64).reshape(-1)
+        if signed_candidate.shape[0] == shap_values.shape[0]:
+            signed_shap_values = signed_candidate
+            shap_df["shap_mean_signed"] = signed_candidate
 
-    # Add metadata columns (TSS distance, gene name, etc.) if available
+    # Add metadata columns (TSS distance, gene name, etc.) if available.
     if metadata_df is not None and not metadata_df.empty:
         shap_df = pd.concat([shap_df, metadata_df], axis=1)
-    shap_path = output_dir / "shap_importances_mean.csv"
+    if "signed_distance_to_tss_kb" not in shap_df.columns or not shap_df["signed_distance_to_tss_kb"].notna().any():
+        inferred_dist = _infer_signed_distance_from_blocks(
+            feature_names,
+            gene_names,
+            feature_block_indices,
+            gene_infos,
+        )
+        if inferred_dist is not None:
+            shap_df["signed_distance_to_tss_kb"] = inferred_dist
+    shap_path = output_dir / "shapley_values_mean.csv"
     shap_df.to_csv(shap_path, index=False)
     _LOG.info("Saved SHAP mean importances (%d rows) to %s", shap_df.shape[0], shap_path)
+
+    signed_plot_path: Optional[Path] = None
+    if signed_shap_values is not None:
+        signed_df = pd.DataFrame(
+            {
+                "feature": feature_names,
+                "shap_mean_signed": signed_shap_values,
+            }
+        )
+        signed_df = signed_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["shap_mean_signed"])
+        if not signed_df.empty:
+            top_pos = signed_df.sort_values("shap_mean_signed", ascending=False).head(10)
+            top_neg = signed_df.sort_values("shap_mean_signed", ascending=True).head(10)
+            signed_top = pd.concat([top_neg, top_pos], axis=0)
+            signed_top = signed_top.drop_duplicates(subset=["feature"], keep="first")
+            if not signed_top.empty:
+                signed_plot_path = output_dir / "shapley_values_mean_signed.png"
+                signed_top = signed_top.sort_values("shap_mean_signed", ascending=True)
+                fig, ax = plt.subplots(figsize=(9.0, 6.0))
+                bar_colors = ["#1f77b4" if v < 0 else "#d62728" for v in signed_top["shap_mean_signed"]]
+                ax.barh(signed_top["feature"], signed_top["shap_mean_signed"], color=bar_colors)
+                ax.axvline(0.0, color="#666666", linestyle="--", linewidth=1)
+                ax.set_xlabel("Mean signed SHAP value")
+                ax.set_ylabel("Feature")
+                ax.set_title(f"Mean signed SHAP | {model_name.upper()}")
+                plt.tight_layout()
+                fig.savefig(signed_plot_path, dpi=300)
+                plt.close(fig)
+                _LOG.info("Saved signed SHAP mean plot to %s", signed_plot_path)
+
+    shap_per_gene_summary_path: Optional[Path] = None
+    shap_per_gene_count: Optional[int] = None
+    shap_per_gene_mean_abs_sum: Optional[float] = None
+    shap_per_gene_mean_signed_sum: Optional[float] = None
+    if feature_block_indices and gene_names:
+        per_gene_records: List[Dict[str, object]] = []
+        limit = min(len(feature_block_indices), len(gene_names))
+        for idx in range(limit):
+            indices = np.asarray(feature_block_indices[idx], dtype=np.int64)
+            if indices.size == 0:
+                continue
+            valid_mask = (indices >= 0) & (indices < len(feature_names))
+            indices = indices[valid_mask]
+            if indices.size == 0:
+                continue
+            block = shap_df.iloc[indices].copy()
+            if block.empty:
+                continue
+            gene_label = gene_names[idx]
+            record = {
+                "gene": gene_label,
+                "feature_count": int(block.shape[0]),
+                "shap_mean_abs_sum": float(block["shap_mean_abs"].sum()),
+                "shap_mean_abs_avg": float(block["shap_mean_abs"].mean()),
+                "top_feature": str(block.loc[block["shap_mean_abs"].idxmax(), "feature"]),
+                "top_feature_shap_mean_abs": float(block["shap_mean_abs"].max()),
+            }
+            if "shap_mean_signed" in block.columns:
+                record["shap_mean_signed_sum"] = float(block["shap_mean_signed"].sum())
+                record["shap_mean_signed_avg"] = float(block["shap_mean_signed"].mean())
+            if "signed_distance_to_tss_kb" in block.columns:
+                distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
+                mask = np.isfinite(distances) & np.isfinite(block["shap_mean_abs"])
+                if mask.any():
+                    shap_vals = block.loc[mask, "shap_mean_abs"]
+                    dist = distances[mask]
+                    if shap_vals.nunique() > 1 and dist.nunique() > 1:
+                        record["pearson_distance_corr"] = float(shap_vals.corr(dist, method="pearson"))
+                        record["spearman_distance_corr"] = float(shap_vals.corr(dist, method="spearman"))
+                    top_idx = block.loc[mask, "shap_mean_abs"].idxmax()
+                    record["top_feature_distance_kb"] = float(distances.loc[top_idx])
+            per_gene_records.append(record)
+
+        if per_gene_records:
+            per_gene_df = pd.DataFrame(per_gene_records)
+            shap_per_gene_summary_path = output_dir / "shapley_values_per_gene_summary.csv"
+            per_gene_df.to_csv(shap_per_gene_summary_path, index=False)
+            shap_per_gene_count = int(per_gene_df.shape[0])
+            shap_per_gene_mean_abs_sum = float(
+                pd.to_numeric(per_gene_df["shap_mean_abs_sum"], errors="coerce").mean(skipna=True)
+            )
+            if "shap_mean_signed_sum" in per_gene_df.columns:
+                shap_per_gene_mean_signed_sum = float(
+                    pd.to_numeric(per_gene_df["shap_mean_signed_sum"], errors="coerce").mean(skipna=True)
+                )
+            _LOG.info(
+                "Saved per-gene SHAP summary (%d genes) to %s",
+                per_gene_df.shape[0],
+                shap_per_gene_summary_path,
+            )
+    elif feature_block_slices and gene_names:
+        per_gene_records = []
+        limit = min(len(feature_block_slices), len(gene_names))
+        for idx in range(limit):
+            start, end = feature_block_slices[idx]
+            start = max(0, start)
+            end = min(len(feature_names), end)
+            if start >= end:
+                continue
+            block = shap_df.iloc[start:end].copy()
+            if block.empty:
+                continue
+            gene_label = gene_names[idx]
+            record = {
+                "gene": gene_label,
+                "feature_count": int(block.shape[0]),
+                "shap_mean_abs_sum": float(block["shap_mean_abs"].sum()),
+                "shap_mean_abs_avg": float(block["shap_mean_abs"].mean()),
+                "top_feature": str(block.loc[block["shap_mean_abs"].idxmax(), "feature"]),
+                "top_feature_shap_mean_abs": float(block["shap_mean_abs"].max()),
+            }
+            if "shap_mean_signed" in block.columns:
+                record["shap_mean_signed_sum"] = float(block["shap_mean_signed"].sum())
+                record["shap_mean_signed_avg"] = float(block["shap_mean_signed"].mean())
+            if "signed_distance_to_tss_kb" in block.columns:
+                distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
+                mask = np.isfinite(distances) & np.isfinite(block["shap_mean_abs"])
+                if mask.any():
+                    shap_vals = block.loc[mask, "shap_mean_abs"]
+                    dist = distances[mask]
+                    if shap_vals.nunique() > 1 and dist.nunique() > 1:
+                        record["pearson_distance_corr"] = float(shap_vals.corr(dist, method="pearson"))
+                        record["spearman_distance_corr"] = float(shap_vals.corr(dist, method="spearman"))
+                    top_idx = block.loc[mask, "shap_mean_abs"].idxmax()
+                    record["top_feature_distance_kb"] = float(distances.loc[top_idx])
+            per_gene_records.append(record)
+        if per_gene_records:
+            per_gene_df = pd.DataFrame(per_gene_records)
+            shap_per_gene_summary_path = output_dir / "shapley_values_per_gene_summary.csv"
+            per_gene_df.to_csv(shap_per_gene_summary_path, index=False)
+            shap_per_gene_count = int(per_gene_df.shape[0])
+            shap_per_gene_mean_abs_sum = float(
+                pd.to_numeric(per_gene_df["shap_mean_abs_sum"], errors="coerce").mean(skipna=True)
+            )
+            if "shap_mean_signed_sum" in per_gene_df.columns:
+                shap_per_gene_mean_signed_sum = float(
+                    pd.to_numeric(per_gene_df["shap_mean_signed_sum"], errors="coerce").mean(skipna=True)
+                )
+            _LOG.info(
+                "Saved per-gene SHAP summary (%d genes) to %s",
+                per_gene_df.shape[0],
+                shap_per_gene_summary_path,
+            )
 
     def _extract_distance_kb(table: pd.DataFrame) -> tuple[Optional[pd.Series], Optional[str], bool]:
         preferred_cols = [
@@ -626,6 +1142,8 @@ def _export_shap_importance_artifacts(
         output_path: Path,
         title: str,
         *,
+        value_col: str = "shap_mean_abs",
+        signed_values: bool = False,
         max_distance_kb: float,
         show_scatter: bool = False,
         y_limits: Optional[tuple[float, float]] = None,
@@ -633,7 +1151,7 @@ def _export_shap_importance_artifacts(
         plot_df = pd.DataFrame(
             {
                 "distance_kb": distance_kb,
-                "shap_value": pd.to_numeric(table["shap_mean_abs"], errors="coerce"),
+                "shap_value": pd.to_numeric(table[value_col], errors="coerce"),
             }
         )
         plot_df = plot_df.replace([np.inf, -np.inf], np.nan).dropna()
@@ -644,11 +1162,18 @@ def _export_shap_importance_artifacts(
             return False
         plot_df.sort_values("distance_kb", inplace=True)
 
-        per_bin = (
-            plot_df.groupby("distance_kb", sort=True)["shap_value"]
-            .quantile(0.9)
-            .reset_index()
-        )
+        if signed_values:
+            per_bin = (
+                plot_df.groupby("distance_kb", sort=True)["shap_value"]
+                .median()
+                .reset_index()
+            )
+        else:
+            per_bin = (
+                plot_df.groupby("distance_kb", sort=True)["shap_value"]
+                .quantile(0.9)
+                .reset_index()
+            )
         if per_bin.empty:
             return False
 
@@ -670,7 +1195,7 @@ def _export_shap_importance_artifacts(
             per_bin["shap_value"],
             color="#e41a1c",
             linewidth=1.5,
-            label="90th percentile",
+            label="median" if signed_values else "90th percentile",
         )
         ax.legend(loc="upper right", frameon=True)
         ax.axvline(0.0, color="#999999", linestyle="--", linewidth=1)
@@ -678,7 +1203,7 @@ def _export_shap_importance_artifacts(
         if y_limits is not None:
             ax.set_ylim(y_limits)
         ax.set_xlabel("Distance to TSS (kb)")
-        ax.set_ylabel("SHAP value")
+        ax.set_ylabel("SHAP value" if not signed_values else "Signed SHAP value")
         ax.set_title(title)
         plt.tight_layout()
         fig.savefig(output_path, dpi=300)
@@ -686,8 +1211,8 @@ def _export_shap_importance_artifacts(
         return True
 
     distance_kb, distance_col, distance_signed = _extract_distance_kb(shap_df)
-    distance_plot_path = output_dir / "shap_vs_tss.png"
-    distance_plot_zoomed_path = output_dir / "shap_vs_tss_zoomed.png"
+    distance_plot_path = output_dir / "shapley_values_vs_tss.png"
+    distance_plot_zoomed_path = output_dir / "shapley_values_vs_tss_zoomed.png"
     if distance_kb is not None and distance_col is not None:
         if not distance_signed:
             _LOG.info(
@@ -738,22 +1263,87 @@ def _export_shap_importance_artifacts(
         distance_plot_path = None
         distance_plot_zoomed_path = None
 
+    if distance_plot_path is None:
+        distance_plot_path = output_dir / "shapley_values_vs_tss.png"
+        _write_placeholder_plot(
+            distance_plot_path,
+            f"SHAP vs TSS distance | {model_name.upper()}",
+            "Distance-to-TSS metadata unavailable for this run.",
+        )
+    if distance_plot_zoomed_path is None:
+        distance_plot_zoomed_path = output_dir / "shapley_values_vs_tss_zoomed.png"
+        _write_placeholder_plot(
+            distance_plot_zoomed_path,
+            f"SHAP vs TSS distance (zoomed) | {model_name.upper()}",
+            "Distance-to-TSS metadata unavailable for this run.",
+        )
+
+    shap_finite = shap_values[np.isfinite(shap_values)]
     summary = {
         "model": model_name,
         "method": method,
         "num_features": int(shap_values.size),
+        "shap_mean_abs_sum": float(shap_finite.sum()) if shap_finite.size else 0.0,
+        "shap_mean_abs_top1": float(shap_finite.max()) if shap_finite.size else 0.0,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "csv_path": str(shap_path),
-        "plot_path": str(output_dir / "shap_importance_mean.png"),
+        "plot_path": str(output_dir / "shapley_values_mean.png"),
     }
+    if signed_shap_values is not None:
+        signed_finite = signed_shap_values[np.isfinite(signed_shap_values)]
+        if signed_finite.size:
+            summary["shap_mean_sum"] = float(signed_finite.sum())
+            summary["shap_mean_top1"] = float(signed_finite.max())
+            summary["shap_mean_signed_sum"] = float(signed_finite.sum())
+            summary["shap_mean_signed_top_positive"] = float(signed_finite.max())
+            summary["shap_mean_signed_top_negative"] = float(signed_finite.min())
+    if signed_plot_path is not None:
+        summary["plot_signed_path"] = str(signed_plot_path)
+    shap_weights = np.abs(shap_finite)
+    shap_weight_total = float(shap_weights.sum()) if shap_weights.size else 0.0
+    if shap_weight_total > 0.0:
+        top_k = min(10, int(shap_weights.size))
+        if top_k > 0:
+            top10_sum = float(np.sort(shap_weights)[-top_k:].sum())
+            summary["top10_weight_share"] = top10_sum / shap_weight_total
     if distance_plot_path is not None:
         summary["distance_plot_path"] = str(distance_plot_path)
     if distance_plot_zoomed_path is not None:
         summary["distance_plot_zoomed_path"] = str(distance_plot_zoomed_path)
+    if shap_per_gene_summary_path is not None:
+        summary["per_gene_summary_file"] = shap_per_gene_summary_path.name
+    if shap_per_gene_count is not None:
+        summary["per_gene_count"] = shap_per_gene_count
+    if shap_per_gene_mean_abs_sum is not None and np.isfinite(shap_per_gene_mean_abs_sum):
+        summary["per_gene_mean_abs_sum"] = shap_per_gene_mean_abs_sum
+    if shap_per_gene_mean_signed_sum is not None and np.isfinite(shap_per_gene_mean_signed_sum):
+        summary["per_gene_mean_signed_sum"] = shap_per_gene_mean_signed_sum
+
+    if distance_kb is not None:
+        distance_arr = np.asarray(distance_kb, dtype=np.float64)
+        corr_mask = np.isfinite(distance_arr) & np.isfinite(shap_values)
+        if corr_mask.any():
+            shap_weights_with_distance = np.abs(shap_values[corr_mask])
+            shap_weights_with_distance_total = float(shap_weights_with_distance.sum())
+            if shap_weights_with_distance_total > 0.0:
+                near_mask = np.abs(distance_arr[corr_mask]) <= 2.0
+                near_sum = float(shap_weights_with_distance[near_mask].sum())
+                summary["tss_near_2kb_share"] = near_sum / shap_weights_with_distance_total
+        if corr_mask.any():
+            corr_x = pd.Series(shap_values[corr_mask])
+            corr_y = pd.Series(distance_arr[corr_mask])
+            if corr_x.nunique() > 1 and corr_y.nunique() > 1:
+                summary["tss_correlation"] = {
+                    "pearson": float(corr_x.corr(corr_y, method="pearson")),
+                    "spearman": float(corr_x.corr(corr_y, method="spearman")),
+                    "count": int(corr_mask.sum()),
+                    "method": method or "unknown",
+                }
+
     model_metric_summary = _compute_model_metric_summary(output_dir)
     if model_metric_summary:
         summary["model_metrics"] = model_metric_summary
-    summary_path = output_dir / "shap_importance_summary.json"
+    summary_path = output_dir / "shapley_values_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
     _LOG.info("Wrote SHAP summary manifest to %s", summary_path)
     return summary
@@ -767,19 +1357,6 @@ def run_pipeline(config: PipelineConfig) -> Path:
     config.ensure_directories()
 
     wandb_run = maybe_init_wandb(config)
-    if wandb_run is not None:
-        summary_payload: Dict[str, Any] = {}
-        if config.run_context:
-            # Keep runtime provenance fields that are not already first-class W&B metadata.
-            summary_payload["run_context"] = {
-                key: value
-                for key, value in config.run_context.items()
-                if key not in {"host", "run_name", "timestamp_utc"}
-            }
-        if config.log_path is not None:
-            summary_payload["log_path"] = str(config.log_path)
-        if summary_payload:
-            wandb_update_summary(wandb_run, summary_payload)
     run_status = "failed"
     run_dir: Optional[Path] = None
     wandb_finished = False
@@ -1028,7 +1605,14 @@ def run_pipeline(config: PipelineConfig) -> Path:
         )
         run_status = "succeeded"
         return run_dir
-    
+    except BaseException as exc:
+        run_status = "failed"
+        _LOG.error(
+            "Terminal pipeline error | type=%s | message=%s",
+            type(exc).__name__,
+            exc,
+        )
+        raise
     finally:
         for sig, handler in prev_signal_handlers.items():
             try:
@@ -1210,7 +1794,7 @@ def _run_per_gene_pipeline(
             if residuals_by_split:
                 plot_residual_histogram_by_split(
                     residuals_by_split,
-                    model_dir / "residuals_by_split.png",
+                    model_dir / "residuals.png",
                     f"Residuals | {model_name.upper()}",
                 )
     
@@ -1291,7 +1875,6 @@ def _run_per_gene_pipeline(
                         summary_payload[f"{split}_{metric}"] = value
                     else:
                         summary_payload[key] = value
-                summary_payload["model"] = model_name
                 summary_payload["num_genes"] = len(metrics_df)
                 if summary_payload:
                     wandb_update_summary(wandb_run, summary_payload)
@@ -1475,20 +2058,26 @@ def _run_per_gene_pipeline(
             model_dir = run_dir / "models" / model_name
             log_tables_from_csv(
                 wandb_run,
-                f"Tables/{model_name}/metrics_by_gene",
+                "Tables/metrics_by_gene",
                 model_dir / "metrics_by_gene.csv",
                 max_rows=table_max,
             )
             log_tables_from_csv(
                 wandb_run,
-                f"Tables/{model_name}/feature_importance_per_gene_summary",
+                "Tables/fi_per_gene_summary",
                 model_dir / "feature_importance_per_gene_summary.csv",
+                max_rows=table_max,
+            )
+            log_tables_from_csv(
+                wandb_run,
+                "Tables/shap_per_gene_summary",
+                model_dir / "shapley_values_per_gene_summary.csv",
                 max_rows=table_max,
             )
             if config.wandb.log_predictions_table:
                 log_tables_from_csv(
                     wandb_run,
-                    f"Tables/{model_name}/predictions",
+                    "Tables/predictions",
                     model_dir / "predictions_raw.csv",
                     max_rows=table_max,
                 )
@@ -1519,14 +2108,14 @@ def _run_per_gene_pipeline(
         log_images_from_globs(
             wandb_run,
             run_dir,
-            patterns=["models/*/residuals_by_split.png"],
+            patterns=["models/*/residuals.png"],
             max_items=max_media,
             group_key="Plots/Residuals",
         )
         log_images_from_globs(
             wandb_run,
             run_dir,
-            patterns=["models/*/residual_bar_by_split.png"],
+            patterns=["models/*/residuals_bar.png"],
             max_items=max_media,
             group_key="Plots/Residuals/Bar",
         )
@@ -1535,57 +2124,30 @@ def _run_per_gene_pipeline(
             run_dir,
             patterns=["models/*/feature_importance_mean.png"],
             max_items=max_media,
-            group_key="Plots/Feature_Importance",
+            group_key="Plots/FI",
         )
         log_images_from_globs(
             wandb_run,
             run_dir,
             patterns=["models/*/feature_importance_vs_tss_distance.png"],
             max_items=max_media,
-            group_key="Plots/Feature_Importance/TSS_Distance",
+            group_key="Plots/FI/TSS_Distance",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/feature_importance_mean_signed.png"],
+            max_items=max_media,
+            group_key="Plots/FI/Signed",
         )
         log_images_from_globs(
             wandb_run,
             run_dir,
             patterns=["models/*/feature_importance_distance_overview.png"],
             max_items=max_media,
-            group_key="Plots/Feature_Importance/Distance_Overview",
+            group_key="Plots/FI/Cumulative_Overview",
         )
-        log_images_from_globs(
-            wandb_run,
-            run_dir,
-            patterns=["models/*/per_gene_panels/*.png"],
-            max_items=max_media,
-            group_key="Plots/Feature_Importance/Per_Gene/Panels",
-        )
-        log_images_from_globs(
-            wandb_run,
-            run_dir,
-            patterns=["models/*/histories/*_loss.png"],
-            max_items=max_media,
-            group_key="Plots/Training_History/Per_Gene/Loss",
-        )
-        log_images_from_globs(
-            wandb_run,
-            run_dir,
-            patterns=["models/*/histories/*_pearson.png"],
-            max_items=max_media,
-            group_key="Plots/Training_History/Per_Gene/Pearson",
-        )
-        log_images_from_globs(
-            wandb_run,
-            run_dir,
-            patterns=["models/*/histories/*_spearman.png"],
-            max_items=max_media,
-            group_key="Plots/Training_History/Per_Gene/Spearman",
-        )
-        log_images_from_globs(
-            wandb_run,
-            run_dir,
-            patterns=["models/*/histories/*_r2.png"],
-            max_items=max_media,
-            group_key="Plots/Training_History/Per_Gene/R2",
-        )
+        # Skip per-gene panel/history image uploads to avoid high-volume W&B media spam.
         training_history_labels = {"loss": "Loss", "pearson": "Pearson", "r2": "R2", "spearman": "Spearman"}
         for metric in ("loss", "pearson", "r2", "spearman"):
             log_images_from_globs(
@@ -1593,7 +2155,7 @@ def _run_per_gene_pipeline(
                 run_dir,
                 patterns=[f"models/*/training_history_{metric}.png"],
                 max_items=max_media,
-                group_key=f"Plots/Training_History/Run/{training_history_labels[metric]}",
+                group_key=f"Plots/Training_History/{training_history_labels[metric]}",
             )
         metric_labels = {
             "pearson": "Pearson",
@@ -1792,47 +2354,43 @@ def _run_cellwise_pipeline(
                         model_name,
                         np.asarray(result.feature_importances, dtype=np.float64),
                         list(result.feature_names),
+                        feature_importance_mean_signed=(
+                            np.asarray(result.feature_importance_mean_signed, dtype=np.float64)
+                            if getattr(result, "feature_importance_mean_signed", None) is not None
+                            else None
+                        ),
                         method=getattr(result, "feature_importance_method", None),
+                        export_per_gene_panels=config.training.enable_per_gene_panels,
                         gene_names=result.gene_names,
                         feature_block_slices=getattr(result, "feature_block_slices", None),
                         feature_block_indices=getattr(result, "feature_block_indices", None),
                         gene_infos=getattr(result, "gene_infos", None),
                     )
                     if wandb_run is not None and fi_summary:
-                        wandb_update_summary(
-                            wandb_run,
-                            {
-                                f"{model_name}/feature_importance_summary": fi_summary,
-                            },
-                        )
-                        fi_metric_payload = _flatten_numeric_metrics(
-                            fi_summary,
-                            prefix=f"feature_importance/{model_name}",
-                        )
+                        fi_metric_payload = _compact_feature_importance_metric_payload(fi_summary)
                         if fi_metric_payload:
-                            wandb_log_metrics(wandb_run, fi_metric_payload)
-                if getattr(result, "shap_importances_mean", None) is not None and getattr(result, "feature_names", None) is not None:
+                            # Keep feature-importance aggregates in summary only (no time-series charts).
+                            wandb_update_summary(wandb_run, fi_metric_payload)
+                if getattr(result, "shap_importance_mean", None) is not None and getattr(result, "feature_names", None) is not None:
                     shap_summary = _export_shap_importance_artifacts(
                         model_dir,
                         model_name,
-                        np.asarray(result.shap_importances_mean, dtype=np.float64),
+                        np.asarray(result.shap_importance_mean, dtype=np.float64),
                         list(result.feature_names),
+                        shap_value_mean_signed=(
+                            np.asarray(result.shap_value_mean_signed, dtype=np.float64)
+                            if getattr(result, "shap_value_mean_signed", None) is not None
+                            else None
+                        ),
                         method=getattr(result, "shap_importance_method", None),
+                        gene_names=result.gene_names,
+                        feature_block_slices=getattr(result, "feature_block_slices", None),
+                        feature_block_indices=getattr(result, "feature_block_indices", None),
+                        gene_infos=getattr(result, "gene_infos", None),
                     )
                     if wandb_run is not None and shap_summary:
-                        wandb_update_summary(
-                            wandb_run,
-                            {
-                                f"{model_name}/shap_importance_summary": shap_summary,
-                            },
-                        )
-                        shap_metric_payload = _flatten_numeric_metrics(
-                            shap_summary,
-                            prefix=f"shap/{model_name}",
-                        )
+                        shap_metric_payload = _compact_shap_metric_payload(shap_summary)
                         if shap_metric_payload:
-                            # SHAP summary scalars are run-level artifacts; keep them in summary
-                            # to avoid noisy single-point metric charts.
                             wandb_update_summary(wandb_run, shap_metric_payload)
 
                 metric_payload = {
@@ -1852,7 +2410,6 @@ def _run_cellwise_pipeline(
                         for key, value in metric_payload.items()
                         if key not in {"model", "dataset"}
                     }
-                    summary_payload["model"] = model_name
                     wandb_update_summary(wandb_run, summary_payload)
 
                 # Verify all critical files were written before logging completion
@@ -1882,18 +2439,18 @@ def _run_cellwise_pipeline(
             finally:
                 export_run_configuration_snapshot()
 
+        if failures:
+            raise RuntimeError(
+                "One or more models failed in multi-output mode: "
+                + "; ".join(failures)
+            )
+
         if summary_records:
             summary_df = pd.DataFrame(summary_records)
             summary_df = _reorder_metric_columns(summary_df)
             summary_df.to_csv(run_dir / "summary_metrics.csv", index=False)
 
             export_run_configuration_snapshot()
-
-            if failures:
-                raise RuntimeError(
-                    "One or more models failed in multi-output mode: "
-                    + "; ".join(failures)
-                )
 
             if wandb_run is not None and config.wandb.log_tables:
                 table_max = config.wandb.table_max_rows
@@ -1907,39 +2464,45 @@ def _run_cellwise_pipeline(
                     model_dir = run_dir / "models" / model_name
                     log_tables_from_csv(
                         wandb_run,
-                        f"Tables/{model_name}/metrics_aggregate",
+                        "Tables/metrics_aggregate",
                         model_dir / "metrics_aggregate.csv",
                         max_rows=table_max,
                     )
                     log_tables_from_csv(
                         wandb_run,
-                        f"Tables/{model_name}/metrics_per_gene",
+                        "Tables/metrics_per_gene",
                         model_dir / "metrics_per_gene.csv",
                         max_rows=table_max,
                     )
                     log_tables_from_csv(
                         wandb_run,
-                        f"Tables/{model_name}/feature_importance_per_gene_summary",
+                        "Tables/fi_per_gene_summary",
                         model_dir / "feature_importance_per_gene_summary.csv",
+                        max_rows=table_max,
+                    )
+                    log_tables_from_csv(
+                        wandb_run,
+                        "Tables/shap_per_gene_summary",
+                        model_dir / "shapley_values_per_gene_summary.csv",
                         max_rows=table_max,
                     )
                     if config.wandb.log_predictions_table:
                         log_tables_from_csv(
                             wandb_run,
-                            f"Tables/{model_name}/predictions",
+                            "Tables/predictions",
                             model_dir / "predictions_raw.csv",
                             max_rows=table_max,
                         )
                     log_tables_from_csv(
                         wandb_run,
-                        f"Tables/{model_name}/training_history",
+                        "Tables/training_history",
                         model_dir / "training_history.csv",
                         max_rows=table_max,
                     )
                     log_training_history_charts_from_csv(
                         wandb_run,
                         model_dir / "training_history.csv",
-                        prefix=f"{model_name}",
+                        prefix="Training_History",
                     )
 
         if wandb_run is not None and config.wandb.log_media:
@@ -1968,14 +2531,14 @@ def _run_cellwise_pipeline(
             log_images_from_globs(
                 wandb_run,
                 run_dir,
-                patterns=["models/*/residuals_by_split.png"],
+                patterns=["models/*/residuals.png"],
                 max_items=max_media,
                 group_key="Plots/Residuals",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
-                patterns=["models/*/residual_bar_by_split.png"],
+                patterns=["models/*/residuals_bar.png"],
                 max_items=max_media,
                 group_key="Plots/Residuals/Bar",
             )
@@ -1986,7 +2549,7 @@ def _run_cellwise_pipeline(
                     "models/*/training_history_loss.png",
                 ],
                 max_items=max_media,
-                group_key="Plots/Training_History/Run/Loss",
+                group_key="Plots/Training_History/Loss",
             )
             log_images_from_globs(
                 wandb_run,
@@ -1995,7 +2558,7 @@ def _run_cellwise_pipeline(
                     "models/*/training_history_pearson.png",
                 ],
                 max_items=max_media,
-                group_key="Plots/Training_History/Run/Pearson",
+                group_key="Plots/Training_History/Pearson",
             )
             log_images_from_globs(
                 wandb_run,
@@ -2004,7 +2567,7 @@ def _run_cellwise_pipeline(
                     "models/*/training_history_spearman.png",
                 ],
                 max_items=max_media,
-                group_key="Plots/Training_History/Run/Spearman",
+                group_key="Plots/Training_History/Spearman",
             )
             log_images_from_globs(
                 wandb_run,
@@ -2013,57 +2576,61 @@ def _run_cellwise_pipeline(
                     "models/*/training_history_r2.png",
                 ],
                 max_items=max_media,
-                group_key="Plots/Training_History/Run/R2",
+                group_key="Plots/Training_History/R2",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
                 patterns=["models/*/feature_importance_mean.png"],
                 max_items=max_media,
-                group_key="Plots/Feature_Importance",
+                group_key="Plots/FI",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
                 patterns=["models/*/feature_importance_vs_tss_distance.png"],
                 max_items=max_media,
-                group_key="Plots/Feature_Importance/TSS_Distance",
+                group_key="Plots/FI/TSS_Distance",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/feature_importance_mean_signed.png"],
+                max_items=max_media,
+                group_key="Plots/FI/Signed",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
                 patterns=["models/*/feature_importance_distance_overview.png"],
                 max_items=max_media,
-                group_key="Plots/Feature_Importance/Distance_Overview",
+                group_key="Plots/FI/Cumulative_Overview",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
-                patterns=["models/*/per_gene_panels/*.png"],
+                patterns=["models/*/shapley_values_mean.png"],
                 max_items=max_media,
-                group_key="Plots/Feature_Importance/Per_Gene/Panels",
+                group_key="Plots/SHAP",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
-                patterns=["models/*/shap_importance_mean.png"],
+                patterns=["models/*/shapley_values_mean_signed.png"],
                 max_items=max_media,
-                prefix="Plots/SHAP/Importance",
+                group_key="Plots/SHAP/Signed",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
-                patterns=["models/*/shap_vs_tss.png"],
+                patterns=[
+                    "models/*/shapley_values_vs_tss.png",
+                    "models/*/shapley_values_vs_tss_zoomed.png",
+                ],
                 max_items=max_media,
-                prefix="Plots/SHAP/TSS",
+                group_key="Plots/SHAP/TSS_Distance",
             )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=["models/*/shap_vs_tss_zoomed.png"],
-                max_items=max_media,
-                prefix="Plots/SHAP/TSS_Zoomed",
-            )
+            # Skip per-gene FI/SHAP panel uploads to avoid high-volume W&B media spam.
             metric_labels = {
                 "pearson": "Pearson",
                 "r2": "R2",
@@ -2088,11 +2655,11 @@ def _run_cellwise_pipeline(
                 group_key="Plots/Generalization_Gap",
             )
 
-            if wandb_run is not None and config.wandb.log_artifacts:
-                log_run_artifacts(wandb_run, run_dir)
+        if wandb_run is not None and config.wandb.log_artifacts:
+            log_run_artifacts(wandb_run, run_dir)
 
-            overall_status = "succeeded"
-            return run_dir
+        overall_status = "succeeded"
+        return run_dir
     finally:
         # Log resource usage summary from entire run
         try:
@@ -2419,13 +2986,13 @@ def _plot_cellwise_diagnostics(
     if residuals_by_split:
         plot_residual_histogram_by_split(
             residuals_by_split,
-            model_dir / "residuals_by_split.png",
+            model_dir / "residuals.png",
             f"Residuals | {result.model_name.upper()}",
         )
         plot_residual_barplot_by_split(
             residuals_by_split,
             result.gene_names,
-            model_dir / "residual_bar_by_split.png",
+            model_dir / "residuals_bar.png",
             f"Mean residuals by split | {result.model_name.upper()}",
         )
 
@@ -2704,7 +3271,6 @@ def _export_run_configuration(
         "max_genes": config.max_genes,
         "chunk_total": config.chunk_total,
         "chunk_index": config.chunk_index,
-        "multi_output": config.multi_output,
     }
     payload["run_name"] = config.run_name
     payload["timestamp_utc"] = _utc_timestamp()
