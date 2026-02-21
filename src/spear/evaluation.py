@@ -2398,18 +2398,18 @@ def _run_cellwise_pipeline(
                     "dataset": infer_dataset_name(config),
                     "num_genes": dataset.num_genes(),
                 }
+                summary_payload: Dict[str, Any] = {
+                    "num_genes": dataset.num_genes(),
+                }
                 for split in ("train", "val", "test"):
                     metrics = result.aggregate_metrics.get(split, {})
                     for metric_name in ("pearson", "r2", "spearman", "rmse", "mse", "mae"):
                         key = f"{split}_{metric_name}"
-                        metric_payload[key] = metrics.get(metric_name)
+                        value = metrics.get(metric_name)
+                        metric_payload[key] = value
+                        summary_payload[key] = value
                 summary_records.append(metric_payload)
                 if wandb_run is not None:
-                    summary_payload = {
-                        key: value
-                        for key, value in metric_payload.items()
-                        if key not in {"model", "dataset"}
-                    }
                     wandb_update_summary(wandb_run, summary_payload)
 
                 # Verify all critical files were written before logging completion

@@ -7,7 +7,7 @@ import random
 import threading
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -52,6 +52,7 @@ _RESOURCE_TRACKER = {
     "max_gpu_devices": 0,
 }
 _CPU_PRIMED = False
+_FAST_CLASSICAL_MODELS = {"svr", "lasso", "elastic_net", "hist_gradient_boosting", "catboost"}
 
 
 def _get_gpu_utilization_pct() -> Optional[float]:
@@ -1359,7 +1360,21 @@ def train_multi_output_model(
     cache_dir: Optional[Path] = None,
 ) -> CellwiseModelResult:
     _seed_everything(config.random_state)
-    cache_key = _cellwise_cache_key(dataset, config)
+    runtime_config = config
+    if config.fast_classical_mode and model_name in _FAST_CLASSICAL_MODELS:
+        runtime_config = replace(config)
+        runtime_config.enable_smoothing = False
+        runtime_config.smoothing_k = 1
+        runtime_config.pseudobulk_group_size = 1
+        runtime_config.group_key = None
+        runtime_config.k_folds = min(config.k_folds, 2)
+        _LOG.info(
+            "Fast classical mode active | model=%s | k_folds=%d | smoothing=off | pseudobulk_group_size=1",
+            model_name,
+            runtime_config.k_folds,
+        )
+
+    cache_key = _cellwise_cache_key(dataset, runtime_config)
     cache_dict = getattr(dataset, "prepared_cache", {})
     if cache_dict is None:
         cache_dict = {}
@@ -1372,7 +1387,7 @@ def train_multi_output_model(
             len(getattr(dataset, "genes", [])),
         )
     else:
-        prepared = prepare_cellwise_data(dataset, config, cache_dir=cache_dir)
+        prepared = prepare_cellwise_data(dataset, runtime_config, cache_dir=cache_dir)
         cache_dict[cache_key] = prepared
     splits = prepared.splits
     gene_names = [gene.gene_name for gene in dataset.genes]
@@ -1391,18 +1406,18 @@ def train_multi_output_model(
 
     cv_groups = np.asarray(splits.group_labels_train)
     unique_groups = np.unique(cv_groups)
-    use_group_kfold = bool(config.group_key) and unique_groups.size >= config.k_folds
+    use_group_kfold = bool(runtime_config.group_key) and unique_groups.size >= runtime_config.k_folds
     if use_group_kfold:
-        kf = GroupKFold(n_splits=config.k_folds)
+        kf = GroupKFold(n_splits=runtime_config.k_folds)
         splitter = kf.split(splits.X_train, splits.y_train, cv_groups)
     else:
-        if config.group_key:
+        if runtime_config.group_key:
             _LOG.warning(
                 "Insufficient unique groups (%d) for GroupKFold (k=%d); falling back to KFold",
                 unique_groups.size,
-                config.k_folds,
+                runtime_config.k_folds,
             )
-        kf = KFold(n_splits=config.k_folds, shuffle=True, random_state=config.random_state)
+        kf = KFold(n_splits=runtime_config.k_folds, shuffle=True, random_state=runtime_config.random_state)
         splitter = kf.split(splits.X_train)
     cv_metrics: List[FoldMetrics] = []
 
@@ -1435,7 +1450,7 @@ def train_multi_output_model(
         _LOG.info(
             "Starting CV fold %d/%d | model=%s | train_samples=%d | val_samples=%d",
             fold_idx,
-            config.k_folds,
+            runtime_config.k_folds,
             model_name,
             X_tr.shape[0],
             X_va.shape[0],
@@ -1447,7 +1462,7 @@ def train_multi_output_model(
         model = build_model(
             model_name,
             dataset.X.shape[1],
-            config,
+            runtime_config,
             output_dim=target_dim,
             artifacts_dir=fold_artifacts_dir,
         )
@@ -1458,7 +1473,7 @@ def train_multi_output_model(
                 y_tr,
                 X_va,
                 y_va,
-                config,
+                runtime_config,
                 target_scaler=fold_target_scaler,
                 capture_history=False,
             )
@@ -1476,7 +1491,7 @@ def train_multi_output_model(
         _LOG.info(
             "Completed CV fold %d/%d | model=%s | mean_R2=%.4f | mean_RMSE=%.4f | %.2fs",
             fold_idx,
-            config.k_folds,
+            runtime_config.k_folds,
             model_name,
             agg_metrics.get("r2", float("nan")),
             agg_metrics.get("rmse", float("nan")),
@@ -1490,7 +1505,7 @@ def train_multi_output_model(
     model = build_model(
         model_name,
         dataset.X.shape[1],
-        config,
+        runtime_config,
         output_dim=target_dim,
         artifacts_dir=final_artifacts_dir,
     )
@@ -1502,13 +1517,13 @@ def train_multi_output_model(
             splits.y_train,
             splits.X_val,
             splits.y_val,
-            config,
+            runtime_config,
             target_scaler=prepared.target_scaler,
             capture_history=True,
         )
-        pred_train = _predict_torch(fitted_model, model.reshape, config, splits.X_train, output_dim=target_dim)
-        pred_val = _predict_torch(fitted_model, model.reshape, config, splits.X_val, output_dim=target_dim)
-        pred_test = _predict_torch(fitted_model, model.reshape, config, splits.X_test, output_dim=target_dim)
+        pred_train = _predict_torch(fitted_model, model.reshape, runtime_config, splits.X_train, output_dim=target_dim)
+        pred_val = _predict_torch(fitted_model, model.reshape, runtime_config, splits.X_val, output_dim=target_dim)
+        pred_test = _predict_torch(fitted_model, model.reshape, runtime_config, splits.X_test, output_dim=target_dim)
     else:
         estimator = clone(model)
         estimator.fit(splits.X_train, splits.y_train)

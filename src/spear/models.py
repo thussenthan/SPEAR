@@ -875,6 +875,9 @@ def build_model(
         epsilon = training.svr_epsilon
         max_iter = training.svr_max_iter
         tol = training.svr_tol
+        if training.fast_classical_mode:
+            max_iter = min(max_iter, 12_000)
+            tol = max(tol, 5e-4)
         if kernel == "linear":
             # LinearSVR scales much better than kernel SVR on large, high-dimensional
             # multi-output workloads (e.g., 1k genes x 40k features).
@@ -898,7 +901,7 @@ def build_model(
         return Pipeline(
             [
                 ("scaler", StandardScaler()),
-                ("regressor", MultiOutputRegressor(svr_estimator)),
+                ("regressor", MultiOutputRegressor(svr_estimator, n_jobs=-1)),
             ]
         )
     if name == "xgboost":
@@ -936,15 +939,23 @@ def build_model(
         # Use configurable iterations (default 1000) with early_stopping_rounds for automatic quality/speed balance
         # Set via training.catboost_iterations to override default
         iterations = training.catboost_iterations if training.catboost_iterations is not None else 1000
+        depth = 6
+        learning_rate = 0.05
+        early_stopping_rounds = 50
+        if training.fast_classical_mode:
+            iterations = min(iterations, 400)
+            depth = 5
+            learning_rate = 0.08
+            early_stopping_rounds = 30
         catboost_params = {
             "iterations": iterations,
-            "depth": 6,
-            "learning_rate": 0.05,
+            "depth": depth,
+            "learning_rate": learning_rate,
             "loss_function": "RMSE",
             "verbose": False,
             "random_seed": training.random_state,
             "thread_count": -1,
-            "early_stopping_rounds": 50,  # Stop if validation metric doesn't improve for 50 rounds
+            "early_stopping_rounds": early_stopping_rounds,
         }
         if use_gpu:
             catboost_params["task_type"] = "GPU"
@@ -970,21 +981,31 @@ def build_model(
     if name == "hist_gradient_boosting":
         from sklearn.ensemble import HistGradientBoostingRegressor
 
-        base_model = HistGradientBoostingRegressor(
-            learning_rate=0.1,  # Increased for faster convergence
+        hgb_params = dict(
+            learning_rate=0.1,
             max_depth=6,
-            max_iter=300,  # Reduced from 600 for speed
+            max_iter=300,
             max_leaf_nodes=64,
-            min_samples_leaf=50,  # Increased from 20 for speed (less granular splits)
+            min_samples_leaf=50,
             l2_regularization=1e-3,
             random_state=training.random_state,
             early_stopping=True,
             validation_fraction=0.1,
-            n_iter_no_change=15,  # Reduced from 20 for earlier stopping
+            n_iter_no_change=15,
+        )
+        if training.fast_classical_mode:
+            hgb_params.update(
+                max_iter=140,
+                max_leaf_nodes=31,
+                min_samples_leaf=100,
+                n_iter_no_change=8,
+            )
+        base_model = HistGradientBoostingRegressor(
+            **hgb_params,
         )
         if output_dim == 1:
             return base_model
-        return MultiOutputRegressor(base_model)
+        return MultiOutputRegressor(base_model, n_jobs=-1)
     if name == "ridge":
         from sklearn.linear_model import Ridge
 
@@ -995,22 +1016,29 @@ def build_model(
     if name == "elastic_net":
         from sklearn.linear_model import ElasticNet, MultiTaskElasticNet
 
+        alpha = 0.1
+        tol = 1e-3
+        max_iter = 3000
+        if training.fast_classical_mode:
+            alpha = 0.2
+            tol = 3e-3
+            max_iter = 1500
         scaler = StandardScaler()
         if output_dim == 1:
             regressor = ElasticNet(
-                alpha=0.1,  # Increased from 0.05 for faster convergence
+                alpha=alpha,
                 l1_ratio=0.5,
-                max_iter=3000,  # Reduced from 10000
+                max_iter=max_iter,
                 selection="random",  # Random is faster than cyclic
-                tol=1e-3,  # Relaxed tolerance for speed
+                tol=tol,
                 random_state=training.random_state,
             )
         else:
             regressor = MultiTaskElasticNet(
-                alpha=0.1,  # Increased from 0.05 for faster convergence
+                alpha=alpha,
                 l1_ratio=0.3,
-                max_iter=3000,  # Reduced from 10000
-                tol=1e-3,  # Relaxed tolerance for speed
+                max_iter=max_iter,
+                tol=tol,
                 random_state=training.random_state,
             )
         return Pipeline([
@@ -1020,20 +1048,27 @@ def build_model(
     if name == "lasso":
         from sklearn.linear_model import Lasso, MultiTaskLasso
 
+        alpha = 0.1
+        tol = 1e-3
+        max_iter = 3000
+        if training.fast_classical_mode:
+            alpha = 0.2
+            tol = 3e-3
+            max_iter = 1500
         scaler = StandardScaler()
         if output_dim == 1:
             regressor = Lasso(
-                alpha=0.1,  # Increased from 0.05 for faster convergence
-                max_iter=3000,  # Reduced from 10000
+                alpha=alpha,
+                max_iter=max_iter,
                 selection="random",  # Random is faster than cyclic
-                tol=1e-3,  # Relaxed tolerance for speed
+                tol=tol,
                 random_state=training.random_state,
             )
         else:
             regressor = MultiTaskLasso(
-                alpha=0.1,  # Increased from 0.05 for faster convergence
-                max_iter=3000,  # Reduced from 10000
-                tol=1e-3,  # Relaxed tolerance for speed
+                alpha=alpha,
+                max_iter=max_iter,
+                tol=tol,
                 random_state=training.random_state,
             )
         return Pipeline([

@@ -106,6 +106,7 @@ Environment / CLI highlights:
 - W&B run name defaults to `<model>_<genes>_<dataset>` unless `--wandb-run-name` is provided.
 - `--device` supports `cuda`, `cpu`, or `auto` (prefers CUDA when available; falls back otherwise).
 - `--disable-pseudobulk` is a quick toggle to benchmark true single-cell training (equivalent to setting `--pseudobulk-group-size 1`).
+- `--fast-classical-mode` applies a faster profile for heavy classical multi-output models (`svr`, `lasso`, `elastic_net`, `hist_gradient_boosting`, `catboost`), useful when long CPU jobs are timing out.
 - `--atac-layer` lets you swap CPM for alternative ATAC transforms such as `tfidf` or disable normalisation entirely.
 
 ### Generate Gene Manifests

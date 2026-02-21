@@ -108,6 +108,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Disable k-NN smoothing of cells",
     )
     parser.add_argument(
+        "--fast-classical-mode",
+        action="store_true",
+        help=(
+            "Apply a faster training profile for heavy classical multi-output models "
+            "(svr/lasso/elastic_net/hist_gradient_boosting/catboost)."
+        ),
+    )
+    parser.add_argument(
         "--resource-sample-seconds",
         type=float,
         help="Interval (in seconds) between resource usage samples (default 60)",
@@ -349,6 +357,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.smoothing_pca_components = args.smoothing_pca_components
         if args.disable_smoothing:
             training.enable_smoothing = False
+        if args.fast_classical_mode:
+            training.fast_classical_mode = True
         if args.pseudobulk_group_size is not None:
             training.pseudobulk_group_size = args.pseudobulk_group_size
         if args.disable_pseudobulk:

@@ -59,6 +59,7 @@ their defaults.
 | `--smoothing-k`                   | int       | `20`                                                   | Neighborhood size for k-NN smoothing (use 1 to disable).                                                 |
 | `--smoothing-pca-components`      | int       | `10`                                                   | PCA components for k-NN smoothing.                                                                       |
 | `--disable-smoothing`             | flag      | `False`                                                | Disable k-NN smoothing of cells.                                                                         |
+| `--fast-classical-mode`           | flag      | `False`                                                | Faster profile for heavy classical multi-output models (svr/lasso/elastic_net/hist_gradient_boosting/catboost). |
 | `--resource-sample-seconds`       | float     | `60`                                                   | Interval (seconds) between resource usage samples.                                                       |
 | `--transformer-embed-dim`         | int       | `128`                                                  | Transformer embedding dimension.                                                                         |
 | `--transformer-num-layers`        | int       | `2`                                                    | Number of transformer encoder layers.                                                                    |
@@ -137,6 +138,7 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `smoothing_pca_components`      | `10`                           | PCA components for smoothing neighbor search.                                                                                     |
 | `pseudobulk_group_size`         | `1`                            | Cells per pseudobulk aggregate (1 disables pooling).                                                                              |
 | `pseudobulk_pca_components`     | `10`                           | PCA dims for pseudobulk neighborhood search.                                                                                      |
+| `fast_classical_mode`           | `False`                        | When enabled, applies faster defaults for heavy classical multi-output models (reduced CV folds and lighter model settings).     |
 | `transformer_embed_dim`         | `128`                          | Transformer embedding size.                                                                                                       |
 | `transformer_num_layers`        | `2`                            | Transformer encoder depth.                                                                                                        |
 | `transformer_dropout`           | `0.2`                          | Transformer dropout for attention/MLP and final head.                                                                             |

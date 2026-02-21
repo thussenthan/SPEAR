@@ -135,6 +135,10 @@ class TrainingConfig:
     # When False, keep sparse feature matrices during cell-wise prep to reduce memory.
     # Note: smoothing/pseudobulk or non-sparse scalers will still force densification.
     force_dense_features: bool = True
+    # Optional speed profile for heavy classical models in multi-output runs.
+    # When enabled, training applies a lighter CV setup and model-specific
+    # conservative defaults to reduce wall-time and timeout risk.
+    fast_classical_mode: bool = False
 
     def validate(self) -> None:
         total = self.train_fraction + self.val_fraction + self.test_fraction
