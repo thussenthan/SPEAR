@@ -167,6 +167,11 @@ def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
     if config.chunk_total > 1 or config.chunk_index > 0:
         payload["chunk_index"] = config.chunk_index
         payload["chunk_total"] = config.chunk_total
+
+    repro_cmd = os.getenv("SPEAR_WANDB_REPRO_CMD")
+    if repro_cmd:
+        payload["repro_command"] = repro_cmd
+
     return _clean_payload(payload)
 
 
@@ -355,6 +360,20 @@ def wandb_update_summary(run: Optional[Any], summary: Dict[str, Any]) -> None:
         run.summary.update(_clean_payload(summary))
     except Exception:
         _LOG.debug("W&B summary update failed", exc_info=True)
+
+
+def wandb_update_config(
+    run: Optional[Any],
+    config_updates: Dict[str, Any],
+    *,
+    allow_val_change: bool = True,
+) -> None:
+    if run is None:
+        return
+    try:
+        run.config.update(_clean_payload(config_updates), allow_val_change=allow_val_change)
+    except Exception:
+        _LOG.debug("W&B config update failed", exc_info=True)
 
 
 def wandb_finish(run: Optional[Any], *, status: str, run_dir: Optional[Path] = None) -> None:

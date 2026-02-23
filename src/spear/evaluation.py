@@ -48,6 +48,7 @@ from .wandb_utils import (
     log_tables_from_csv,
     maybe_init_wandb,
     wandb_finish,
+    wandb_update_config,
     wandb_update_summary,
 )
 from .visualization import (
@@ -1647,7 +1648,7 @@ def _run_per_gene_pipeline(
         return run_dir
     
     _ensure_directory(run_dir)
-    wandb_update_summary(
+    wandb_update_config(
         wandb_run,
         {
             "mode": "per_gene",
@@ -1875,7 +1876,6 @@ def _run_per_gene_pipeline(
                         summary_payload[f"{split}_{metric}"] = value
                     else:
                         summary_payload[key] = value
-                summary_payload["num_genes"] = len(metrics_df)
                 if summary_payload:
                     wandb_update_summary(wandb_run, summary_payload)
             base_row: Dict[str, Any] = {
@@ -2263,7 +2263,7 @@ def _run_cellwise_pipeline(
             _export_run_configuration(config, run_dir, model_run_details, extra_context)
 
         export_run_configuration_snapshot()
-        wandb_update_summary(
+        wandb_update_config(
             wandb_run,
             {
                 "mode": "multi_output",
@@ -2398,9 +2398,7 @@ def _run_cellwise_pipeline(
                     "dataset": infer_dataset_name(config),
                     "num_genes": dataset.num_genes(),
                 }
-                summary_payload: Dict[str, Any] = {
-                    "num_genes": dataset.num_genes(),
-                }
+                summary_payload: Dict[str, Any] = {}
                 for split in ("train", "val", "test"):
                     metrics = result.aggregate_metrics.get(split, {})
                     for metric_name in ("pearson", "r2", "spearman", "rmse", "mse", "mae"):
@@ -3074,7 +3072,6 @@ def _plot_cellwise_diagnostics(
                     wandb_run,
                     {
                         "generalization_gap_train_test_pearson_mean": gap_mean,
-                        "model": result.model_name,
                     },
                 )
             plot_single_box_violin(

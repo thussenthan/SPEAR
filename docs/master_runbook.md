@@ -88,6 +88,7 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 - Review `README.md` for the current pipeline behavior and defaults.
 - Consult `docs/config_reference.md` for every CLI flag supported by `src`.
 - Determine the gene manifest(s), chromosome scope, window size, and training overrides for your planned run; record these in `todo.md` or a run sheet.
+- For ResNet experiments, decide whether to keep squeeze-excitation attention (`--resnet-attention se`, default) or run an ablation with `--resnet-attention none`; tune bottleneck capacity with `--resnet-attention-se-reduction`.
 - For SVR runs, note that `TrainingConfig` exposes `svr_kernel`, `svr_C`, `svr_epsilon`, `svr_max_iter`, and `svr_tol` with defaults documented in `docs/config_reference.md`.
 
 ### Stage 3 - Computer science perspective

@@ -108,6 +108,7 @@ Environment / CLI highlights:
 - `--disable-pseudobulk` is a quick toggle to benchmark true single-cell training (equivalent to setting `--pseudobulk-group-size 1`).
 - `--fast-classical-mode` applies a faster profile for heavy classical multi-output models (`svr`, `lasso`, `elastic_net`, `hist_gradient_boosting`, `catboost`), useful when long CPU jobs are timing out.
 - `--atac-layer` lets you swap CPM for alternative ATAC transforms such as `tfidf` or disable normalisation entirely.
+- ResNet now supports configurable squeeze-excitation attention: `--resnet-attention {se,none}` and `--resnet-attention-se-reduction <int>` (default: `se`, reduction `8`).
 
 ### Generate Gene Manifests
 
@@ -136,6 +137,12 @@ spear --per-gene --models ridge lasso ols --device cpu --run-name per_gene_basel
 
 # Multi-output torch run with smaller smoothing and no pseudobulk
 spear --models mlp transformer --smoothing-k 5 --disable-pseudobulk --run-name multi_output_no_bulk
+
+# ResNet with SE attention (default) and tuned reduction ratio
+spear --models resnet --resnet-attention se --resnet-attention-se-reduction 4 --run-name resnet_se_r4
+
+# ResNet ablation without attention
+spear --models resnet --resnet-attention none --run-name resnet_no_attention
 
 Optional experiment tracking is available via Weights & Biases. Enable it with `--wandb` after installing `wandb`
 and exporting `WANDB_API_KEY` (or configuring `~/.netrc`). If the key or login is missing, SPEAR will skip W&B

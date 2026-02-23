@@ -159,7 +159,14 @@ class CNNRegressor(nn.Module):
 class ResNetBlock1D(nn.Module):
     """Basic residual block for 1D convolutions."""
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        attention: str = "none",
+        se_reduction: int = 8,
+    ) -> None:
         super().__init__()
         self.conv1 = nn.Conv1d(
             in_channels,
@@ -186,6 +193,10 @@ class ResNetBlock1D(nn.Module):
             )
         else:
             self.downsample = nn.Identity()
+        if attention == "se":
+            self.attention = SEBlock1D(out_channels, reduction=se_reduction)
+        else:
+            self.attention = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.conv1(x)
@@ -193,8 +204,28 @@ class ResNetBlock1D(nn.Module):
         out = F.relu(out)
         out = self.conv2(out)
         out = self.bn2(out)
+        out = self.attention(out)
         out = out + self.downsample(x)
         return F.relu(out)
+
+
+class SEBlock1D(nn.Module):
+    """Squeeze-and-Excitation channel attention for 1D feature maps."""
+
+    def __init__(self, channels: int, reduction: int = 8) -> None:
+        super().__init__()
+        reduced_channels = max(4, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.gate = nn.Sequential(
+            nn.Conv1d(channels, reduced_channels, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(reduced_channels, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights = self.gate(self.pool(x))
+        return x * weights
 
 
 class ResNet1DRegressor(nn.Module):
@@ -210,8 +241,21 @@ class ResNet1DRegressor(nn.Module):
     Output: (batch, output_dim) predictions
     """
 
-    def __init__(self, input_dim: int, output_dim: int = 1) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1,
+        attention: str = "se",
+        attention_se_reduction: int = 8,
+    ) -> None:
         super().__init__()
+        if attention not in {"none", "se"}:
+            raise ValueError("attention must be 'none' or 'se'")
+        if attention_se_reduction <= 0:
+            raise ValueError("attention_se_reduction must be positive")
+
+        self.attention = attention
+        self.attention_se_reduction = attention_se_reduction
         # Heuristic for the number of pooled segments used by the dense head:
         # - CNNRegressor has total stride 4*4*2 = 32; this ResNet has stride
         #   4 (stem) * 2 (maxpool) * 2 (layer2) * 2 (layer3) = 32 as well.
@@ -240,9 +284,25 @@ class ResNet1DRegressor(nn.Module):
         )
 
     def _make_layer(self, in_channels: int, out_channels: int, *, blocks: int, stride: int) -> nn.Sequential:
-        layers = [ResNetBlock1D(in_channels, out_channels, stride=stride)]
+        layers = [
+            ResNetBlock1D(
+                in_channels,
+                out_channels,
+                stride=stride,
+                attention=self.attention,
+                se_reduction=self.attention_se_reduction,
+            )
+        ]
         for _ in range(1, blocks):
-            layers.append(ResNetBlock1D(out_channels, out_channels, stride=1))
+            layers.append(
+                ResNetBlock1D(
+                    out_channels,
+                    out_channels,
+                    stride=1,
+                    attention=self.attention,
+                    se_reduction=self.attention_se_reduction,
+                )
+            )
         return nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -828,7 +888,14 @@ def build_model(
     if name == "cnn":
         return TorchModelBundle(CNNRegressor(input_dim, output_dim=output_dim))
     if name == "resnet":
-        return TorchModelBundle(ResNet1DRegressor(input_dim, output_dim=output_dim))
+        return TorchModelBundle(
+            ResNet1DRegressor(
+                input_dim,
+                output_dim=output_dim,
+                attention=training.resnet_attention,
+                attention_se_reduction=training.resnet_attention_se_reduction,
+            )
+        )
     if name == "rnn":
         return TorchModelBundle(RNNRegressor(input_dim, output_dim=output_dim), reshape="sequence")
     if name == "lstm":
@@ -1005,7 +1072,9 @@ def build_model(
         )
         if output_dim == 1:
             return base_model
-        return MultiOutputRegressor(base_model, n_jobs=-1)
+        # Running one process per target can explode memory on large multi-output
+        # runs (e.g., 1000 genes x 40k features), leading to OOM kills.
+        return MultiOutputRegressor(base_model, n_jobs=1)
     if name == "ridge":
         from sklearn.linear_model import Ridge
 

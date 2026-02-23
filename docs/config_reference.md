@@ -65,6 +65,8 @@ their defaults.
 | `--transformer-num-layers`        | int       | `2`                                                    | Number of transformer encoder layers.                                                                    |
 | `--transformer-dropout`           | float     | `0.2`                                                  | Transformer dropout for encoder and prediction head.                                                     |
 | `--transformer-num-heads`         | int       | `None` (auto)                                          | Transformer attention heads (must divide `transformer_embed_dim`).                                       |
+| `--resnet-attention`              | enum      | `se`                                                   | ResNet attention type (`se` for squeeze-excitation, `none` to disable).                                  |
+| `--resnet-attention-se-reduction` | int       | `8`                                                    | Reduction ratio for ResNet squeeze-excitation bottleneck.                                                |
 | `--enable-feature-importance`     | flag      | `False`                                                | Enable feature importance computation.                                                                   |
 | `--feature-importance-samples`    | int       | `None` (all samples)                                   | Max samples for feature importance computation.                                                          |
 | `--feature-importance-batch-size` | int       | `256`                                                  | Batch size for feature importance gradient accumulation.                                                 |
@@ -143,6 +145,8 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `transformer_num_layers`        | `2`                            | Transformer encoder depth.                                                                                                        |
 | `transformer_dropout`           | `0.2`                          | Transformer dropout for attention/MLP and final head.                                                                             |
 | `transformer_num_heads`         | `None`                         | Attention heads; auto-selected when unset, must divide embedding dim when set.                                                    |
+| `resnet_attention`              | `se`                           | Attention module in ResNet blocks (`se` or `none`).                                                                                |
+| `resnet_attention_se_reduction` | `8`                            | Reduction ratio used by ResNet squeeze-excitation blocks.                                                                          |
 | `min_expression_fraction`       | `0.10`                         | Fraction of cells expressing a gene for multi-output sampling.                                                                    |
 | `enable_feature_importance`     | `False`                        | Whether to compute feature importance for torch models.                                                                           |
 | `feature_importance_samples`    | `None` (all)                   | Max samples for feature importance computation.                                                                                   |
@@ -220,7 +224,7 @@ Data files are not published with the repository; treat the defaults above as lo
 | Model         | Architecture Summary                                                                                                                            |
 | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cnn`         | 1D CNN with 3 conv blocks (32/64/128 channels), adaptive pooling, 512-unit dense head, dropout 0.2.                                             |
-| `resnet`      | 1D ResNet with strided stem, three residual stages (32→64→128 channels), adaptive pooling, 256-unit dense head, dropout 0.2.                    |
+| `resnet`      | 1D ResNet with strided stem, three residual stages (32→64→128 channels), squeeze-excitation attention in residual blocks (configurable), adaptive pooling, 256-unit dense head, dropout 0.2. |
 | `rnn`         | Conv down-sampling followed by RNN (`hidden_size=96`, `num_layers=1`), dense head with dropout 0.2.                                             |
 | `lstm`        | Same conv front-end as RNN, `hidden_size=128` LSTM, dense head with dropout 0.2.                                                                |
 | `transformer` | Conv projection to 128 channels, adaptive pooling, configurable transformer encoder (`embed_dim`, `num_layers`, auto/explicit `num_heads`), dense head with GELU and configurable dropout. |

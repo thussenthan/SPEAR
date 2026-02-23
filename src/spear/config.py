@@ -81,6 +81,8 @@ class TrainingConfig:
     transformer_dropout: float = 0.2
     transformer_num_heads: Optional[int] = None
     transformer_arch: str = "v1"
+    resnet_attention: str = "se"
+    resnet_attention_se_reduction: int = 8
     torch_pearson_loss_weight: float = 0.0
     # Gradient clipping for torch-based models (cnn/rnn/lstm/transformer/mlp/dcn/resnet/graph).
     max_grad_norm: Optional[float] = 5.0
@@ -203,6 +205,10 @@ class TrainingConfig:
                 raise ValueError("transformer_embed_dim must be divisible by transformer_num_heads")
         if self.transformer_arch not in {"v1", "v2"}:
             raise ValueError("transformer_arch must be 'v1' or 'v2'")
+        if self.resnet_attention not in {"none", "se"}:
+            raise ValueError("resnet_attention must be 'none' or 'se'")
+        if self.resnet_attention_se_reduction <= 0:
+            raise ValueError("resnet_attention_se_reduction must be positive")
         if self.torch_pearson_loss_weight < 0.0:
             raise ValueError("torch_pearson_loss_weight must be >= 0")
         if self.k_folds > 1 and self.group_key is not None and not self.group_key:

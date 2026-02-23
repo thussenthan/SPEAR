@@ -134,6 +134,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Transformer architecture variant (default v1)",
     )
     parser.add_argument(
+        "--resnet-attention",
+        choices=["none", "se"],
+        help="ResNet attention type ('se' for squeeze-excitation, 'none' to disable)",
+    )
+    parser.add_argument(
+        "--resnet-attention-se-reduction",
+        type=int,
+        help="Reduction ratio for ResNet SE attention MLP bottleneck",
+    )
+    parser.add_argument(
         "--torch-pearson-loss-weight",
         type=float,
         help="Optional Pearson-correlation loss weight added to torch-model training objective",
@@ -395,6 +405,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             training.transformer_num_heads = args.transformer_num_heads
         if args.transformer_arch is not None:
             training.transformer_arch = args.transformer_arch
+        if args.resnet_attention is not None:
+            training.resnet_attention = args.resnet_attention
+        if args.resnet_attention_se_reduction is not None:
+            training.resnet_attention_se_reduction = args.resnet_attention_se_reduction
         if args.torch_pearson_loss_weight is not None:
             training.torch_pearson_loss_weight = args.torch_pearson_loss_weight
         if args.rf_n_estimators is not None:
