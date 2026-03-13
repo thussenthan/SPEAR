@@ -13,15 +13,15 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 ## Outputs
 
 - Model checkpoints, metrics, summaries, and figures under `output/` and `analysis/figs`.
-- Log files under `output/logs` (pipeline logs: `<run_name>.log`; Slurm logs: `spear_<jobid>_<task>.out/.err`).
+- Log files under `output/logs` (pipeline logs: `<run_name>.log`; scheduler logs commonly appear as `spear_<jobid>_<task>.out/.err` when using job arrays).
 - Default run naming: `spear_<model>_<genes>_<dataset>_<cpu/gpu>_<timestamp>`; W&B run names default to `<model>_<genes>_<dataset>` unless overridden.
 
 ## Usage
 
 ### Orientation
 
-- Scope: infer gene regulatory networks from paired single-cell RNA-seq and ATAC-seq across E7.5 to E8.75 mouse embryogenesis with CRISPR controls.
-- Target users: computational biologists operating on the Penn State College of Medicine HPC cluster (Slurm) or a comparable environment.
+- Scope: infer gene regulatory programs from paired single-cell RNA-seq and ATAC-seq, using the included mouse embryonic and endothelial examples as reference workflows.
+- Target users: computational biologists and ML practitioners working with paired single-cell ATAC/RNA data on local workstations, cloud instances, or HPC environments.
 - Output: model checkpoints, per-gene metrics, aggregate summaries, and narrative analyses ready for publication.
 
 ### Biological frame
@@ -115,7 +115,7 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 
 ### Stage 5 - Computer science perspective
 
-- Pre-creating directories avoids race conditions in batch jobs and keeps Slurm output organized.
+- Pre-creating directories avoids race conditions in batch jobs and keeps scheduler output organized.
 - Planning storage usage prevents silent failures caused by quota exhaustion mid-training.
 
 ### Stage 5 - Biology perspective
@@ -141,15 +141,15 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 
 - Even miniature runs validate that cell metadata lines up with gene manifests (e.g., no empty matrices), avoiding biological misinterpretations later.
 
-### Stage 7 - Submit Cluster Jobs
+### Stage 7 - Submit Batch Jobs
 
 ### Stage 7 - Practical steps
 
-- Job submission templates are internal. Use your local Slurm templates and map array indices to `(model, chunk)` combinations consistent with your manifest size.
+- Use the templates in `jobs/` as starting points and adapt account, partition/queue, resources, and launcher commands for your environment. Map array indices to `(model, chunk)` combinations consistent with your manifest size.
 
 ### Stage 7 - Computer science perspective
 
-- Slurm arrays map deterministically to `(model, chunk)` pairs; log files encoded with array indices make troubleshooting parallel jobs tractable.
+- Job arrays map deterministically to `(model, chunk)` pairs; log files encoded with array indices make troubleshooting parallel jobs tractable.
 - Explicit environment variables keep submission commands self-documenting and reusable in automation scripts.
 
 ### Stage 7 - Biology perspective
@@ -161,8 +161,8 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 
 ### Stage 8 - Practical steps
 
-- Track queues with `sq -u $USER` and tail log files under `output/logs`.
-- Spot-check GPU utilization via `srun --pty nvidia-smi` when allowed.
+- Track queued/running jobs with your scheduler CLI (for example: `squeue`, `qstat`, or `bjobs`) and tail log files under `output/logs`.
+- Spot-check GPU utilization with `nvidia-smi` or scheduler-integrated monitoring commands when available.
 - Confirm each chunk writes `metrics_per_gene.csv`, `summary_metrics.csv`, and `run_configuration.json`.
 - Retry failed array indices after addressing the root cause.
 
@@ -216,4 +216,4 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 
 - Dataset specifics and download automation: `docs/mouse_esc_dataset.md`, `docs/endothelial_dataset.md`
 - Configuration dictionary: `docs/config_reference.md`
-- Job submission templates are internal.
+- Job submission templates are provided in `jobs/` and should be customized for your infrastructure.

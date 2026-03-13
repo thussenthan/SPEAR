@@ -1,6 +1,6 @@
 model_id	model_display_name	model_short_name
 cnn	Convolutional Neural Network	CNN
-resnet	Residual Network (1D)	ResNet
+resnet	Residual Network	ResNet
 rnn	Recurrent Neural Network	RNN
 lstm	Long Short-Term Memory Network	LSTM
 transformer	Transformer Encoder	Transformer

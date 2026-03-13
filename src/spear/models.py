@@ -11,6 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.linear_model import SGDRegressor
 from sklearn.svm import LinearSVR, SVR
 import torch
 from torch import nn
@@ -27,6 +28,12 @@ except ImportError:  # pragma: no cover - optional
     CatBoostRegressor = None  # type: ignore
 
 from .config import TrainingConfig
+
+FAST_MODE_SVR_MAX_ITER = 2_000
+FAST_MODE_SVR_TOL = 1e-3
+FAST_MODE_SVR_ALPHA = 1e-4
+FAST_MODE_SVR_VAL_FRACTION = 0.1
+FAST_MODE_SVR_NO_CHANGE_ITERS = 5
 
 
 class _CatBoostRegressorCompat(BaseEstimator, RegressorMixin):
@@ -943,8 +950,24 @@ def build_model(
         max_iter = training.svr_max_iter
         tol = training.svr_tol
         if training.fast_classical_mode:
-            max_iter = min(max_iter, 12_000)
-            tol = max(tol, 5e-4)
+            max_iter = min(max_iter, FAST_MODE_SVR_MAX_ITER)
+            tol = max(tol, FAST_MODE_SVR_TOL)
+            # Use a first-order linear approximation in fast mode to avoid
+            # very long liblinear runtimes on large multi-output workloads.
+            fast_svr = SGDRegressor(
+                loss="epsilon_insensitive",
+                epsilon=epsilon,
+                alpha=FAST_MODE_SVR_ALPHA,
+                max_iter=max_iter,
+                tol=tol,
+                random_state=training.random_state,
+                early_stopping=True,
+                validation_fraction=FAST_MODE_SVR_VAL_FRACTION,
+                n_iter_no_change=FAST_MODE_SVR_NO_CHANGE_ITERS,
+            )
+            if output_dim == 1:
+                return fast_svr
+            return MultiOutputRegressor(fast_svr, n_jobs=1)
         if kernel == "linear":
             # LinearSVR scales much better than kernel SVR on large, high-dimensional
             # multi-output workloads (e.g., 1k genes x 40k features).

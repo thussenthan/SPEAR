@@ -16,7 +16,7 @@ SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibil
 ## Outputs
 
 - Run artifacts under `output/results/` (metrics, predictions, histories, model files).
-- Logs under `output/logs` (pipeline logs: `<run_name>.log`; Slurm logs: `spear_<jobid>_<task>.out/.err`).
+- Logs under `output/logs` (pipeline logs: `<run_name>.log`; scheduler logs commonly appear as `spear_<jobid>_<task>.out/.err` for array jobs).
 - Figures under `analysis/figs`.
 
 ## Usage
@@ -93,7 +93,7 @@ spear \
   --device auto
 ```
 
-SPEAR can be run on Slurm-managed clusters; job scripts are internal.
+SPEAR runs on local machines, cloud VMs, and HPC clusters. Slurm templates are provided under `jobs/`; adapt them (or port to your scheduler) for your infrastructure.
 
 More flags and defaults are documented in `docs/config_reference.md`.
 
@@ -116,17 +116,17 @@ Generate the 1000-gene manifests used in this repo with the helper script:
 
 ```bash
 PYTHONPATH=src python scripts/select_random_genes.py \
-  --base-dir /gpfs/Home/tqw5435/uzun/spear \
+  --base-dir "$(pwd)" \
   --gene-count 1000 \
-  --gtf-path /gpfs/Home/tqw5435/uzun/spear/data/references/GCF_000001635.27_genomic.gtf \
-  --output /gpfs/Home/tqw5435/uzun/spear/data/embryonic/manifests/1000_random_genes.csv
+  --gtf-path data/references/GCF_000001635.27_genomic.gtf \
+  --output data/embryonic/manifests/1000_random_genes.csv
 
 PYTHONPATH=src python scripts/select_random_genes.py \
-  --base-dir /gpfs/Home/tqw5435/uzun/spear \
+  --base-dir "$(pwd)" \
   --gene-count 1000 \
-  --rna-path '/gpfs/Home/tqw5435/uzun/spear/data/endothelial/processed/combined_RNA_qc_<15%mito.h5ad' \
-  --gtf-path /gpfs/Home/tqw5435/uzun/spear/data/references/gencode.v44.annotation.gtf.gz \
-  --output /gpfs/Home/tqw5435/uzun/spear/data/endothelial/manifests/1000_random_genes.csv
+  --rna-path data/endothelial/processed/combined_RNA_qc_<15%mito.h5ad \
+  --gtf-path data/references/gencode.v44.annotation.gtf.gz \
+  --output data/endothelial/manifests/1000_random_genes.csv
 ```
 
 ### Example runs
@@ -263,4 +263,4 @@ python -m spear.predict \
 
 ## Citation
 
-If you use SPEAR, cite the original data sources and this repository ([https://github.com/UzunLab/SPEAR](https://github.com/UzunLab/SPEAR)). A formal software citation can be added once a DOI is available.
+If you use SPEAR in a publication, cite this repository and the original dataset/source publications listed in the dataset docs. A formal software citation can be added once a DOI is available.

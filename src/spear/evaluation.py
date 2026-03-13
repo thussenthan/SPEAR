@@ -43,6 +43,8 @@ from .wandb_utils import (
     apply_sweep_overrides,
     infer_dataset_name,
     log_images_from_globs,
+    log_metric_distribution_charts_from_csv,
+    log_prediction_charts_from_csv,
     log_training_history_charts_from_csv,
     log_run_artifacts,
     log_tables_from_csv,
@@ -2082,43 +2084,22 @@ def _run_per_gene_pipeline(
                     max_rows=table_max,
                 )
 
-        if wandb_run is not None and config.wandb.log_media:
-            max_media = config.wandb.media_max_items
-            log_images_from_globs(
+    if wandb_run is not None and config.wandb.log_media:
+        for model_name in config.all_models():
+            model_dir = run_dir / "models" / model_name
+            chart_prefix = f"Per_Gene/{model_name.upper()}"
+            log_prediction_charts_from_csv(
                 wandb_run,
-                run_dir,
-                patterns=["models/*/scatter_train.png"],
-                max_items=max_media,
-                group_key="Plots/Scatter/Train",
+                model_dir / "predictions_raw.csv",
+                prefix=chart_prefix,
             )
-            log_images_from_globs(
+            log_metric_distribution_charts_from_csv(
                 wandb_run,
-                run_dir,
-                patterns=["models/*/scatter_val.png"],
-                max_items=max_media,
-                group_key="Plots/Scatter/Val",
+                model_dir / "metrics_by_gene.csv",
+                prefix=chart_prefix,
             )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=["models/*/scatter_test.png"],
-                max_items=max_media,
-                group_key="Plots/Scatter/Test",
-            )
-        log_images_from_globs(
-            wandb_run,
-            run_dir,
-            patterns=["models/*/residuals.png"],
-            max_items=max_media,
-            group_key="Plots/Residuals",
-        )
-        log_images_from_globs(
-            wandb_run,
-            run_dir,
-            patterns=["models/*/residuals_bar.png"],
-            max_items=max_media,
-            group_key="Plots/Residuals/Bar",
-        )
+
+        max_media = config.wandb.media_max_items
         log_images_from_globs(
             wandb_run,
             run_dir,
@@ -2147,40 +2128,6 @@ def _run_per_gene_pipeline(
             max_items=max_media,
             group_key="Plots/FI/Cumulative_Overview",
         )
-        # Skip per-gene panel/history image uploads to avoid high-volume W&B media spam.
-        training_history_labels = {"loss": "Loss", "pearson": "Pearson", "r2": "R2", "spearman": "Spearman"}
-        for metric in ("loss", "pearson", "r2", "spearman"):
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=[f"models/*/training_history_{metric}.png"],
-                max_items=max_media,
-                group_key=f"Plots/Training_History/{training_history_labels[metric]}",
-            )
-        metric_labels = {
-            "pearson": "Pearson",
-            "r2": "R2",
-            "spearman": "Spearman",
-            "rmse": "RMSE",
-            "mse": "MSE",
-            "mae": "MAE",
-        }
-        for metric in _METRIC_ORDER:
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=[f"models/*/by_split_{metric}.png"],
-                max_items=max_media,
-                group_key=f"Plots/{metric_labels[metric]}",
-            )
-        log_images_from_globs(
-            wandb_run,
-            run_dir,
-            patterns=["models/*/generalization_gap_pearson_train_test.png"],
-            max_items=max_media,
-            group_key="Plots/Generalization_Gap",
-        )
-
     if wandb_run is not None and config.wandb.log_artifacts:
         log_run_artifacts(wandb_run, run_dir)
 
@@ -2500,82 +2447,25 @@ def _run_cellwise_pipeline(
                     log_training_history_charts_from_csv(
                         wandb_run,
                         model_dir / "training_history.csv",
-                        prefix="Training_History",
+                        prefix=f"Training_History/{model_name.upper()}",
                     )
 
         if wandb_run is not None and config.wandb.log_media:
+            for model_name in config.all_models():
+                model_dir = run_dir / "models" / model_name
+                chart_prefix = f"Multi_Output/{model_name.upper()}"
+                log_prediction_charts_from_csv(
+                    wandb_run,
+                    model_dir / "predictions_raw.csv",
+                    prefix=chart_prefix,
+                )
+                log_metric_distribution_charts_from_csv(
+                    wandb_run,
+                    model_dir / "metrics_per_gene.csv",
+                    prefix=chart_prefix,
+                )
+
             max_media = config.wandb.media_max_items
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=["models/*/scatter_train.png"],
-                max_items=max_media,
-                group_key="Plots/Scatter/Train",
-            )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=["models/*/scatter_val.png"],
-                max_items=max_media,
-                group_key="Plots/Scatter/Val",
-            )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=["models/*/scatter_test.png"],
-                max_items=max_media,
-                group_key="Plots/Scatter/Test",
-            )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=["models/*/residuals.png"],
-                max_items=max_media,
-                group_key="Plots/Residuals",
-            )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=["models/*/residuals_bar.png"],
-                max_items=max_media,
-                group_key="Plots/Residuals/Bar",
-            )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=[
-                    "models/*/training_history_loss.png",
-                ],
-                max_items=max_media,
-                group_key="Plots/Training_History/Loss",
-            )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=[
-                    "models/*/training_history_pearson.png",
-                ],
-                max_items=max_media,
-                group_key="Plots/Training_History/Pearson",
-            )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=[
-                    "models/*/training_history_spearman.png",
-                ],
-                max_items=max_media,
-                group_key="Plots/Training_History/Spearman",
-            )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=[
-                    "models/*/training_history_r2.png",
-                ],
-                max_items=max_media,
-                group_key="Plots/Training_History/R2",
-            )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
@@ -2627,30 +2517,6 @@ def _run_cellwise_pipeline(
                 ],
                 max_items=max_media,
                 group_key="Plots/SHAP/TSS_Distance",
-            )
-            # Skip per-gene FI/SHAP panel uploads to avoid high-volume W&B media spam.
-            metric_labels = {
-                "pearson": "Pearson",
-                "r2": "R2",
-                "spearman": "Spearman",
-                "rmse": "RMSE",
-                "mse": "MSE",
-                "mae": "MAE",
-            }
-            for metric in _METRIC_ORDER:
-                log_images_from_globs(
-                    wandb_run,
-                    run_dir,
-                    patterns=[f"models/*/by_split_{metric}.png"],
-                    max_items=max_media,
-                    group_key=f"Plots/{metric_labels[metric]}",
-                )
-            log_images_from_globs(
-                wandb_run,
-                run_dir,
-                patterns=["models/*/generalization_gap_pearson_train_test.png"],
-                max_items=max_media,
-                group_key="Plots/Generalization_Gap",
             )
 
         if wandb_run is not None and config.wandb.log_artifacts:

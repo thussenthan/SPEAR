@@ -53,6 +53,7 @@ _RESOURCE_TRACKER = {
 }
 _CPU_PRIMED = False
 _FAST_CLASSICAL_MODELS = {"svr", "lasso", "elastic_net", "hist_gradient_boosting", "catboost"}
+FAST_MODE_MIN_PSEUDOBULK_GROUP_SIZE = 8
 
 
 def _get_gpu_utilization_pct() -> Optional[float]:
@@ -1365,13 +1366,20 @@ def train_multi_output_model(
         runtime_config = replace(config)
         runtime_config.enable_smoothing = False
         runtime_config.smoothing_k = 1
-        runtime_config.pseudobulk_group_size = 1
-        runtime_config.group_key = None
         runtime_config.k_folds = min(config.k_folds, 2)
+        if model_name == "svr":
+            # SVR is especially costly on large single-cell folds; increase
+            # pseudobulk aggregation in fast mode to keep runtime bounded.
+            runtime_config.pseudobulk_group_size = max(
+                config.pseudobulk_group_size,
+                FAST_MODE_MIN_PSEUDOBULK_GROUP_SIZE,
+            )
         _LOG.info(
-            "Fast classical mode active | model=%s | k_folds=%d | smoothing=off | pseudobulk_group_size=1",
+            "Fast classical mode active | model=%s | k_folds=%d | smoothing=off | pseudobulk_group_size=%d | group_key=%s",
             model_name,
             runtime_config.k_folds,
+            runtime_config.pseudobulk_group_size,
+            runtime_config.group_key if runtime_config.group_key else "none",
         )
 
     cache_key = _cellwise_cache_key(dataset, runtime_config)

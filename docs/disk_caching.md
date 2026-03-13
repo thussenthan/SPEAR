@@ -102,7 +102,7 @@ data/.spear_cache/
 #### Step 1 – Prepare Datasets
 
 ```bash
-cd /gpfs/Home/tqw5435/uzun/spear
+cd /path/to/SPEAR
 python scripts/prepare_datasets.py
 ```
 

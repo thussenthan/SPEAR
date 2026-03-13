@@ -132,12 +132,17 @@ def infer_dataset_name(config: PipelineConfig) -> Optional[str]:
 
 def _build_wandb_config_payload(config: PipelineConfig) -> Dict[str, Any]:
     training_payload = asdict(config.training)
+    run_context = config.run_context or {}
+    slurm_job_id = run_context.get("slurm_job") or os.getenv("SLURM_JOB_ID")
+    slurm_array_task_id = run_context.get("slurm_task") or os.getenv("SLURM_ARRAY_TASK_ID")
     payload = {
         "dataset": infer_dataset_name(config),
         "max_genes": config.max_genes,
         "num_requested_genes": len(config.genes) if config.genes else None,
         "chromosomes": config.chromosomes,
         "model": (config.all_models()[0] if config.all_models() else None),
+        "slurm_job_id": slurm_job_id,
+        "slurm_array_task_id": slurm_array_task_id,
         "training": training_payload,
     }
     # Remove noisy training fields from W&B config to avoid redundancy.
@@ -544,6 +549,183 @@ def log_training_history_charts_from_csv(
             run.log({f"Charts/{prefix}/{label}": chart})
         except Exception:
             _LOG.debug("Failed to log W&B history chart %s (%s)", label, csv_path, exc_info=True)
+
+
+def log_prediction_charts_from_csv(
+    run: Optional[Any],
+    csv_path: Path,
+    *,
+    prefix: str,
+) -> None:
+    if run is None:
+        return
+    if wandb is None:
+        return
+    if not csv_path.exists():
+        return
+    try:
+        import pandas as pd
+    except Exception:
+        _LOG.debug("pandas unavailable for W&B prediction charts", exc_info=True)
+        return
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        _LOG.debug("Failed to read CSV for W&B prediction charts: %s", csv_path, exc_info=True)
+        return
+    if df.empty or "y_true" not in df.columns or "y_pred" not in df.columns:
+        return
+
+    numeric = df[["y_true", "y_pred"]].apply(pd.to_numeric, errors="coerce").dropna()
+    if numeric.empty:
+        return
+
+    try:
+        scatter_table = wandb.Table(dataframe=numeric)
+        scatter_chart = wandb.plot.scatter(
+            scatter_table,
+            x="y_true",
+            y="y_pred",
+            title=f"{prefix} | Predicted vs Actual",
+        )
+        run.log({f"Charts/{prefix}/Predictions/Scatter": scatter_chart})
+    except Exception:
+        _LOG.debug("Failed to log W&B prediction scatter chart (%s)", csv_path, exc_info=True)
+
+    if "split" in df.columns:
+        split_df = df[["split", "y_true", "y_pred"]].copy()
+        split_df["y_true"] = pd.to_numeric(split_df["y_true"], errors="coerce")
+        split_df["y_pred"] = pd.to_numeric(split_df["y_pred"], errors="coerce")
+        split_df = split_df.dropna(subset=["split", "y_true", "y_pred"])
+        if not split_df.empty:
+            mean_rows = []
+            for split_name, split_rows in split_df.groupby("split"):
+                if split_rows.empty:
+                    continue
+                chart_split = str(split_name).title()
+                try:
+                    table = wandb.Table(dataframe=split_rows[["y_true", "y_pred"]])
+                    chart = wandb.plot.scatter(
+                        table,
+                        x="y_true",
+                        y="y_pred",
+                        title=f"{prefix} | {chart_split} Predicted vs Actual",
+                    )
+                    run.log({f"Charts/{prefix}/Predictions/Scatter_By_Split/{chart_split}": chart})
+                except Exception:
+                    _LOG.debug("Failed to log W&B split scatter chart (%s)", csv_path, exc_info=True)
+
+                residuals = (split_rows["y_pred"] - split_rows["y_true"]).dropna()
+                if residuals.empty:
+                    continue
+                try:
+                    res_table = wandb.Table(dataframe=pd.DataFrame({"residual": residuals}))
+                    res_chart = wandb.plot.histogram(
+                        res_table,
+                        "residual",
+                        title=f"{prefix} | {chart_split} Residual Distribution",
+                    )
+                    run.log({f"Charts/{prefix}/Residuals/Histogram/{chart_split}": res_chart})
+                except Exception:
+                    _LOG.debug("Failed to log W&B residual histogram (%s)", csv_path, exc_info=True)
+                mean_rows.append({"split": chart_split, "mean_residual": float(residuals.mean())})
+
+            if mean_rows:
+                try:
+                    mean_table = wandb.Table(dataframe=pd.DataFrame(mean_rows))
+                    mean_chart = wandb.plot.bar(
+                        mean_table,
+                        "split",
+                        "mean_residual",
+                        title=f"{prefix} | Mean Residual by Split",
+                    )
+                    run.log({f"Charts/{prefix}/Residuals/Mean_By_Split": mean_chart})
+                except Exception:
+                    _LOG.debug("Failed to log W&B mean residual bar chart (%s)", csv_path, exc_info=True)
+
+
+def log_metric_distribution_charts_from_csv(
+    run: Optional[Any],
+    csv_path: Path,
+    *,
+    prefix: str,
+) -> None:
+    if run is None:
+        return
+    if wandb is None:
+        return
+    if not csv_path.exists():
+        return
+    try:
+        import pandas as pd
+    except Exception:
+        _LOG.debug("pandas unavailable for W&B metric charts", exc_info=True)
+        return
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        _LOG.debug("Failed to read CSV for W&B metric charts: %s", csv_path, exc_info=True)
+        return
+    if df.empty:
+        return
+
+    metrics = ("pearson", "r2", "spearman", "rmse", "mse", "mae")
+    for metric in metrics:
+        split_means = []
+        for split in ("train", "val", "test"):
+            col = f"{split}_{metric}"
+            if col not in df.columns:
+                continue
+            values = pd.to_numeric(df[col], errors="coerce").dropna()
+            if values.empty:
+                continue
+            split_label = split.title()
+            split_means.append({"split": split_label, "mean": float(values.mean())})
+            try:
+                hist_table = wandb.Table(dataframe=pd.DataFrame({"value": values}))
+                hist_chart = wandb.plot.histogram(
+                    hist_table,
+                    "value",
+                    title=f"{prefix} | {split_label} {metric.upper()} Distribution",
+                )
+                run.log({f"Charts/{prefix}/Metrics/{metric.upper()}/Histogram/{split_label}": hist_chart})
+            except Exception:
+                _LOG.debug(
+                    "Failed to log W&B metric histogram %s (%s)",
+                    col,
+                    csv_path,
+                    exc_info=True,
+                )
+        if split_means:
+            try:
+                mean_table = wandb.Table(dataframe=pd.DataFrame(split_means))
+                mean_chart = wandb.plot.bar(
+                    mean_table,
+                    "split",
+                    "mean",
+                    title=f"{prefix} | {metric.upper()} Mean by Split",
+                )
+                run.log({f"Charts/{prefix}/Metrics/{metric.upper()}/Mean_By_Split": mean_chart})
+            except Exception:
+                _LOG.debug("Failed to log W&B metric mean bar chart %s (%s)", metric, csv_path, exc_info=True)
+
+    if "train_pearson" in df.columns and "test_pearson" in df.columns:
+        train_vals = pd.to_numeric(df["train_pearson"], errors="coerce")
+        test_vals = pd.to_numeric(df["test_pearson"], errors="coerce")
+        mask = train_vals.notna() & test_vals.notna()
+        if mask.any():
+            gaps = (train_vals[mask] - test_vals[mask]).dropna()
+            if not gaps.empty:
+                try:
+                    gap_table = wandb.Table(dataframe=pd.DataFrame({"value": gaps}))
+                    gap_chart = wandb.plot.histogram(
+                        gap_table,
+                        "value",
+                        title=f"{prefix} | Train-Test Pearson Gap",
+                    )
+                    run.log({f"Charts/{prefix}/Generalization_Gap/Pearson_Train_Test": gap_chart})
+                except Exception:
+                    _LOG.debug("Failed to log W&B generalization gap chart (%s)", csv_path, exc_info=True)
 
 
 def log_images_from_globs(
