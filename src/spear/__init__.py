@@ -2,7 +2,6 @@
 
 from .config import PipelineConfig, PathsConfig, TrainingConfig, ModelConfig
 
-
 __all__ = [
     "PipelineConfig",
     "PathsConfig",

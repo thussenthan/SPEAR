@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence
 
@@ -18,7 +17,9 @@ BY_SPLIT_FIGSIZE = (8.4, 4.9)
 FEATURE_IMPORTANCE_FIGSIZE = (9.0, 5.0)
 
 
-def _iter_violin_collections(ax: plt.Axes, collection_start: int) -> list[PolyCollection]:
+def _iter_violin_collections(
+    ax: plt.Axes, collection_start: int
+) -> list[PolyCollection]:
     return [
         collection
         for collection in ax.collections[collection_start:]
@@ -26,7 +27,9 @@ def _iter_violin_collections(ax: plt.Axes, collection_start: int) -> list[PolyCo
     ]
 
 
-def _violin_centers(polys: Sequence[PolyCollection]) -> list[tuple[float, PolyCollection]]:
+def _violin_centers(
+    polys: Sequence[PolyCollection],
+) -> list[tuple[float, PolyCollection]]:
     centers: list[tuple[float, PolyCollection]] = []
     for poly in polys:
         paths = poly.get_paths()
@@ -50,7 +53,12 @@ def plot_predictions_vs_actual(
 ) -> None:
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
-    mask = (~np.isnan(y_true)) & (~np.isnan(y_pred)) & (~np.isinf(y_true)) & (~np.isinf(y_pred))
+    mask = (
+        (~np.isnan(y_true))
+        & (~np.isnan(y_pred))
+        & (~np.isinf(y_true))
+        & (~np.isinf(y_pred))
+    )
     y_true = y_true[mask]
     y_pred = y_pred[mask]
     if y_true.size == 0:
@@ -70,7 +78,13 @@ def plot_predictions_vs_actual(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(7, 7))
     plt.scatter(y_true, y_pred, s=10, alpha=0.3, edgecolor="none")
-    plt.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="crimson", linewidth=1.5)
+    plt.plot(
+        [min_val, max_val],
+        [min_val, max_val],
+        linestyle="--",
+        color="crimson",
+        linewidth=1.5,
+    )
     plt.xlabel("Actual expression")
     plt.ylabel("Predicted expression")
     plt.title(title)
@@ -81,6 +95,7 @@ def plot_predictions_vs_actual(
         else:
             metrics = annotation_metrics
             mean_override = True
+
         def _fmt(value: float) -> str:
             return "nan" if not np.isfinite(value) else f"{value:.3f}"
 
@@ -114,85 +129,6 @@ def plot_predictions_vs_actual(
     plt.tight_layout()
     plt.savefig(output_path, dpi=300)
     plt.close()
-
-
-def plot_predictions_vs_actual_by_split(
-    y_true_by_split: Dict[str, np.ndarray],
-    y_pred_by_split: Dict[str, np.ndarray],
-    output_path: Path,
-    title_prefix: str,
-    annotation_metrics_by_split: Optional[Dict[str, Dict[str, float]]] = None,
-    sample_size: Optional[int] = 200_000,
-) -> None:
-    if not y_true_by_split or not y_pred_by_split:
-        return
-    splits = [s for s in ("train", "val", "test") if s in y_true_by_split and s in y_pred_by_split]
-    if not splits:
-        return
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, len(splits), figsize=(6 * len(splits), 5), squeeze=False)
-    axes = axes[0]
-
-    for ax, split in zip(axes, splits):
-        y_true = np.asarray(y_true_by_split[split], dtype=np.float64)
-        y_pred = np.asarray(y_pred_by_split[split], dtype=np.float64)
-        mask = (~np.isnan(y_true)) & (~np.isnan(y_pred)) & (~np.isinf(y_true)) & (~np.isinf(y_pred))
-        y_true = y_true[mask]
-        y_pred = y_pred[mask]
-        if y_true.size == 0:
-            ax.axis("off")
-            continue
-
-        if sample_size is not None and y_true.size > sample_size:
-            rng = np.random.default_rng(42)
-            idx = rng.choice(y_true.size, size=sample_size, replace=False)
-            y_true = y_true[idx]
-            y_pred = y_pred[idx]
-
-        min_val = float(min(y_true.min(), y_pred.min()))
-        max_val = float(max(y_true.max(), y_pred.max()))
-        if min_val == max_val:
-            max_val = min_val + 1.0
-
-        ax.scatter(y_true, y_pred, s=10, alpha=0.3, edgecolor="none")
-        ax.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="crimson", linewidth=1.5)
-        ax.set_xlabel("Actual expression")
-        ax.set_ylabel("Predicted expression")
-        ax.set_title(f"{title_prefix} | {split}")
-
-        metrics = None
-        if annotation_metrics_by_split is not None:
-            metrics = annotation_metrics_by_split.get(split)
-        if metrics is None:
-            metrics = regression_metrics(y_true, y_pred)
-
-        def _fmt(value: float) -> str:
-            return "nan" if not np.isfinite(value) else f"{value:.3f}"
-
-        lines = []
-        r2_val = metrics.get("r2") if metrics is not None else None
-        if r2_val is not None:
-            lines.append(f"$R^2={_fmt(r2_val)}$")
-        pearson_val = metrics.get("pearson") if metrics is not None else None
-        if pearson_val is not None:
-            lines.append(f"Pearson={_fmt(pearson_val)}")
-        spearman_val = metrics.get("spearman") if metrics is not None else None
-        if spearman_val is not None:
-            lines.append(f"Spearman={_fmt(spearman_val)}")
-        text = "\n".join(lines)
-        if text:
-            ax.text(
-                min_val + 0.05 * (max_val - min_val),
-                max_val - 0.12 * (max_val - min_val),
-                text,
-                fontsize=11,
-                bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
-            )
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
 
 
 def plot_box_violin_half_split(
@@ -266,13 +202,20 @@ def plot_box_violin_half_split(
         showfliers=False,
         medianprops={"color": "#222222", "linewidth": 1.0},
     )
-    def _mix_with_white(color: tuple[float, float, float], factor: float = 0.45) -> tuple[float, float, float]:
+
+    def _mix_with_white(
+        color: tuple[float, float, float], factor: float = 0.45
+    ) -> tuple[float, float, float]:
         r, g, b = color
         return (1 - (1 - r) * factor, 1 - (1 - g) * factor, 1 - (1 - b) * factor)
 
     for idx, patch in enumerate(box["boxes"]):
         base = palette[idx] if idx < len(palette) else (0.7, 0.7, 0.7)
-        patch.set(facecolor=_mix_with_white(base, factor=0.4), edgecolor="#222222", linewidth=1.0)
+        patch.set(
+            facecolor=_mix_with_white(base, factor=0.4),
+            edgecolor="#222222",
+            linewidth=1.0,
+        )
     for whisker in box["whiskers"]:
         whisker.set(color="#222222", linewidth=1.0)
     for cap in box["caps"]:
@@ -325,21 +268,6 @@ def plot_single_box_violin(
         ylabel,
         order=[""],
     )
-
-
-def plot_residual_histogram(y_true: np.ndarray, y_pred: np.ndarray, output_path: Path, title: str) -> None:
-    y_true = np.asarray(y_true, dtype=np.float64)
-    y_pred = np.asarray(y_pred, dtype=np.float64)
-    residuals = y_pred - y_true
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(7, 4))
-    sns.histplot(residuals, bins=50, kde=True)
-    plt.xlabel("Residual (prediction - actual)")
-    plt.ylabel("Count")
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300)
-    plt.close()
 
 
 def plot_residual_histogram_by_split(
@@ -442,7 +370,10 @@ def plot_per_gene_feature_panel(
     sanitized = block_df.copy()
     sanitized = sanitized.sort_values("importance_mean", ascending=False)
     subset = sanitized.head(max(1, top_n)).copy()
-    has_distance = "signed_distance_to_tss_kb" in sanitized.columns and sanitized["signed_distance_to_tss_kb"].notna().any()
+    has_distance = (
+        "signed_distance_to_tss_kb" in sanitized.columns
+        and sanitized["signed_distance_to_tss_kb"].notna().any()
+    )
     cols = 2 if has_distance else 1
     fig_height = max(4.0, subset.shape[0] * 0.35)
     fig, axes = plt.subplots(1, cols, figsize=(cols * 5.5, fig_height))
@@ -464,7 +395,9 @@ def plot_per_gene_feature_panel(
 
     if has_distance:
         scatter_ax = axes[1]
-        scatter_data = sanitized.dropna(subset=["signed_distance_to_tss_kb", "importance_mean"])
+        scatter_data = sanitized.dropna(
+            subset=["signed_distance_to_tss_kb", "importance_mean"]
+        )
         scatter_ax.scatter(
             scatter_data["signed_distance_to_tss_kb"],
             scatter_data["importance_mean"],
@@ -481,59 +414,6 @@ def plot_per_gene_feature_panel(
     fig.suptitle(f"Feature importance panel | {gene_name}", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.98))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
-
-
-def save_metric_table(metrics: Dict[str, float], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["metric,value"] + [f"{name},{value}" for name, value in metrics.items()]
-    output_path.write_text("\n".join(lines) + "\n")
-
-
-def plot_residual_barplot(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    gene_names: Sequence[str],
-    output_path: Path,
-    title: str,
-    top_n: int = 30,
-) -> None:
-    y_true = np.asarray(y_true, dtype=np.float64)
-    y_pred = np.asarray(y_pred, dtype=np.float64)
-    if y_true.ndim != 2 or y_pred.ndim != 2 or y_true.shape != y_pred.shape:
-        return
-    if y_true.size == 0:
-        return
-
-    residuals = y_pred - y_true
-    mae = np.nanmean(np.abs(residuals), axis=0)
-    mean_res = np.nanmean(residuals, axis=0)
-
-    if mae.size == 0:
-        return
-
-    order = np.argsort(mae)[::-1]
-    limit = min(top_n, mae.size)
-    idx = order[:limit]
-
-    selected_genes = np.asarray(gene_names)[idx]
-    selected_mae = mae[idx]
-    selected_mean = mean_res[idx]
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig_height = max(4.0, limit * 0.3)
-    fig, ax = plt.subplots(figsize=(10, fig_height))
-    bar_colors = ["#d62728" if val >= 0 else "#1f77b4" for val in selected_mean]
-    y_positions = np.arange(limit)
-    ax.barh(y_positions, selected_mae, color=bar_colors)
-    ax.set_yticks(y_positions)
-    ax.set_yticklabels(selected_genes)
-    ax.invert_yaxis()  # put largest residuals at the top for readability
-    ax.set_xlabel("Mean absolute residual")
-    ax.set_ylabel("Gene")
-    ax.set_title(title)
-    fig.tight_layout()
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
@@ -608,107 +488,6 @@ def plot_residual_barplot_by_split(
     plt.close(fig)
 
 
-def plot_correlation_box_violin(
-    values: Sequence[float],
-    output_path: Path,
-    title: str,
-    metric_label: str,
-) -> None:
-    plot_single_box_violin(values, output_path, title, metric_label)
-
-
-def plot_correlation_boxplot(
-    values: Sequence[float],
-    output_path: Path,
-    title: str,
-    metric_label: str,
-    axes: plt.Axes | None = None,
-) -> None:
-    if axes is not None:
-        arr = np.asarray(values, dtype=np.float64)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            return
-        plot_df = pd.DataFrame({"group": ["" for _ in range(arr.size)], "value": arr})
-        collection_start = len(axes.collections)
-        sns.violinplot(
-            data=plot_df,
-            x="group",
-            y="value",
-            hue="group",
-            order=[""],
-            palette="Set2",
-            legend=False,
-            inner=None,
-            cut=0,
-            width=0.4,
-            linewidth=1.0,
-            ax=axes,
-        )
-        violin_polys = _iter_violin_collections(axes, collection_start)
-        for center, poly in _violin_centers(violin_polys):
-            for path in poly.get_paths():
-                verts = path.vertices
-                verts[:, 0] = np.clip(verts[:, 0], center, np.inf)
-        box = axes.boxplot(
-            [arr],
-            positions=[-0.2],
-            widths=0.2,
-            patch_artist=True,
-            showfliers=False,
-            medianprops={"color": "#222222", "linewidth": 1.0},
-        )
-        palette = sns.color_palette("Set2", n_colors=1)
-        r, g, b = palette[0]
-        box["boxes"][0].set(
-            facecolor=(1 - (1 - r) * 0.4, 1 - (1 - g) * 0.4, 1 - (1 - b) * 0.4),
-            edgecolor="#222222",
-            linewidth=1.0,
-        )
-        for whisker in box["whiskers"]:
-            whisker.set(color="#222222", linewidth=1.0)
-        for cap in box["caps"]:
-            cap.set(color="#222222", linewidth=1.0)
-        rng = np.random.default_rng(42)
-        jitter = rng.normal(0, 0.03, size=arr.size)
-        scatter_color = tuple(max(0.0, c * 0.72) for c in (r, g, b))
-        axes.scatter(
-            np.full(arr.size, -0.2) + jitter,
-            arr,
-            s=10,
-            alpha=0.42,
-            color=scatter_color,
-            linewidth=0,
-            zorder=4,
-        )
-        axes.set_xlim(-0.6, 0.4)
-        axes.set_xlabel("")
-        axes.set_ylabel(metric_label)
-        axes.set_xticks([0])
-        axes.set_xticklabels([""])
-        axes.set_title(title)
-        sns.despine(ax=axes, left=True, bottom=True)
-        return
-    plot_correlation_box_violin(values, output_path, title, metric_label)
-
-
-def plot_correlation_violin(
-    values: Sequence[float],
-    output_path: Path,
-    title: str,
-    metric_label: str,
-    axes: plt.Axes | None = None,
-) -> None:
-    if axes is not None:
-        arr = np.asarray(values, dtype=np.float64)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            return
-        plot_correlation_boxplot(values, output_path, title, metric_label, axes=axes)
-        return
-    plot_correlation_box_violin(values, output_path, title, metric_label)
-
-
 def plot_importance_distance_scatter(
     importances: Sequence[float],
     distances_kb: Sequence[float],
@@ -734,7 +513,9 @@ def plot_importance_distance_scatter(
     order = np.argsort(dist)
     dist_sorted = dist[order]
     imp_sorted = imp[order]
-    rolling = pd.Series(imp_sorted).rolling(window=rolling_window, min_periods=10).median()
+    rolling = (
+        pd.Series(imp_sorted).rolling(window=rolling_window, min_periods=10).median()
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(7, 5))
@@ -753,7 +534,9 @@ def plot_importance_distance_scatter(
     plt.ylabel("Feature importance")
     plt.title(title)
     if annotation:
-        text = "\n".join(f"{k}={v:.3f}" for k, v in annotation.items() if np.isfinite(v))
+        text = "\n".join(
+            f"{k}={v:.3f}" for k, v in annotation.items() if np.isfinite(v)
+        )
         if text:
             plt.text(
                 0.03,
@@ -837,7 +620,6 @@ def plot_training_history_curves(
         val_col = f"val_{metric_clean}"
 
     curves = []
-    labels = []
     if include_train and train_col in history:
         curves.append((history[train_col], "Train"))
     if include_val and val_col in history:
@@ -867,34 +649,6 @@ def plot_training_history_curves(
     plt.title(title)
     if len(curves) > 1:
         plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300)
-    plt.close()
-
-
-def plot_training_history_series(
-    history: pd.DataFrame,
-    column: str,
-    output_path: Path,
-    title: str,
-    ylabel: str,
-) -> None:
-    if history.empty or "epoch" not in history.columns or column not in history.columns:
-        return
-
-    series = pd.to_numeric(history[column], errors="coerce")
-    finite = series.dropna()
-    if finite.empty:
-        return
-    if finite.nunique(dropna=True) <= 1:
-        return
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(7.5, 4.5))
-    plt.plot(history["epoch"], history[column], linewidth=2.0)
-    plt.xlabel("Epoch")
-    plt.ylabel(ylabel)
-    plt.title(title)
     plt.tight_layout()
     plt.savefig(output_path, dpi=300)
     plt.close()

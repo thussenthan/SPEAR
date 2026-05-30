@@ -87,13 +87,13 @@ This runbook connects the biological motivation for the mouse embryonic stem cel
 
 - Review `README.md` for the current pipeline behavior and defaults.
 - Consult `docs/config_reference.md` for every CLI flag supported by `src`.
-- Determine the gene manifest(s), chromosome scope, window size, and training overrides for your planned run; record these in `todo.md` or a run sheet.
+- Determine the gene manifest(s), chromosome scope, window size, and training overrides for your planned run; record these in a run sheet or tracked run inventory.
 - For ResNet experiments, decide whether to keep squeeze-excitation attention (`--resnet-attention se`, default) or run an ablation with `--resnet-attention none`; tune bottleneck capacity with `--resnet-attention-se-reduction`.
 - For SVR runs, note that `TrainingConfig` exposes `svr_kernel`, `svr_C`, `svr_epsilon`, `svr_max_iter`, and `svr_tol` with defaults documented in `docs/config_reference.md`.
 
 ### Stage 3 - Computer science perspective
 
-- Many script parameters have sensible defaults but interact (e.g., `--multi-output` with chunk count); reviewing the reference prevents invalid combinations.
+- Many script parameters have sensible defaults but interact. Per-gene is now the default analysis mode; use `--multi-output` only for explicit legacy comparisons, and review the reference before combining it with chunking or gene-count overrides.
 - Knowing the configuration space upfront facilitates reproducibility by enabling exact command reconstruction from logged YAML/JSON artifacts.
 
 ### Stage 3 - Biology perspective
@@ -128,10 +128,11 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 ### Stage 6 - Practical steps
 
 - Execute a CPU-only smoke run (via `spear` or module form):  
-  `spear --models mlp --gene-manifest data/embryonic/manifests/selected_genes_10.csv --device cpu --k-folds 2 --epochs 2 --run-name dev_smoke_local`
+  `spear --models mlp --gene-manifest data/embryonic/manifests/selected_genes_10.csv --device cpu --k-folds 0 --epochs 2 --run-name dev_smoke_local`
 - Confirm outputs are generated successfully.
 - Inspect logs for import errors, missing data references, or serialization issues.
 - You can also run `python scripts/preflight_check.py` to validate environment, package availability, and data paths (AnnData/GTF) before queueing jobs.
+- If you maintain local W&B sweep YAMLs, run `python scripts/preflight_wandb_sweeps.py --base-dir . --sweep-dir <sweep_dir>` before submission. This validates sweep paths, manifest row counts, W&B tags/groups, model names, cache directories, and expected run-count accounting.
 
 ### Stage 6 - Computer science perspective
 
@@ -145,7 +146,8 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 
 ### Stage 7 - Practical steps
 
-- Use the templates in `jobs/` as starting points and adapt account, partition/queue, resources, and launcher commands for your environment. Map array indices to `(model, chunk)` combinations consistent with your manifest size.
+- Use your site-specific scheduler templates and keep private account, partition/queue, resource, and launcher details outside the public repository. Map array indices to `(model, chunk)` combinations consistent with your manifest size.
+- Treat private W&B entities, personal filesystem paths, scheduler accounts, and scratch command blocks as local overrides only. Public templates should rely on environment variables and documented paths.
 
 ### Stage 7 - Computer science perspective
 
@@ -216,4 +218,4 @@ Refer to the "Preprocessing Details", "Supported Models", and "Results & Visuali
 
 - Dataset specifics and download automation: `docs/mouse_esc_dataset.md`, `docs/endothelial_dataset.md`
 - Configuration dictionary: `docs/config_reference.md`
-- Job submission templates are provided in `jobs/` and should be customized for your infrastructure.
+- Scheduler submission templates should be maintained locally and customized for your infrastructure.

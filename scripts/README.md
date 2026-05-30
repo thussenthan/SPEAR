@@ -19,13 +19,19 @@ Summary of helper scripts for data preparation, aggregation, and reporting.
 
 ### Core Pipeline Scripts
 
-- `select_random_genes.py` – validate expression thresholds and build reusable gene manifests.
-- `combine_filtered.py`, `preprocess.py` – data wrangling helpers used prior to training
-- `preprocess_endothelial.py` – preprocess endothelial dataset
-- `download_mesc_raw_data.py` – download raw mouse ESC data
+- `download_geo_raw_data.py` – canonical raw-data download/staging entrypoint for embryonic and endothelial datasets.
+- `preprocess_geo_raw_to_spear.py` – canonical sample-first preprocessing entrypoint for GEO raw multiome inputs.
+- `generate_all_sample_manifests.py` – build per-sample `random`, `hvg`, and `low_noisy` manifests, with optional peak-count annotation/filtering for peak-only sweeps.
+- `prepare_10x_pbmc_multiome.py` – prepare the public 10x PBMC multiome matrix into paired SPEAR-compatible RNA/ATAC AnnData files and manifests.
+- `create_tiny_example_data.py` – create a synthetic paired ATAC/RNA mini dataset for install and CLI smoke tests.
+- `list_data_samples.py` – emit canonical sample order for Slurm arrays and wrappers.
+- `list_duplicate_runs.py` – inspect W&B projects for duplicate run names or fingerprints.
 - `combine_chunk_results.py` – stitch together per-chunk training outputs into unified result folders.
-- `plot_feature_importance_vs_tss.py` – plot feature importance relative to TSS
-- `preflight_check.py` – pre-flight checks before running pipeline
+- `plot_feature_importance_vs_tss.py` – plot feature importance relative to TSS.
+- `plot_shap_vs_tss.py` – plot SHAP attribution relative to TSS.
+- `plot_prediction_structure.py` – compare real versus predicted RNA cell structure from exported raw predictions.
+- `preflight_check.py` – pre-flight checks before running the training pipeline.
+- `preflight_wandb_sweeps.py` – validate local sweep YAML paths, manifest row counts, W&B tags/groups, model names, cache directories, and expected run-count accounting before W&B submission.
 
 ### Results Analysis & Reporting Scripts
 

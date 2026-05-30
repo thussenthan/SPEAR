@@ -1,17 +1,43 @@
-# Large/local data & scratch
+# Data, generated outputs, and external tool logs
 data/
-jobs/
-work/
 output/
 wandb/
+ArchRLogs/
+analysis/figs/
+analysis/reports/
+wandb_export_*.csv
+*.pptx
+
+# Local HPC / private workflow files
+jobs/
+comparision/
+
+# Local manuscript planning and private workspace notes
+docs/resubmission_master_plan.md
+docs/resubmission_todo.md
+/resubmission_todo.md
 todo.md
+work/
+.archive/
+.claude/
+CLAUDE.md
+.codex
+AGENTS.md
 
 # Local editor settings
 .vscode/
 
-# Python and notebooks
+# Python, notebook, and tooling caches
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
 *cache/
+
+# Scheduler and runtime logs
+*.out
+*.err
+*.log
+slurm-*.out

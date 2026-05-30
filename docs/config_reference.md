@@ -33,18 +33,21 @@ their defaults.
 | `--max-genes`                     | int       | `None`                                                 | Hard cap on genes processed in per-gene mode. Multi-output uses full filtered set unless explicitly set. |
 | `--models`                        | list[str] | `['cnn','rnn','lstm','mlp','xgboost','random_forest']` | Replace the default model roster (graph, catboost, etc. can be specified explicitly).                    |
 | `--extra-models`                  | list[str] | `[]`                                                   | Extend the model roster without replacing defaults.                                                      |
-| `--k-folds`                       | int       | `5`                                                    | Number of CV folds.                                                                                      |
+| `--k-folds`                       | int       | `0`                                                    | Number of CV folds; use `0` or `1` to disable CV.                                                        |
 | `--train-fraction`                | float     | `0.70`                                                 | Train split proportion (per-gene mode).                                                                  |
 | `--val-fraction`                  | float     | `0.15`                                                 | Validation split proportion.                                                                             |
 | `--test-fraction`                 | float     | `0.15`                                                 | Test split proportion.                                                                                   |
 | `--group-key`                     | str       | `sample`                                               | AnnData obs column to use for grouped splits (use `none` to disable).                                    |
-| `--window-bp`                     | int       | `10000`                                                | ATAC window size around each TSS.                                                                        |
+| `--window-bp`                     | int       | `250000`                                               | ATAC window size around each TSS.                                                                        |
 | `--bin-size-bp`                   | int       | `500`                                                  | ATAC bin size (peak resolution).                                                                         |
 | `--multioutput-feature-basis`     | enum      | `bin`                                                  | Feature basis for multi-output mode (`bin` for shared bins, `peak` for shared peaks).                    |
+| `--per-gene-feature-basis`        | enum      | `bin`                                                  | Feature basis for per-gene mode (`bin` or `peak`).                                                       |
+| `--per-gene-peak-min-peaks`       | int       | `10`                                                   | Minimum peaks required in a per-gene peak window; genes below this threshold are skipped, not converted to bins. |
+| `--per-gene-peak-distance-encoding` | enum    | `signed_linear`                                        | Explicit distance-to-TSS encoding for per-gene peak features (`none` or `signed_linear`).                 |
 | `--scaler`                        | enum      | `standard`                                             | Feature scaler (`standard`, `minmax`, `none`).                                                           |
 | `--target-scaler`                 | enum      | `standard`                                             | Target scaler (`standard`, `minmax`, `none`).                                                            |
 | `--force-target-scaling`          | flag      | `False`                                                | Apply target scaling even when targets are already log-transformed.                                      |
-| `--epochs`                        | int       | `100`                                                  | Training epochs for neural models.                                                                       |
+| `--epochs`                        | int       | `200`                                                  | Training epochs for neural models.                                                                       |
 | `--learning-rate`                 | float     | `1e-3`                                                 | Optimizer learning rate (torch models).                                                                  |
 | `--lr-scheduler`                  | enum      | `cosine`                                               | LR scheduler for torch models (`none`, `cosine`).                                                         |
 | `--warmup-epochs`                 | int       | `5`                                                    | Warmup epochs for LR scheduling.                                                                         |
@@ -56,8 +59,11 @@ their defaults.
 | `--pseudobulk-group-size`         | int       | `1`                                                    | Cells per pseudobulk neighborhood.                                                                       |
 | `--pseudobulk-pca-components`     | int       | `10`                                                   | PCA components for pseudobulk grouping.                                                                  |
 | `--disable-pseudobulk`            | flag      | `False`                                                | Shortcut to set `pseudobulk_group_size=1`.                                                               |
-| `--smoothing-k`                   | int       | `20`                                                   | Neighborhood size for k-NN smoothing (use 1 to disable).                                                 |
+| `--smoothing-k`                   | int       | `20`                                                   | Neighborhood size for k-NN smoothing applied to train/val/test after splitting (use 1 to disable).       |
 | `--smoothing-pca-components`      | int       | `10`                                                   | PCA components for k-NN smoothing.                                                                       |
+| `--smoothing-target`              | enum      | `all_splits`                                           | Splits to smooth: `all_splits`, `train_only`, or `none`.                                                 |
+| `--no-smoothing-y`                | flag      | `False`                                                | Smooth ATAC feature matrices only; leave RNA targets unchanged.                                          |
+| `--global-atac-components`        | int       | `0`                                                    | Append global ATAC cell-state SVD components to gene-local features.                                     |
 | `--disable-smoothing`             | flag      | `False`                                                | Disable k-NN smoothing of cells.                                                                         |
 | `--fast-classical-mode`           | flag      | `False`                                                | Faster profile for heavy classical multi-output models (svr/lasso/elastic_net/hist_gradient_boosting/catboost). |
 | `--resource-sample-seconds`       | float     | `60`                                                   | Interval (seconds) between resource usage samples.                                                       |
@@ -94,8 +100,8 @@ their defaults.
 | `--chunk-index`                   | int       | `0`                                                    | Gene chunk index (zero-based).                                                                           |
 | `--chunk-total`                   | int       | `1`                                                    | Number of gene chunks.                                                                                   |
 | `--config-json`                   | path      | `None`                                                 | Load pipeline configuration from JSON file.                                                              |
-| `--per-gene`                      | flag      | `False`                                                | Run per-gene training (one model per gene).                                                              |
-| `--multi-output`                  | flag      | `True` (unless `--per-gene`)                           | Enable cell-wise multi-output regression (default unless `--per-gene` is set).                           |
+| `--per-gene`                      | flag      | `True` by default                                      | Run per-gene training (one model per gene).                                                              |
+| `--multi-output`                  | flag      | `False`                                                | Enable cell-wise multi-output regression instead of the default per-gene mode.                           |
 | `--rf-n-estimators`               | int       | `None` (model-specific default)                        | Override random forest tree count.                                                                       |
 | `--rf-max-depth`                  | int       | `None`                                                 | Override maximum depth.                                                                                  |
 | `--rf-min-samples-leaf`           | int       | `None`                                                 | Override leaf size.                                                                                      |
@@ -108,16 +114,19 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 
 | Parameter                       | Default                        | Notes                                                                                                                             |
 | ------------------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `window_bp`                     | `10000`                        | +/- bp around TSS.                                                                                                                |
+| `window_bp`                     | `250000`                       | +/- bp around TSS.                                                                                                                |
 | `bin_size_bp`                   | `500`                          | ATAC bin resolution.                                                                                                              |
 | `multioutput_feature_basis`     | `bin`                          | Multi-output feature basis (`bin` for shared bins, `peak` for shared peaks).                                                      |
-| `k_folds`                       | `5`                            | Cross-validation folds.                                                                                                           |
+| `per_gene_feature_basis`        | `bin`                          | Per-gene feature basis (`bin` for aggregated windows, `peak` for one feature per ATAC peak, ordered by transcription direction). |
+| `per_gene_peak_min_peaks`       | `10`                           | Minimum peaks required for per-gene peak features; prevents silent fallback to bin features.                                       |
+| `per_gene_peak_distance_encoding` | `signed_linear`              | Distance-to-TSS encoding for peak features (adds a second channel for torch sequence models).                                      |
+| `k_folds`                       | `0`                            | Cross-validation folds; `0` or `1` disables CV.                                                                                   |
 | `train_fraction`                | `0.70`                         | Per-gene mode train split.                                                                                                        |
 | `val_fraction`                  | `0.15`                         | Per-gene mode validation split.                                                                                                   |
 | `test_fraction`                 | `0.15`                         | Per-gene mode test split.                                                                                                         |
-| `batch_size`                    | `512`                          | Torch mini-batch size.                                                                                                            |
+| `batch_size`                    | `4096`                         | Torch mini-batch size.                                                                                                            |
 | `effective_batch_cap`           | `48000`                        | Cap used to scale effective batch size in multi-output mode (`cap // target_dim`).                                                |
-| `epochs`                        | `100`                          | Torch training epochs.                                                                                                            |
+| `epochs`                        | `200`                          | Torch training epochs.                                                                                                            |
 | `learning_rate`                 | `1e-3`                         | Adam learning rate.                                                                                                               |
 | `lr_scheduler`                  | `cosine`                       | Learning-rate scheduling strategy (`none` or `cosine`).                                                                           |
 | `warmup_epochs`                 | `5`                            | Warmup in epochs before cosine decay.                                                                                             |
@@ -126,7 +135,7 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `gradient_accumulation_steps`   | `1`                            | Number of gradient accumulation steps per optimizer update.                                                                        |
 | `weight_decay`                  | `1e-5`                         | Adam weight decay.                                                                                                                |
 | `max_grad_norm`                 | `5.0`                          | Gradient clipping for torch models (cnn/rnn/lstm/transformer/mlp/dcn/resnet/graph).                                                |
-| `early_stopping_patience`       | `10`                           | Epoch patience on validation loss.                                                                                                |
+| `early_stopping_patience`       | `20`                           | Epoch patience on validation loss.                                                                                                |
 | `random_state`                  | `42`                           | RNG seed for reproducibility.                                                                                                     |
 | `device_preference`             | `cuda`                         | Preferred compute device.                                                                                                         |
 | `scaler`                        | `standard`                     | Feature scaling (set `none` to disable).                                                                                          |
@@ -135,14 +144,17 @@ Values below come from `TrainingConfig` and apply unless overridden via CLI or J
 | `log1p_transform`               | `False`                        | Additional log1p on targets if raw layer selected.                                                                                |
 | `target_scaler`                 | `standard`                     | Target scaling (skipped when `log1p_transform=True` or the RNA layer name starts with `log`, unless `force_target_scaling=True`). |
 | `force_target_scaling`          | `False`                        | Apply target scaling even when targets are already log-transformed.                                                               |
-| `enable_smoothing`              | `True`                         | Whether to apply k-NN smoothing within each split.                                                                                |
+| `enable_smoothing`              | `True`                         | Whether to apply k-NN smoothing to train/val/test after splitting, and to inference batches during prediction.                    |
 | `smoothing_k`                   | `20`                           | Neighborhood size for smoothing (use 1 to disable).                                                                               |
 | `smoothing_pca_components`      | `10`                           | PCA components for smoothing neighbor search.                                                                                     |
+| `smoothing_target`              | `all_splits`                   | Which splits receive k-NN smoothing: `all_splits`, `train_only`, or `none`.                                                       |
+| `smoothing_y`                   | `True`                         | Whether k-NN smoothing averages RNA targets along with ATAC features.                                                             |
+| `global_atac_components`        | `0`                            | Number of global ATAC cell-state SVD components to append to gene-local features; `0` disables this optional feature path.        |
 | `pseudobulk_group_size`         | `1`                            | Cells per pseudobulk aggregate (1 disables pooling).                                                                              |
 | `pseudobulk_pca_components`     | `10`                           | PCA dims for pseudobulk neighborhood search.                                                                                      |
 | `fast_classical_mode`           | `False`                        | When enabled, applies faster defaults for heavy classical multi-output models (reduced CV folds and lighter model settings).     |
-| `transformer_embed_dim`         | `128`                          | Transformer embedding size.                                                                                                       |
-| `transformer_num_layers`        | `2`                            | Transformer encoder depth.                                                                                                        |
+| `transformer_embed_dim`         | `256`                          | Transformer embedding size.                                                                                                       |
+| `transformer_num_layers`        | `4`                            | Transformer encoder depth.                                                                                                        |
 | `transformer_dropout`           | `0.2`                          | Transformer dropout for attention/MLP and final head.                                                                             |
 | `transformer_num_heads`         | `None`                         | Attention heads; auto-selected when unset, must divide embedding dim when set.                                                    |
 | `resnet_attention`              | `se`                           | Attention module in ResNet blocks (`se` or `none`).                                                                                |
@@ -230,9 +242,9 @@ Data files are not published with the repository; treat the defaults above as lo
 | `transformer` | Conv projection to 128 channels, adaptive pooling, configurable transformer encoder (`embed_dim`, `num_layers`, auto/explicit `num_heads`), dense head with GELU and configurable dropout. |
 | `graph`       | Implicit 1D graph message-passing network that chunkifies ATAC bins, applies learned edge weights, and aggregates through residual MLP layers.  |
 | `dcn`         | Deep & Cross Network with 3 cross layers and a 256→256→128 deep tower; concatenated outputs are linearly projected to targets.                  |
-| `mlp`         | Fully connected stack: 256→256→128 with LayerNorm + ReLU + dropout 0.2, output layer sized to target dimension.                                 |
+| `mlp`         | Fully connected stack: 256→256→128 with RMSNorm + ReLU + dropout 0.2, output layer sized to target dimension.                                   |
 
-Torch optimizers use `Adam(lr=1e-3, weight_decay=1e-5)` with automatic mixed precision when CUDA is available, plus optional cosine LR decay with warmup.
+Torch optimizers default to `AdamW(lr=1e-3, weight_decay=1e-5)` with automatic mixed precision when CUDA is available, plus optional cosine LR decay with warmup.
 
 #### Scikit-learn / XGBoost Models
 

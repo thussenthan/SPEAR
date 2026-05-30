@@ -16,7 +16,6 @@ and optionally concatenates `predictions_raw.csv`. Combined artifacts are writte
 to `output-root/RUN_NAME_MODEL` mirroring non-chunked runs.
 """
 
-
 import argparse
 import json
 import re
@@ -87,7 +86,9 @@ def discover_chunks(
     return grouped
 
 
-def load_dataframe(path: Path, add_cols: Optional[dict[str, int | str]] = None) -> pd.DataFrame:
+def load_dataframe(
+    path: Path, add_cols: Optional[dict[str, int | str]] = None
+) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(path)
     df = pd.read_csv(path)
@@ -117,7 +118,9 @@ def concat_and_dedupe(
             for col in remaining_cols:
                 if col in grouped.columns:
                     continue
-                grouped[col] = combined.groupby(subset, dropna=False)[col].first().values
+                grouped[col] = (
+                    combined.groupby(subset, dropna=False)[col].first().values
+                )
             return grouped
         combined = combined.drop_duplicates(subset=subset, keep="first")
     return combined.reset_index(drop=True)
@@ -146,7 +149,9 @@ def compute_split_means(metrics_per_gene: pd.DataFrame) -> pd.DataFrame:
     return grouped.sort_values("split").reset_index(drop=True)
 
 
-def combine_cv_metrics(cv_frames: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def combine_cv_metrics(
+    cv_frames: list[pd.DataFrame],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     filtered = [df for df in cv_frames if df is not None and not df.empty]
     if not filtered:
         return pd.DataFrame(), pd.DataFrame()
@@ -161,7 +166,9 @@ def combine_cv_metrics(cv_frames: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.
     return aggregated, merged
 
 
-def build_output_dirs(root: Path, base: str, model: str, overwrite: bool) -> tuple[Path, Path]:
+def build_output_dirs(
+    root: Path, base: str, model: str, overwrite: bool
+) -> tuple[Path, Path]:
     run_dir = root / f"{base}_{model}"
     model_dir = run_dir / "models" / model
     if run_dir.exists() and not overwrite:
@@ -254,7 +261,10 @@ def combine_chunks_for_model(
             metrics_with_chunk_frames.append(metrics_df)
             metrics_frames.append(metrics_df.drop(columns=["chunk_index"]))
         else:
-            print(f"[WARN] Missing metrics_per_gene.csv in {metrics_path}", file=sys.stderr)
+            print(
+                f"[WARN] Missing metrics_per_gene.csv in {metrics_path}",
+                file=sys.stderr,
+            )
 
         # CV metrics
         cv_path = record.model_dir / "metrics_cv.csv"
@@ -280,16 +290,33 @@ def combine_chunks_for_model(
     selected_all = concat_and_dedupe(selected_frames, subset=["gene_name", "gene_id"])
     selected_by_chunk = concat_and_dedupe(selected_frames)
     metrics_per_gene = concat_and_dedupe(metrics_frames, subset=["gene", "split"])
-    metrics_per_gene_by_chunk = concat_and_dedupe(metrics_with_chunk_frames, subset=None)
+    metrics_per_gene_by_chunk = concat_and_dedupe(
+        metrics_with_chunk_frames, subset=None
+    )
     metrics_aggregate = compute_split_means(metrics_per_gene)
     cv_aggregate, cv_by_chunk = combine_cv_metrics(cv_frames)
-    predictions_combined = concat_and_dedupe(predictions_frames, subset=["split", "cell_id", "gene"]) if predictions_frames else pd.DataFrame()
+    predictions_combined = (
+        concat_and_dedupe(predictions_frames, subset=["split", "cell_id", "gene"])
+        if predictions_frames
+        else pd.DataFrame()
+    )
 
     # Write outputs
-    write_dataframe(selected_all.sort_values("gene_name"), run_dir / "selected_genes.csv")
-    write_dataframe(selected_by_chunk.sort_values(["chunk_index", "gene_name"]), run_dir / "selected_genes_by_chunk.csv")
-    write_dataframe(metrics_per_gene.sort_values(["split", "gene"]), model_dir / "metrics_per_gene.csv")
-    write_dataframe(metrics_per_gene_by_chunk.sort_values(["chunk_index", "split", "gene"]), model_dir / "metrics_per_gene_by_chunk.csv")
+    write_dataframe(
+        selected_all.sort_values("gene_name"), run_dir / "selected_genes.csv"
+    )
+    write_dataframe(
+        selected_by_chunk.sort_values(["chunk_index", "gene_name"]),
+        run_dir / "selected_genes_by_chunk.csv",
+    )
+    write_dataframe(
+        metrics_per_gene.sort_values(["split", "gene"]),
+        model_dir / "metrics_per_gene.csv",
+    )
+    write_dataframe(
+        metrics_per_gene_by_chunk.sort_values(["chunk_index", "split", "gene"]),
+        model_dir / "metrics_per_gene_by_chunk.csv",
+    )
     write_dataframe(metrics_aggregate, model_dir / "metrics_aggregate.csv")
     if not cv_aggregate.empty:
         write_dataframe(cv_aggregate, model_dir / "metrics_cv.csv")
@@ -377,7 +404,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     for (base, model), records in sorted(grouped.items()):
-        print(f"[INFO] Found {len(records)} chunk folders for run '{base}' model '{model}'.")
+        print(
+            f"[INFO] Found {len(records)} chunk folders for run '{base}' model '{model}'."
+        )
         if args.dry_run:
             continue
         try:

@@ -1,4 +1,3 @@
-
 import argparse
 import json
 from pathlib import Path
@@ -95,7 +94,9 @@ def _knn_smooth_features(
         try:
             X_for_pca = scaler.fit_transform(X)
         except Exception as exc:  # pragma: no cover - defensive
-            _LOG.warning("Inference smoothing: scaler failed (%s); using raw features", exc)
+            _LOG.warning(
+                "Inference smoothing: scaler failed (%s); using raw features", exc
+            )
 
     try:
         pca = PCA(n_components=components, random_state=random_state)
@@ -114,8 +115,14 @@ def _knn_smooth_features(
 
     X_smoothed = np.zeros_like(X, dtype=np.float32)
     for i in range(n_cells):
-        neighbor_set = neighbor_indices[i, : k_neighbors + 1]  # includes the cell itself
-        X_smoothed[i] = np.asarray(X[neighbor_set], dtype=np.float64).mean(axis=0).astype(np.float32)
+        neighbor_set = neighbor_indices[
+            i, : k_neighbors + 1
+        ]  # includes the cell itself
+        X_smoothed[i] = (
+            np.asarray(X[neighbor_set], dtype=np.float64)
+            .mean(axis=0)
+            .astype(np.float32)
+        )
 
     _LOG.info(
         "Inference smoothing applied | cells=%d | k=%d | components=%d",
@@ -144,10 +151,29 @@ def predict(
     if not model_dir.exists():
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
 
+    model_meta_path = model_dir / "model_meta.json"
+    model_meta: dict = {}
+    if model_meta_path.exists():
+        try:
+            model_meta = json.loads(model_meta_path.read_text())
+        except Exception as exc:  # pragma: no cover - defensive
+            _LOG.warning("Failed to read model metadata %s: %s", model_meta_path, exc)
+            model_meta = {}
+
+    feature_block_indices = model_meta.get("feature_block_indices")
+    if feature_block_indices is not None and not isinstance(
+        feature_block_indices, list
+    ):
+        feature_block_indices = None
+
     feature_scaler_path = model_dir / "feature_scaler.pkl"
     target_scaler_path = model_dir / "target_scaler.pkl"
-    feature_scaler = joblib.load(feature_scaler_path) if feature_scaler_path.exists() else None
-    target_scaler = joblib.load(target_scaler_path) if target_scaler_path.exists() else None
+    feature_scaler = (
+        joblib.load(feature_scaler_path) if feature_scaler_path.exists() else None
+    )
+    target_scaler = (
+        joblib.load(target_scaler_path) if target_scaler_path.exists() else None
+    )
 
     model_pt = model_dir / "model.pt"
     model_pkl = model_dir / "model.pkl"
@@ -161,13 +187,16 @@ def predict(
             feature_data.num_features(),
             training,
             output_dim=len(feature_data.genes),
+            feature_block_indices=feature_block_indices,
         )
         if isinstance(bundle, TorchModelBundle):
             model = bundle.model
             model.load_state_dict(state["state_dict"])
             reshape = reshape or bundle.reshape
         else:
-            raise RuntimeError("Saved torch model but build_model did not return TorchModelBundle")
+            raise RuntimeError(
+                "Saved torch model but build_model did not return TorchModelBundle"
+            )
     elif model_pkl.exists():
         model = joblib.load(model_pkl)
     else:
@@ -176,7 +205,11 @@ def predict(
     X = feature_data.X
     if sp.issparse(X):
         X = X.toarray().astype(np.float32)
-    if training.enable_smoothing and training.smoothing_k > 1:
+    if (
+        training.enable_smoothing
+        and training.smoothing_k > 1
+        and getattr(training, "smoothing_target", "all_splits") == "all_splits"
+    ):
         X = _knn_smooth_features(
             X,
             feature_data.cell_ids,
@@ -201,6 +234,9 @@ def predict(
 
     if target_scaler is not None:
         preds = target_scaler.inverse_transform(preds)
+    prediction_min = getattr(training, "prediction_min_value", 0.0)
+    if prediction_min is not None:
+        preds = np.maximum(preds, float(prediction_min))
 
     rows = []
     for cell_idx, cell_id in enumerate(feature_data.cell_ids):
@@ -216,15 +252,29 @@ def predict(
     df = pd.DataFrame(rows)
     out_path = output_path or (model_dir / "predictions_inference.csv")
     df.to_csv(out_path, index=False)
-    _LOG.info("Saved inference predictions for %d cells to %s", len(feature_data.cell_ids), out_path)
+    _LOG.info(
+        "Saved inference predictions for %d cells to %s",
+        len(feature_data.cell_ids),
+        out_path,
+    )
     return out_path
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run inference on new ATAC AnnData using a trained model")
-    parser.add_argument("--run-dir", required=True, help="Path to training run directory (contains models/)")
-    parser.add_argument("--model", required=True, help="Model name under run_dir/models/")
-    parser.add_argument("--atac-path", required=True, help="Path to ATAC AnnData (.h5ad) for inference")
+    parser = argparse.ArgumentParser(
+        description="Run inference on new ATAC AnnData using a trained model"
+    )
+    parser.add_argument(
+        "--run-dir",
+        required=True,
+        help="Path to training run directory (contains models/)",
+    )
+    parser.add_argument(
+        "--model", required=True, help="Model name under run_dir/models/"
+    )
+    parser.add_argument(
+        "--atac-path", required=True, help="Path to ATAC AnnData (.h5ad) for inference"
+    )
     parser.add_argument("--output", help="Optional output CSV path for predictions")
     args = parser.parse_args(argv)
 

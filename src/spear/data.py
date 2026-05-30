@@ -1,17 +1,16 @@
-
 from __future__ import annotations
 
 import gzip
 import re
-import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from sklearn.decomposition import TruncatedSVD
 from sklearn.utils import sparsefuncs
 
 from .config import PathsConfig, TrainingConfig
@@ -62,6 +61,7 @@ class GeneDataset:
     cell_ids: np.ndarray
     feature_names: List[str]
     group_labels: np.ndarray
+    metadata: Dict[str, object] = field(default_factory=dict)
     prepared_cache: Dict[str, object] = field(default_factory=dict, repr=False)
 
     def num_cells(self) -> int:
@@ -78,6 +78,25 @@ def _bin_label(bin_idx: int, training: TrainingConfig, gene: GeneInfo) -> str:
     if gene.strand == "-":
         start_offset, end_offset = -end_offset, -start_offset
     return f"bin_{int(start_offset)}_to_{int(end_offset)}"
+
+
+def _orient_peak_window(
+    indices: np.ndarray,
+    midpoints: np.ndarray,
+    gene: GeneInfo,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Orient peak windows relative to transcription direction."""
+    if gene.strand == "-":
+        return indices[::-1], midpoints[::-1]
+    return indices, midpoints
+
+
+def _signed_peak_offset(midpoint: int, gene: GeneInfo) -> int:
+    """Return a transcription-oriented peak midpoint offset from the TSS."""
+    genomic_offset = int(midpoint) - int(gene.tss)
+    if gene.strand == "-":
+        return -genomic_offset
+    return genomic_offset
 
 
 def _compute_gene_features_all_cells(
@@ -119,7 +138,6 @@ def _compute_gene_features_all_cells(
             summed = np.sum(sub, axis=1)
         features[:, b] = summed
 
-
     # Orient bins relative to transcription direction: negative = upstream, positive = downstream
     if gene.strand == "-":
         features = features[:, ::-1]
@@ -130,6 +148,48 @@ def _compute_gene_features_all_cells(
 
     return features, feature_names
 
+
+def _compute_gene_peak_features_all_cells(
+    gene: GeneInfo,
+    peak_indexer: PeakIndexer,
+    training: TrainingConfig,
+) -> Tuple[np.ndarray, List[str]]:
+    """Return one-feature-per-peak ATAC accessibility in the TSS window for all cells.
+
+    Unlike `_compute_gene_features_all_cells`, this preserves peak-level resolution
+    instead of aggregating into fixed-width bins. Feature order is oriented relative to
+    transcription direction (upstream features first on both strands).
+
+    Returns a zero-column matrix when no peaks exist in the window; the caller should
+    fall back to bin-based features in that case.
+    """
+    start = gene.tss - training.window_bp
+    end = gene.tss + training.window_bp
+    indices, midpoints = peak_indexer.get_peaks_in_window(gene.chrom, start, end)
+
+    if indices.size == 0:
+        return np.zeros((peak_indexer.n_cells, 0), dtype=np.float32), []
+
+    indices_ord, midpoints_ord = _orient_peak_window(indices, midpoints, gene)
+    matrix = peak_indexer.matrix[:, indices_ord]
+    if sp.issparse(matrix):
+        features = np.asarray(matrix.toarray(), dtype=np.float32)
+    else:
+        features = np.asarray(matrix, dtype=np.float32)
+
+    feature_names: List[str] = []
+    for idx, mid in zip(indices_ord.tolist(), midpoints_ord.tolist()):
+        peak_id = (
+            peak_indexer.peak_ids[int(idx)]
+            if int(idx) < peak_indexer.n_peaks
+            else f"peak_{int(mid)}"
+        )
+        offset = _signed_peak_offset(int(mid), gene)
+        feature_names.append(f"{peak_id}|offset_{offset:+d}bp")
+
+    return features, feature_names
+
+
 @dataclass
 class CellwiseDataset:
     genes: List[GeneInfo]
@@ -138,6 +198,7 @@ class CellwiseDataset:
     cell_ids: np.ndarray
     feature_names: List[str]
     group_labels: np.ndarray
+    metadata: Dict[str, object] = field(default_factory=dict)
     prepared_cache: Dict[str, object] = field(default_factory=dict, repr=False)
     feature_block_slices: List[Tuple[int, int]] = field(default_factory=list)
     feature_block_indices: List[np.ndarray] = field(default_factory=list)
@@ -172,7 +233,10 @@ def preprocess_modalities(
                 training.atac_layer,
             )
 
-    if training.rna_expression_layer and training.rna_expression_layer not in rna.layers:
+    if (
+        training.rna_expression_layer
+        and training.rna_expression_layer not in rna.layers
+    ):
         if training.rna_expression_layer == "log1p_cpm":
             rna.layers[training.rna_expression_layer] = _log1p_cpm(rna.X)
         else:
@@ -217,7 +281,12 @@ def _log1p_cpm(matrix: sp.spmatrix | np.ndarray) -> sp.spmatrix | np.ndarray:
 
 
 def _tfidf_matrix(matrix: sp.spmatrix | np.ndarray) -> sp.spmatrix | np.ndarray:
-    """Compute TF-IDF normalized representation for ATAC counts with sparse-friendly math."""
+    """TF-IDF with per-row L2 normalization (matches ArchR/Signac LSI convention).
+
+    Steps: TF (row-normalize counts) → IDF weighting → L2-normalize each cell row.
+    L2 normalization ensures all cells land on the unit hypersphere, removing the
+    residual magnitude differences that remain after TF alone.
+    """
 
     if sp.issparse(matrix):
         counts = matrix.tocsr().astype(np.float32, copy=True)
@@ -231,7 +300,15 @@ def _tfidf_matrix(matrix: sp.spmatrix | np.ndarray) -> sp.spmatrix | np.ndarray:
         doc_freq = np.diff(tfidf.indptr).astype(np.float32)
         idf = np.log1p(n_cells / (1.0 + doc_freq))
         sparsefuncs.inplace_column_scale(tfidf, idf.astype(np.float32))
-        return tfidf.tocsr()
+        tfidf = tfidf.tocsr()
+
+        # L2-normalize each row so all cells have unit norm
+        row_norms = np.sqrt(np.asarray(tfidf.power(2).sum(axis=1)).ravel()).astype(
+            np.float32
+        )
+        row_norms[row_norms == 0] = 1.0
+        sparsefuncs.inplace_row_scale(tfidf, 1.0 / row_norms)
+        return tfidf
 
     counts_arr = np.asarray(matrix, dtype=np.float32)
     totals = counts_arr.sum(axis=1, keepdims=True)
@@ -239,7 +316,10 @@ def _tfidf_matrix(matrix: sp.spmatrix | np.ndarray) -> sp.spmatrix | np.ndarray:
     tf = counts_arr / totals
     df = (counts_arr > 0).sum(axis=0, keepdims=False).astype(np.float32)
     idf = np.log1p(counts_arr.shape[0] / (1.0 + df))
-    return (tf * idf).astype(np.float32)
+    tfidf = (tf * idf).astype(np.float32)
+    row_norms = np.linalg.norm(tfidf, axis=1, keepdims=True)
+    row_norms[row_norms == 0] = 1.0
+    return (tfidf / row_norms).astype(np.float32)
 
 
 class PeakIndexer:
@@ -278,9 +358,13 @@ class PeakIndexer:
         self.n_cells = atac.n_obs
         self.peak_ids = np.asarray(var_df.index).astype(str)
         self.n_peaks = int(self.peak_ids.shape[0])
+        self._global_feature_cache: Dict[
+            Tuple[int, int, str | None, Tuple[int, int]], Tuple[np.ndarray, List[str]]
+        ] = {}
 
-
-    def get_peaks_in_window(self, chrom: str, start: int, end: int) -> Tuple[np.ndarray, np.ndarray]:
+    def get_peaks_in_window(
+        self, chrom: str, start: int, end: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
         midpoints = self.chrom_to_midpoints.get(chrom)
         indices = self.chrom_to_indices.get(chrom)
         if midpoints is None or indices is None:
@@ -292,13 +376,97 @@ class PeakIndexer:
         return local, local_midpoints
 
 
+def _compute_global_atac_features(
+    peak_indexer: PeakIndexer,
+    training: TrainingConfig,
+) -> Tuple[np.ndarray, List[str]]:
+    """Return optional global ATAC cell-state components for all cells."""
+
+    requested = int(getattr(training, "global_atac_components", 0) or 0)
+    if requested <= 0:
+        return np.zeros((peak_indexer.n_cells, 0), dtype=np.float32), []
+
+    cache_key = (
+        requested,
+        int(getattr(training, "random_state", 42)),
+        peak_indexer.layer,
+        tuple(int(v) for v in peak_indexer.matrix.shape),
+    )
+    cached = peak_indexer._global_feature_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    max_components = min(
+        requested, max(0, peak_indexer.n_cells - 1), peak_indexer.n_peaks
+    )
+    names = [f"global_atac_svd_{i + 1}" for i in range(requested)]
+    if max_components <= 0:
+        features = np.zeros((peak_indexer.n_cells, requested), dtype=np.float32)
+        result = (features, names)
+        peak_indexer._global_feature_cache[cache_key] = result
+        return result
+
+    svd = TruncatedSVD(n_components=max_components, random_state=training.random_state)
+    features = np.asarray(svd.fit_transform(peak_indexer.matrix), dtype=np.float32)
+    if max_components < requested:
+        padding = np.zeros(
+            (peak_indexer.n_cells, requested - max_components), dtype=np.float32
+        )
+        features = np.hstack([features, padding])
+
+    result = (features, names)
+    peak_indexer._global_feature_cache[cache_key] = result
+    return result
+
+
+def _append_global_features(
+    matrix: np.ndarray | sp.spmatrix,
+    feature_names: List[str],
+    feature_block_indices: Optional[List[np.ndarray]],
+    peak_indexer: PeakIndexer,
+    training: TrainingConfig,
+) -> Tuple[np.ndarray | sp.spmatrix, List[str], Optional[List[np.ndarray]]]:
+    global_features, global_names = _compute_global_atac_features(
+        peak_indexer, training
+    )
+    if global_features.shape[1] == 0:
+        return matrix, feature_names, feature_block_indices
+
+    offset = int(matrix.shape[1])
+    if sp.issparse(matrix):
+        matrix_out: np.ndarray | sp.spmatrix = sp.hstack(
+            [matrix, sp.csr_matrix(global_features)],
+            format="csr",
+        )
+    else:
+        matrix_out = np.hstack(
+            [np.asarray(matrix, dtype=np.float32), global_features]
+        ).astype(np.float32)
+
+    names_out = list(feature_names) + list(global_names)
+    if feature_block_indices is None:
+        return matrix_out, names_out, None
+
+    global_indices = np.arange(
+        offset, offset + global_features.shape[1], dtype=np.int64
+    )
+    blocks_out: List[np.ndarray] = []
+    for block in feature_block_indices:
+        block_arr = np.asarray(block, dtype=np.int64).ravel()
+        block_arr = block_arr[block_arr >= 0]
+        blocks_out.append(np.concatenate([block_arr, global_indices]))
+    return matrix_out, names_out, blocks_out
+
+
 def load_datasets(paths: PathsConfig) -> Tuple[ad.AnnData, ad.AnnData]:
     _LOG.info("Loading AnnData objects from %s and %s", paths.atac_path, paths.rna_path)
     atac = ad.read_h5ad(paths.atac_path.as_posix())
     rna = ad.read_h5ad(paths.rna_path.as_posix())
 
     if atac.n_obs != rna.n_obs:
-        raise ValueError("ATAC and RNA AnnData objects have different numbers of cells; harmonized pairs expected")
+        raise ValueError(
+            "ATAC and RNA AnnData objects have different numbers of cells; harmonized pairs expected"
+        )
 
     atac_cells = np.asarray(atac.obs_names).astype(str)
     rna_cells = np.asarray(rna.obs_names).astype(str)
@@ -312,12 +480,20 @@ def load_datasets(paths: PathsConfig) -> Tuple[ad.AnnData, ad.AnnData]:
     return atac, rna
 
 
-def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_names: Optional[Sequence[str]] = None) -> List[GeneInfo]:
+def parse_gtf(
+    gtf_path: Path,
+    chromosomes: Optional[Sequence[str]] = None,
+    gene_names: Optional[Sequence[str]] = None,
+) -> List[GeneInfo]:
     _LOG.info("Parsing GTF annotations from %s", gtf_path)
     opener = gzip.open if gtf_path.suffix == ".gz" else open
     records: List[GeneInfo] = []
     target_chroms_raw = set(chromosomes) if chromosomes else None
-    target_chroms_norm = {_normalize_chrom_name(ch) for ch in target_chroms_raw} if target_chroms_raw else None
+    target_chroms_norm = (
+        {_normalize_chrom_name(ch) for ch in target_chroms_raw}
+        if target_chroms_raw
+        else None
+    )
     fallback_name_count = 0
 
     def _strip_gene_version(gene_id: str) -> str:
@@ -351,8 +527,13 @@ def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_
         mouse_like = sum(1 for g in gene_names if _is_mouse_like(g))
         total = max(len(gene_names), 1)
         stem = gtf_path.name.lower()
-        gtf_human = any(token in stem for token in ("gencode.v", "grch", "hg", "gcf_000001405", "gcf_000001635"))
-        gtf_mouse = any(token in stem for token in ("gencode.vm", "grcm", "mm", "gcf_000001635."))
+        gtf_human = any(
+            token in stem
+            for token in ("gencode.v", "grch", "hg", "gcf_000001405", "gcf_000001635")
+        )
+        gtf_mouse = any(
+            token in stem for token in ("gencode.vm", "grcm", "mm", "gcf_000001635.")
+        )
         if (ensm_count / total) > 0.2 or (mouse_like / total) > 0.2:
             if gtf_human and not gtf_mouse:
                 _LOG.warning(
@@ -380,11 +561,17 @@ def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_
             parts = line.rstrip().split("\t")
             if len(parts) < 9:
                 continue
-            seqname, source, feature, start, end, score, strand, frame, attributes = parts
+            seqname, source, feature, start, end, score, strand, frame, attributes = (
+                parts
+            )
             if feature != "gene":
                 continue
             chrom_norm = _normalize_chrom_name(seqname)
-            if target_chroms_raw and seqname not in target_chroms_raw and chrom_norm not in target_chroms_norm:
+            if (
+                target_chroms_raw
+                and seqname not in target_chroms_raw
+                and chrom_norm not in target_chroms_norm
+            ):
                 continue
             attr_map = _parse_gtf_attributes(attributes)
             gene_name_attr = attr_map.get("gene_name")
@@ -395,11 +582,15 @@ def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_
                 continue
             gene_id = _strip_gene_version(gene_id_raw)
             gene_name_raw = gene_name_attr or name_attr or gene_attr
-            gene_name = _pick_display_name(gene_name_attr, name_attr, gene_attr, gene_id)
+            gene_name = _pick_display_name(
+                gene_name_attr, name_attr, gene_attr, gene_id
+            )
             if gene_name == gene_id and gene_name_raw is None:
                 fallback_name_count += 1
             if target_genes:
-                candidates = {c for c in (gene_name_raw, gene_name, gene_id_raw, gene_id) if c}
+                candidates = {
+                    c for c in (gene_name_raw, gene_name, gene_id_raw, gene_id) if c
+                }
                 candidates_lower = {c.lower() for c in candidates}
                 if not (
                     candidates & target_genes
@@ -413,10 +604,18 @@ def parse_gtf(gtf_path: Path, chromosomes: Optional[Sequence[str]] = None, gene_
             strand_val = strand if strand in {"+", "-"} else "+"
             tss = start_i if strand_val == "+" else end_i
             records.append(
-                GeneInfo(gene_id=gene_id, gene_name=gene_name, chrom=chrom_norm, tss=tss, strand=strand_val)
+                GeneInfo(
+                    gene_id=gene_id,
+                    gene_name=gene_name,
+                    chrom=chrom_norm,
+                    tss=tss,
+                    strand=strand_val,
+                )
             )
     if target_genes and len(records) == 0:
-        raise ValueError("None of the requested genes were found in the provided GTF file")
+        raise ValueError(
+            "None of the requested genes were found in the provided GTF file"
+        )
     if fallback_name_count:
         _LOG.warning(
             "GTF entries without gene names: %d (falling back to Ensembl IDs)",
@@ -468,8 +667,9 @@ def _gene_window_peak_indices(
 ) -> np.ndarray:
     start = gene.tss - training.window_bp
     end = gene.tss + training.window_bp
-    indices, _ = peak_indexer.get_peaks_in_window(gene.chrom, start, end)
-    return indices
+    indices, midpoints = peak_indexer.get_peaks_in_window(gene.chrom, start, end)
+    indices_ord, _ = _orient_peak_window(indices, midpoints, gene)
+    return indices_ord
 
 
 def _map_indices_to_union(idxs: np.ndarray, union_indices: np.ndarray) -> np.ndarray:
@@ -492,7 +692,6 @@ def _build_shared_peak_matrix(
     peak_indexer: PeakIndexer,
     training: TrainingConfig,
 ) -> tuple[np.ndarray | sp.spmatrix, List[str], List[np.ndarray]]:
-    selected_genes: List[GeneInfo] = []
     per_gene_peak_indices: List[np.ndarray] = []
     for gene in genes:
         peak_indices = _gene_window_peak_indices(gene, peak_indexer, training)
@@ -513,7 +712,8 @@ def _build_shared_peak_matrix(
     # loops for better performance when idxs is large.
 
     feature_block_indices = [
-        _map_indices_to_union(idxs, union_peak_indices) for idxs in per_gene_peak_indices
+        _map_indices_to_union(idxs, union_peak_indices)
+        for idxs in per_gene_peak_indices
     ]
     shared_matrix = peak_indexer.matrix[:, union_peak_indices]
     if sp.issparse(shared_matrix):
@@ -614,10 +814,8 @@ def build_gene_dataset(
         mask_values = np.asarray(mask_source).ravel()
 
     mask = mask_values >= training.min_expression
-    if mask.sum() < training.min_cells_per_gene:
-        raise ValueError(
-            f"Gene {gene.gene_name} has only {mask.sum()} cells above expression threshold {training.min_expression}"
-        )
+    cells_raw = int(mask_values.shape[0])
+    cells_eligible = int(mask.sum())
 
     cell_ids = np.asarray(rna.obs_names).astype(str)
     if training.group_key and training.group_key in rna.obs.columns:
@@ -630,14 +828,71 @@ def build_gene_dataset(
             )
         group_labels = np.asarray(rna.obs_names).astype(str)
 
-    start = gene.tss - training.window_bp
-    end = gene.tss + training.window_bp
-    features_all, feature_names = _compute_gene_features_all_cells(
-        gene,
+    feature_basis = getattr(training, "per_gene_feature_basis", "bin")
+    if feature_basis == "peak":
+        features_all, feature_names = _compute_gene_peak_features_all_cells(
+            gene, peak_indexer, training
+        )
+        peak_count = int(features_all.shape[1])
+        min_peaks = int(getattr(training, "per_gene_peak_min_peaks", 1))
+        if peak_count < min_peaks:
+            raise ValueError(
+                f"Gene {gene.gene_name} has only {peak_count} peaks in ±{training.window_bp} bp window; "
+                f"requires at least {min_peaks} peaks for per-gene peak features"
+            )
+    else:
+        features_all, feature_names = _compute_gene_features_all_cells(
+            gene, peak_indexer, training
+        )
+        peak_count = None
+    features_all, feature_names, _ = _append_global_features(
+        features_all,
+        feature_names,
+        None,
         peak_indexer,
         training,
     )
     features = features_all.astype(np.float32)
+    filter_mode = getattr(training, "per_gene_cell_filter_mode", "auto")
+    apply_cell_filtering = filter_mode == "on"
+    override_reason = str(getattr(training, "per_gene_cell_filter_reason", "") or "")
+    if not apply_cell_filtering and not override_reason:
+        override_reason = "explicit_off"
+
+    min_cells_check = cells_eligible if apply_cell_filtering else cells_raw
+    if min_cells_check < training.min_cells_per_gene:
+        if apply_cell_filtering:
+            raise ValueError(
+                f"Gene {gene.gene_name} has only {cells_eligible} cells above expression threshold {training.min_expression}"
+            )
+        raise ValueError(
+            f"Gene {gene.gene_name} has only {cells_raw} total cells available with cell filtering disabled"
+        )
+
+    if apply_cell_filtering:
+        features = features[mask]
+        y = y[mask]
+        cell_ids = cell_ids[mask]
+        group_labels = group_labels[mask]
+
+    cells_filtered_out = cells_raw - (
+        cells_eligible if apply_cell_filtering else cells_raw
+    )
+    metadata: Dict[str, object] = {
+        "cells_raw": cells_raw,
+        "cells_eligible": cells_eligible,
+        "cells_filtered_out": cells_filtered_out,
+        "feature_count": int(features.shape[1]),
+        "feature_basis": feature_basis,
+        "cell_filtering_applied": bool(apply_cell_filtering),
+        "cell_filtering_override_reason": override_reason,
+    }
+    if peak_count is not None:
+        metadata["peak_count_in_window"] = peak_count
+        metadata["peak_window_bp"] = int(training.window_bp)
+        metadata["peak_min_required"] = int(
+            getattr(training, "per_gene_peak_min_peaks", 1)
+        )
     return GeneDataset(
         gene=gene,
         X=features,
@@ -645,6 +900,7 @@ def build_gene_dataset(
         cell_ids=cell_ids,
         feature_names=feature_names,
         group_labels=group_labels.astype(str),
+        metadata=metadata,
     )
 
 
@@ -654,17 +910,17 @@ def _deduplicate_genes_by_rna_match(
 ) -> List[GeneInfo]:
     """
     Remove duplicate gene entries, prioritizing those whose gene_id is in the RNA data.
-    
+
     When a GTF file has multiple entries with the same gene_name (e.g., IL3RA on chrX and chrY),
     this function keeps only the entry whose gene_id matches an entry in the RNA data.
-    
+
     Tie-breaking for multiple RNA matches:
     - Prefer canonical autosomes (chr1-chr22) over sex/mito chromosomes
     - Within same chromosome category, sort by chromosome name lexicographically
     - Final tie-breaker: prefer upstream TSS (lower position on + strand, higher position on - strand)
     """
     from collections import defaultdict
-    
+
     def _chromosome_sort_key(chrom: str) -> tuple:
         """Return sort key prioritizing canonical autosomes."""
         # Extract numeric part for sorting (chr1, chr2, ..., chr22)
@@ -681,16 +937,16 @@ def _deduplicate_genes_by_rna_match(
                 return (2, 0, chrom)
         # Unknown format: sort to end
         return (3, 0, chrom)
-    
+
     rna_var_set = set(rna_var_names.astype(str))
     # Cache membership so duplicate gene_name groups do not repeatedly probe the RNA set
     gene_id_in_rna = {gene.gene_id: gene.gene_id in rna_var_set for gene in genes}
     name_to_genes = defaultdict(list)
-    
+
     # Group genes by gene_name
     for gene in genes:
         name_to_genes[gene.gene_name].append(gene)
-    
+
     deduplicated: List[GeneInfo] = []
     for gene_name, gene_list in name_to_genes.items():
         if len(gene_list) == 1:
@@ -698,7 +954,9 @@ def _deduplicate_genes_by_rna_match(
             deduplicated.append(gene_list[0])
         else:
             # Multiple entries with same gene_name - prioritize RNA matches
-            matches_in_rna = [g for g in gene_list if gene_id_in_rna.get(g.gene_id, False)]
+            matches_in_rna = [
+                g for g in gene_list if gene_id_in_rna.get(g.gene_id, False)
+            ]
             if matches_in_rna:
                 # Sort multiple matches by chromosome (canonical first) then TSS position for determinism
                 sorted_matches = sorted(
@@ -719,16 +977,20 @@ def _deduplicate_genes_by_rna_match(
                         selected.gene_id,
                         selected.chrom,
                         selected.tss,
-                        ", ".join(f"{m.gene_id} ({m.chrom})" for m in sorted_matches[1:])
+                        ", ".join(
+                            f"{m.gene_id} ({m.chrom})" for m in sorted_matches[1:]
+                        ),
                     )
             else:
                 # None match RNA data, keep first entry (will be skipped later)
                 deduplicated.append(gene_list[0])
                 _LOG.debug(
                     "Gene %s has %d GTF entries but none match RNA data; using %s",
-                    gene_name, len(gene_list), gene_list[0].gene_id
+                    gene_name,
+                    len(gene_list),
+                    gene_list[0].gene_id,
                 )
-    
+
     return deduplicated
 
 
@@ -744,10 +1006,10 @@ def build_cellwise_dataset(
 
     cell_ids = np.asarray(rna.obs_names).astype(str)
     rna_var = np.asarray(rna.var_names).astype(str)
-    
+
     # Deduplicate genes, prioritizing those in RNA data
     genes = _deduplicate_genes_by_rna_match(genes, rna_var)
-    
+
     name_to_idx = {name: idx for idx, name in enumerate(rna_var)}
     if training.group_key and training.group_key in rna.obs.columns:
         group_labels = rna.obs[training.group_key].astype(str).to_numpy()
@@ -767,6 +1029,7 @@ def build_cellwise_dataset(
         already_logged = False
 
     target_blocks: List[np.ndarray] = []
+    raw_target_blocks: List[np.ndarray] = []
     selected_genes: List[GeneInfo] = []
 
     for gene in genes:
@@ -800,11 +1063,13 @@ def build_cellwise_dataset(
             continue
 
         target_blocks.append(y.astype(np.float32))
+        raw_target_blocks.append(raw_values.astype(np.float32))
         selected_genes.append(gene)
 
     if not selected_genes:
         raise ValueError("No genes satisfied inclusion criteria for cell-wise dataset")
     Y = _safe_stack(target_blocks, axis=1)
+    raw_Y = _safe_stack(raw_target_blocks, axis=1)
 
     basis = training.multioutput_feature_basis
     if basis == "peak":
@@ -819,6 +1084,39 @@ def build_cellwise_dataset(
             peak_indexer,
             training,
         )
+    shared_matrix, feature_names, feature_block_indices = _append_global_features(
+        shared_matrix,
+        feature_names,
+        feature_block_indices,
+        peak_indexer,
+        training,
+    )
+    if feature_block_indices is None:
+        feature_block_indices = []
+
+    filter_mode = getattr(training, "per_gene_cell_filter_mode", "auto")
+    apply_cell_filtering = filter_mode == "on"
+    override_reason = str(getattr(training, "per_gene_cell_filter_reason", "") or "")
+    if not apply_cell_filtering and not override_reason:
+        override_reason = "explicit_off"
+
+    cells_raw = int(cell_ids.shape[0])
+    if apply_cell_filtering:
+        cell_mask = np.any(raw_Y >= training.min_expression, axis=1)
+        cells_eligible = int(cell_mask.sum())
+        if cells_eligible < training.min_cells_per_gene:
+            raise ValueError(
+                "Cell-wise dataset has only "
+                f"{cells_eligible} cells with any retained target >= {training.min_expression}"
+            )
+        shared_matrix = shared_matrix[cell_mask]
+        Y = Y[cell_mask]
+        cell_ids = cell_ids[cell_mask]
+        group_labels = group_labels[cell_mask]
+    else:
+        cells_eligible = cells_raw
+
+    cells_filtered_out = cells_raw - cells_eligible
 
     return CellwiseDataset(
         genes=selected_genes,
@@ -827,6 +1125,15 @@ def build_cellwise_dataset(
         cell_ids=cell_ids,
         feature_names=feature_names,
         group_labels=group_labels,
+        metadata={
+            "cells_raw": cells_raw,
+            "cells_eligible": cells_eligible,
+            "cells_filtered_out": cells_filtered_out,
+            "cell_filtering_applied": bool(apply_cell_filtering),
+            "cell_filtering_override_reason": override_reason,
+            "feature_count": int(shared_matrix.shape[1]),
+            "target_gene_count": len(selected_genes),
+        },
         feature_block_slices=[],
         feature_block_indices=feature_block_indices,
     )
@@ -866,6 +1173,15 @@ def build_cellwise_features_only(
             peak_indexer,
             training,
         )
+    shared_matrix, feature_names, feature_block_indices = _append_global_features(
+        shared_matrix,
+        feature_names,
+        feature_block_indices,
+        peak_indexer,
+        training,
+    )
+    if feature_block_indices is None:
+        feature_block_indices = []
 
     return CellwiseDataset(
         genes=selected_genes,
@@ -877,14 +1193,6 @@ def build_cellwise_features_only(
         feature_block_slices=[],
         feature_block_indices=feature_block_indices,
     )
-def _safe_concat(arrays: Sequence[np.ndarray], axis: int = 0) -> np.ndarray:
-    try:
-        return np.concatenate(arrays, axis=axis)
-    except MemoryError as exc:
-        raise RuntimeError(
-            "Cell-wise feature matrix concatenation exceeded available memory. "
-            "Consider reducing window size, increasing bin size, or chunking genes."
-        ) from exc
 
 
 def _safe_stack(arrays: Sequence[np.ndarray], axis: int = 0) -> np.ndarray:
@@ -897,7 +1205,9 @@ def _safe_stack(arrays: Sequence[np.ndarray], axis: int = 0) -> np.ndarray:
         ) from exc
 
 
-def filter_atac_by_genes(atac: ad.AnnData, genes: Sequence[GeneInfo], window_bp: int) -> ad.AnnData:
+def filter_atac_by_genes(
+    atac: ad.AnnData, genes: Sequence[GeneInfo], window_bp: int
+) -> ad.AnnData:
     """Subset the ATAC matrix to peaks located within +/- window_bp of the supplied genes' TSS."""
 
     if not genes:
@@ -1022,10 +1332,14 @@ def _find_column(df: pd.DataFrame, candidates: Sequence[str]) -> str:
             return lower
         if title in df.columns:
             return title
-    raise ValueError(f"None of the candidate columns {candidates} were found in dataframe")
+    raise ValueError(
+        f"None of the candidate columns {candidates} were found in dataframe"
+    )
 
 
-def _parse_peak_index(index_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _parse_peak_index(
+    index_values: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     chroms: List[str] = []
     starts: List[int] = []
     ends: List[int] = []
@@ -1048,10 +1362,16 @@ def _parse_peak_index(index_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray,
     if not chroms:
         raise ValueError("No peak coordinates could be parsed from ATAC index")
 
-    return np.asarray(chroms, dtype=str), np.asarray(starts, dtype=np.int64), np.asarray(ends, dtype=np.int64)
+    return (
+        np.asarray(chroms, dtype=str),
+        np.asarray(starts, dtype=np.int64),
+        np.asarray(ends, dtype=np.int64),
+    )
 
 
-def _extract_peak_coordinates(var_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _extract_peak_coordinates(
+    var_df: pd.DataFrame,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     try:
         chrom_col = _find_column(var_df, ["chrom", "chr", "chromosome", "seqname"])
         start_col = _find_column(var_df, ["start", "chromStart", "begin", "sta"])

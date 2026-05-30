@@ -4,7 +4,7 @@
 
 ## Overview
 
-SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts) is an end-to-end machine-learning framework for training and evaluating multi-omics integration models. The toolkit focuses on predicting the full RNA gene expression vector for every cell directly from its paired single-cell ATAC accessibility profile, pairing reproducible preprocessing with a modular model zoo, batchable CLI entry points, and plotting notebooks for downstream analysis.
+SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibility Readouts) is an end-to-end framework for per-gene cis-regulatory prediction and interpretation from paired single-cell ATAC/RNA data. The primary analysis mode predicts gene-by-gene expression from local chromatin accessibility and exports feature-importance/SHAP artifacts for peak/bin interpretation. Multi-output modeling remains available for explicit legacy or supplementary comparisons.
 
 ## Inputs
 
@@ -29,16 +29,16 @@ SPEAR (Single-cell-based Prediction of Gene Expression from Chromatin Accessibil
 
 ### Project Goals
 
-- Predict the full RNA expression vector for every cell directly from its paired single-cell ATAC accessibility profile.
-- Build feature matrices using ±10 kb windows around each gene's transcription start site, binned at 500 bp (40 bins per gene) and recomputed for every run.
-- Provide a modular model zoo spanning convolutional, recurrent, transformer, graph-based, deep & cross networks, gradient boosting (XGBoost, CatBoost), multilayer perceptron, tree ensembles, and linear baselines (Ridge, Elastic Net, Lasso, OLS) so comparative experiments are one CLI flag away.
+- Predict per-gene RNA expression from local ATAC accessibility and compare feature bases such as fixed genomic bins and ATAC peaks.
+- Keep simple baselines central. Ridge/Elastic Net, MLP/ResNet, Transformer, and one tree/boosting model should answer most primary manuscript questions before the full model zoo is used.
+- Provide a modular supplementary model zoo spanning convolutional, recurrent, transformer, graph-based, deep & cross networks, gradient boosting (XGBoost, CatBoost), multilayer perceptron, tree ensembles, and linear baselines (Ridge, Elastic Net, Lasso, OLS) so controlled comparisons are one CLI flag away.
 - Produce test-set diagnostics (scatter plots, per-gene Pearson summaries, epoch histories) while persisting raw predictions for reproducibility and downstream analysis.
 
 - **Modal-specific normalization:**
   - ATAC/RNA matrices are subset to shared barcodes and aligned to a common ordering; by default ATAC uses TF–IDF (`tfidf` layer), with alternatives (`counts_per_million`, `log1p_cpm`, or none) available via the `atac_layer` setting.
   - RNA counts are converted to counts-per-million and log-transformed (`log1p_cpm` layer) if needed; double log1p transforms are skipped when a normalized layer already exists.
   - Optional `StandardScaler`/`MinMaxScaler` may be applied on features and targets (target scaling is skipped for log-transformed targets unless `force_target_scaling=True`).
-- **k-NN smoothing:** Each cell is smoothed by averaging with its k nearest neighbors (default k=19 for `smoothing_k=20`) using PCA-informed nearest-neighbor search to reduce sparsity while maintaining dataset size.
+- **k-NN smoothing:** When enabled, training smooths `train`, `val`, and `test` independently after splitting by averaging each cell with its k nearest neighbors (20-cell neighborhoods by default, including the cell itself) using PCA-informed nearest-neighbor search to reduce sparsity while maintaining dataset size. Inference applies the same smoothing to the full inference batch before prediction.
 - **Optional pseudobulk aggregation:** PCA-informed, group-aware pooling within each sample when `pseudobulk_group_size > 1`.
 - **Group-aware splitting:** 70/15/15 train/val/test splits with `GroupShuffleSplit` keyed by `group_key` (default `sample`; falls back to random when insufficient groups), plus 5-fold cross-validation using `GroupKFold` when possible.
 - **Model zoo:** CNN, ResNet, RNN, LSTM, Transformer, Graph (implicit message passing), DCN (Deep & Cross Network), PyTorch MLP, Random Forest, Extra Trees, HistGradientBoosting, XGBoost, CatBoost, SVR, Ridge, Elastic Net, Lasso, and OLS. Each model is defined in `spear.models` and accessible through the CLI.
@@ -56,8 +56,7 @@ analysis/figs/               # Notebook outputs and generated figures
 analysis/spear_results_analysis.ipynb
 data/                        # Local AnnData matrices, manifests, references (not published)
 src/                         # Core Python package (config, data, training, evaluation)
-scripts/                     # Minimal helper scripts (data prep only)
-todo.md                      # Running task list
+scripts/                     # Public helper scripts for data prep, smoke tests, reporting, and plotting
 ```
 
 ### Installation
@@ -73,11 +72,35 @@ pip install -e .
 > Torch and XGBoost wheels can be large on HPC systems—consider using `pip install --no-cache-dir` if disk quotas are tight.
 > Data files are not published with this repository; fetch or generate them locally before running the pipeline.
 
+### Tiny Smoke Test
+
+Verify the installation without downloading real data:
+
+```bash
+python scripts/create_tiny_example_data.py
+spear \
+  --rna-path data/examples/tiny/tiny_RNA.h5ad \
+  --atac-path data/examples/tiny/tiny_ATAC.h5ad \
+  --gtf-path data/examples/tiny/tiny.gtf \
+  --gene-manifest data/examples/tiny/tiny_genes.csv \
+  --models ridge \
+  --device cpu \
+  --k-folds 2 \
+  --disable-smoothing \
+  --min-cells-per-gene 5 \
+  --run-name tiny_smoke_ridge
+```
+
+Expected smoke-test outputs are written under `output/results/tiny_smoke_ridge/`, including
+`summary_metrics.csv`, `summary_metrics_per_gene.csv`, `run_configuration.json`, and model-level
+files under `models/ridge/`.
+
 ### Data Requirements
 
 - Paired ATAC/RNA `h5ad` files with overlapping barcodes.
 - A reference GTF containing gene annotations.
 - See `docs/mouse_esc_dataset.md` and `docs/endothelial_dataset.md` for dataset-specific provenance and storage conventions.
+- Use explicit gene manifests for controlled comparisons; `docs/run_inventory_schema.json` documents the run-inventory fields used to separate strict common-manifest rankings from fallback or feasibility runs.
 
 ### Running the Pipeline
 
@@ -93,7 +116,7 @@ spear \
   --device auto
 ```
 
-SPEAR runs on local machines, cloud VMs, and HPC clusters. Slurm templates are provided under `jobs/`; adapt them (or port to your scheduler) for your infrastructure.
+SPEAR runs on local machines, cloud VMs, and HPC clusters. For schedulers such as Slurm, wrap the same `spear` command in your site-specific submission template and keep private accounts, partitions, and paths outside the public repository.
 
 More flags and defaults are documented in `docs/config_reference.md`.
 
@@ -106,43 +129,47 @@ Environment / CLI highlights:
 - W&B run name defaults to `<model>_<genes>_<dataset>` unless `--wandb-run-name` is provided.
 - `--device` supports `cuda`, `cpu`, or `auto` (prefers CUDA when available; falls back otherwise).
 - `--disable-pseudobulk` is a quick toggle to benchmark true single-cell training (equivalent to setting `--pseudobulk-group-size 1`).
+- `--smoothing-target {all_splits,train_only,none}` and `--no-smoothing-y` let you evaluate whether smoothing should affect all splits, only training features, or features without RNA target averaging.
+- `--global-atac-components <N>` appends global ATAC cell-state SVD components to each gene-local feature set; the default `0` keeps this disabled.
 - `--fast-classical-mode` applies a faster profile for heavy classical multi-output models (`svr`, `lasso`, `elastic_net`, `hist_gradient_boosting`, `catboost`), useful when long CPU jobs are timing out.
 - `--atac-layer` lets you swap CPM for alternative ATAC transforms such as `tfidf` or disable normalisation entirely.
+- Torch CNN, ResNet, MLP, DCN, Transformer, and Graph models use RMSNorm-style normalization in their dense, attention, and convolutional blocks when available.
 - ResNet now supports configurable squeeze-excitation attention: `--resnet-attention {se,none}` and `--resnet-attention-se-reduction <int>` (default: `se`, reduction `8`).
 
 ### Generate Gene Manifests
 
-Generate the 1000-gene manifests used in this repo with the helper script:
+Generate the current per-sample 1000-gene manifests with:
 
 ```bash
-PYTHONPATH=src python scripts/select_random_genes.py \
-  --base-dir "$(pwd)" \
+python scripts/generate_all_sample_manifests.py \
+  --base-dir data \
   --gene-count 1000 \
-  --gtf-path data/references/GCF_000001635.27_genomic.gtf \
-  --output data/embryonic/manifests/1000_random_genes.csv
-
-PYTHONPATH=src python scripts/select_random_genes.py \
-  --base-dir "$(pwd)" \
-  --gene-count 1000 \
-  --rna-path data/endothelial/processed/combined_RNA_qc_<15%mito.h5ad \
-  --gtf-path data/references/gencode.v44.annotation.gtf.gz \
-  --output data/endothelial/manifests/1000_random_genes.csv
+  --random-state 42
 ```
+
+This writes three manifests per processed sample:
+
+- `*_random_1000.csv`
+- `*_hvg_1000.csv`
+- `*_low_noisy_1000.csv`
 
 ### Example runs
 
 ```bash
-# Per-gene baselines on CPU
-spear --per-gene --models ridge lasso ols --device cpu --run-name per_gene_baselines
+# Per-gene baselines on CPU (default mode)
+spear --models ridge lasso ols --device cpu --run-name per_gene_baselines
 
 # Multi-output torch run with smaller smoothing and no pseudobulk
-spear --models mlp transformer --smoothing-k 5 --disable-pseudobulk --run-name multi_output_no_bulk
+spear --multi-output --models mlp transformer --smoothing-k 5 --disable-pseudobulk --run-name multi_output_no_bulk
 
 # ResNet with SE attention (default) and tuned reduction ratio
 spear --models resnet --resnet-attention se --resnet-attention-se-reduction 4 --run-name resnet_se_r4
 
 # ResNet ablation without attention
 spear --models resnet --resnet-attention none --run-name resnet_no_attention
+```
+
+Per-gene training is now the default analysis path. Multi-output remains available for explicit comparisons and legacy runs via `--multi-output`.
 
 Optional experiment tracking is available via Weights & Biases. Enable it with `--wandb` after installing `wandb`
 and exporting `WANDB_API_KEY` (or configuring `~/.netrc`). If the key or login is missing, SPEAR will skip W&B
@@ -156,7 +183,6 @@ Quick setup:
 By default, SPEAR logs summary metrics, tables, and key plots to W&B (with row/media caps). Use
 `--wandb-no-artifacts`, `--wandb-no-tables`, `--wandb-no-media`, or `--wandb-no-predictions-table`
 to trim logging.
-```
 
 ### Results & Visualization
 
@@ -203,19 +229,34 @@ The following identifiers can be supplied to `--models` (and combined arbitraril
 - `ols`
 - `svr`
 
-Each mapping to a display label is tracked in `scripts/model_name_lookup.tsv` and consumed by the plotting notebook.
 SVR defaults to a linear kernel with configurable hyperparameters via `TrainingConfig.svr_*`.
 
 ### Utilities and scripts
 
+- `scripts/create_tiny_example_data.py`: generate a tiny synthetic paired ATAC/RNA dataset for install smoke tests.
+- `scripts/download_geo_raw_data.py`: download or stage GEO raw inputs and shared references under `data/`.
+- `scripts/preprocess_geo_raw_to_spear.py`: canonical sample-first preprocessing entrypoint for embryonic and endothelial raw GEO inputs.
+- `scripts/generate_all_sample_manifests.py`: build per-sample `random`, `hvg`, and `low_noisy` 1000-gene manifests for current processed outputs.
+- `scripts/prepare_10x_pbmc_multiome.py`: prepare the public 10x PBMC multiome dataset into SPEAR-compatible RNA/ATAC files and manifests.
 - `scripts/preflight_check.py`: quick readiness probe (env, packages, data paths, GTF). Run `python scripts/preflight_check.py --help` for options.
-- `scripts/preprocess_endothelial.py`: RDS→AnnData conversion and QC for the endothelial dataset (barcode alignment, MT filtering, min genes/cells).
+- `scripts/generate_all_reports.py`: summarize completed runs into CSV and markdown reports.
+- `scripts/plot_prediction_structure.py`: compare real versus predicted RNA cell structure from exported raw predictions.
 
 ### Dependencies
 
 All dependencies (runtime, dev, and notebooks) are listed in `requirements.txt`.
 
+## Citation
+
+If you use SPEAR in a publication, please cite the SPEAR manuscript/preprint and include the GitHub repository URL so others can reproduce the software version used in your analysis.
+
 ### Preprocessing Details
+
+The current canonical preprocessing workflow is:
+
+1. `python scripts/download_geo_raw_data.py --datasets ...`
+2. `python scripts/preprocess_geo_raw_to_spear.py --datasets ...`
+3. `python scripts/generate_all_sample_manifests.py --base-dir data --gene-count 1000`
 
 1. **AnnData loading:** ATAC and RNA `h5ad` matrices are loaded through `anndata`, subset to shared barcodes, and aligned to a common ordering.
 2. **Modal layers:**
@@ -224,7 +265,7 @@ All dependencies (runtime, dev, and notebooks) are listed in `requirements.txt`.
 
 3. **Gene feature extraction:** For each gene, the pipeline sums ATAC counts within ±10 kb windows, binned at 500 bp. Feature matrices are built on demand for each execution.
 4. **Expression filtering:** Genes must have at least `min_cells_per_gene` cells above `min_expression` (defaults: 100 cells, 0.0 expression).
-5. **k-NN smoothing:** Each cell is smoothed by averaging with its k nearest neighbors (k = `smoothing_k - 1`, default 19) using PCA-informed neighbor search within each split to reduce sparsity while maintaining dataset size.
+5. **k-NN smoothing:** After train/val/test splitting, `train`, `val`, and `test` are each smoothed independently by averaging each cell with its k nearest neighbors (20-cell neighborhoods by default, including the cell itself) using PCA-informed neighbor search within that split to reduce sparsity while maintaining dataset size.
 6. **Pseudobulk (optional):** If `pseudobulk_group_size > 1`, PCA-guided, group-aware pooling within each `group_key` (default `sample`) produces meta-cells of the requested size.
 7. **Scaling:** Feature scalers run on the training split; target scaling is skipped automatically when expression values are already log-transformed (set `force_target_scaling=True` to override).
 8. **Splitting:** Train/val/test fractions default to 0.70/0.15/0.15 with `GroupShuffleSplit` by `group_key` (fallback to random splits when too few groups).
@@ -241,6 +282,8 @@ python -m spear.predict \
   --atac-path /path/to/new_atac.h5ad \
   --output /path/to/predictions_inference.csv
 ```
+
+Inference reuses the saved training preprocessing settings. If smoothing was enabled for the run, the inference feature matrix is k-NN smoothed as a single batch before feature scaling and prediction.
 
 ### Troubleshooting
 

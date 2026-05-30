@@ -1,5 +1,7 @@
 """On-disk caching utilities for preprocessed data."""
 
+import contextlib
+import os
 import logging
 from pathlib import Path
 from typing import Optional
@@ -12,6 +14,56 @@ from .data_types import PreparedData, PreparedCellwiseData, SplitData, CellwiseS
 _LOG = logging.getLogger(__name__)
 
 
+@contextlib.contextmanager
+def cache_key_lock(cache_dir: Path, cache_key: str, prefix: str):
+    """Serialize cache creation for one cache key across Slurm array tasks."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir / f"{cache_key}_{prefix}.lock"
+    with lock_path.open("w") as lock_handle:
+        try:
+            import fcntl
+
+            _LOG.info("Waiting for %s cache lock: %s", prefix, lock_path)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            _LOG.info("Acquired %s cache lock: %s", prefix, lock_path)
+            yield
+        finally:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def _atomic_replace(tmp_path: Path, final_path: Path) -> None:
+    os.replace(tmp_path, final_path)
+
+
+def _atomic_save_npz(path: Path, **arrays) -> None:
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp.npz")
+    try:
+        np.savez(tmp_path, **arrays)
+        _atomic_replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_pickle_dump(path: Path, payload) -> None:
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp_path.open("wb") as handle:
+            pickle.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _atomic_replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _load_scalers(cache_dir: Path, cache_key: str, prefix: str):
     scaler_file_pickle = cache_dir / f"{cache_key}_{prefix}_scalers.pkl"
     with open(scaler_file_pickle, "rb") as f:
@@ -22,7 +74,7 @@ def _load_scalers(cache_dir: Path, cache_key: str, prefix: str):
 
 
 def _save_splits_to_npz(splits, split_file: Path) -> None:
-    np.savez(
+    _atomic_save_npz(
         split_file,
         X_train=splits.X_train,
         X_val=splits.X_val,
@@ -36,14 +88,18 @@ def _save_splits_to_npz(splits, split_file: Path) -> None:
         group_labels_train=splits.group_labels_train,
         group_labels_val=splits.group_labels_val,
         group_labels_test=splits.group_labels_test,
-        X_train_raw=splits.X_train_raw if splits.X_train_raw is not None else np.array([]),
+        X_train_raw=(
+            splits.X_train_raw if splits.X_train_raw is not None else np.array([])
+        ),
         X_val_raw=splits.X_val_raw if splits.X_val_raw is not None else np.array([]),
         X_test_raw=splits.X_test_raw if splits.X_test_raw is not None else np.array([]),
-        y_train_raw=splits.y_train_raw if splits.y_train_raw is not None else np.array([]),
+        y_train_raw=(
+            splits.y_train_raw if splits.y_train_raw is not None else np.array([])
+        ),
         y_val_raw=splits.y_val_raw if splits.y_val_raw is not None else np.array([]),
         y_test_raw=splits.y_test_raw if splits.y_test_raw is not None else np.array([]),
+        metadata=np.array([splits.metadata], dtype=object),
     )
-
 
 
 def save_prepared_data(
@@ -52,7 +108,7 @@ def save_prepared_data(
     cache_key: str,
 ) -> None:
     """Save PreparedData to disk.
-    
+
     Parameters
     ----------
     prepared : PreparedData
@@ -64,32 +120,34 @@ def save_prepared_data(
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    
+
     split_file = cache_dir / f"{cache_key}_gene_splits.npz"
     splits = prepared.splits
     _save_splits_to_npz(splits, split_file)
-    
+
     # Save scalers as pickle (primary format)
     scaler_file = cache_dir / f"{cache_key}_gene_scalers.pkl"
-    with open(scaler_file, "wb") as f:
-        pickle.dump({
+    _atomic_pickle_dump(
+        scaler_file,
+        {
             "feature_scaler": prepared.feature_scaler,
             "target_scaler": prepared.target_scaler,
-        }, f)
-    
+        },
+    )
+
     _LOG.info("Saved prepared gene-wise data to %s", cache_dir)
 
 
 def load_prepared_data(cache_dir: Path, cache_key: str) -> Optional[PreparedData]:
     """Load PreparedData from disk.
-    
+
     Parameters
     ----------
     cache_dir : Path
         Directory containing cache files.
     cache_key : str
         Hash key for this configuration.
-    
+
     Returns
     -------
     Optional[PreparedData]
@@ -98,10 +156,10 @@ def load_prepared_data(cache_dir: Path, cache_key: str) -> Optional[PreparedData
     cache_dir = Path(cache_dir)
     split_file = cache_dir / f"{cache_key}_gene_splits.npz"
     scaler_file_pickle = cache_dir / f"{cache_key}_gene_scalers.pkl"
-    
+
     if not split_file.exists() or not scaler_file_pickle.exists():
         return None
-    
+
     try:
         # Load splits
         with np.load(split_file, allow_pickle=True) as data:
@@ -118,23 +176,35 @@ def load_prepared_data(cache_dir: Path, cache_key: str) -> Optional[PreparedData
                 group_labels_train=data["group_labels_train"],
                 group_labels_val=data["group_labels_val"],
                 group_labels_test=data["group_labels_test"],
-                X_train_raw=data["X_train_raw"] if data["X_train_raw"].size > 0 else None,
+                X_train_raw=(
+                    data["X_train_raw"] if data["X_train_raw"].size > 0 else None
+                ),
                 X_val_raw=data["X_val_raw"] if data["X_val_raw"].size > 0 else None,
                 X_test_raw=data["X_test_raw"] if data["X_test_raw"].size > 0 else None,
-                y_train_raw=data["y_train_raw"] if data["y_train_raw"].size > 0 else None,
+                y_train_raw=(
+                    data["y_train_raw"] if data["y_train_raw"].size > 0 else None
+                ),
                 y_val_raw=data["y_val_raw"] if data["y_val_raw"].size > 0 else None,
                 y_test_raw=data["y_test_raw"] if data["y_test_raw"].size > 0 else None,
+                metadata=(
+                    data["metadata"][0]
+                    if "metadata" in data.files and data["metadata"].size > 0
+                    else {}
+                ),
             )
-        
-        feature_scaler, target_scaler = _load_scalers(cache_dir, cache_key, "gene")
-        
+
+        scaler_file_pickle = cache_dir / f"{cache_key}_gene_scalers.pkl"
+        with open(scaler_file_pickle, "rb") as f:
+            scaler_data = pickle.load(f)
+        feature_scaler = scaler_data["feature_scaler"]
+        target_scaler = scaler_data["target_scaler"]
         prepared = PreparedData(
             splits=splits,
             feature_scaler=feature_scaler,
             target_scaler=target_scaler,
         )
-        
-        _LOG.info("Loaded prepared gene-wise data from %s", cache_dir)
+
+        _LOG.debug("Loaded prepared gene-wise data from %s", cache_dir)
         return prepared
     except Exception as exc:
         _LOG.warning("Failed to load prepared data from %s: %s", cache_dir, exc)
@@ -142,7 +212,13 @@ def load_prepared_data(cache_dir: Path, cache_key: str) -> Optional[PreparedData
 
 
 def _save_sparse_matrix(matrix, path: Path) -> None:
-    sp.save_npz(path, matrix, compressed=False)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp.npz")
+    try:
+        sp.save_npz(tmp_path, matrix, compressed=False)
+        _atomic_replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _load_sparse_matrix(path: Path):
@@ -155,7 +231,7 @@ def save_prepared_cellwise_data(
     cache_key: str,
 ) -> None:
     """Save PreparedCellwiseData to disk.
-    
+
     Parameters
     ----------
     prepared : PreparedCellwiseData
@@ -167,7 +243,7 @@ def save_prepared_cellwise_data(
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    
+
     split_file = cache_dir / f"{cache_key}_cellwise_splits.npz"
     splits = prepared.splits
 
@@ -189,7 +265,9 @@ def save_prepared_cellwise_data(
     # Skip caching raw matrices when sparse to avoid huge redundant files.
     # Note: if force_dense_features (or similar) changes between runs, the cache
     # may lack raw dense matrices even if they would now be expected.
-    save_raw = not any(meta[name]["is_sparse"] for name in ("X_train", "X_val", "X_test"))
+    save_raw = not any(
+        meta[name]["is_sparse"] for name in ("X_train", "X_val", "X_test")
+    )
     if not save_raw:
         if _LOG.isEnabledFor(logging.INFO):
             sparse_splits = [
@@ -206,13 +284,25 @@ def save_prepared_cellwise_data(
             )
     meta.update(
         {
-            "X_train_raw": _save_matrix("X_train_raw", splits.X_train_raw) if save_raw else {"is_sparse": False, "saved": False},
-            "X_val_raw": _save_matrix("X_val_raw", splits.X_val_raw) if save_raw else {"is_sparse": False, "saved": False},
-            "X_test_raw": _save_matrix("X_test_raw", splits.X_test_raw) if save_raw else {"is_sparse": False, "saved": False},
+            "X_train_raw": (
+                _save_matrix("X_train_raw", splits.X_train_raw)
+                if save_raw
+                else {"is_sparse": False, "saved": False}
+            ),
+            "X_val_raw": (
+                _save_matrix("X_val_raw", splits.X_val_raw)
+                if save_raw
+                else {"is_sparse": False, "saved": False}
+            ),
+            "X_test_raw": (
+                _save_matrix("X_test_raw", splits.X_test_raw)
+                if save_raw
+                else {"is_sparse": False, "saved": False}
+            ),
         }
     )
 
-    np.savez(
+    _atomic_save_npz(
         split_file,
         X_train=splits.X_train if not meta["X_train"]["is_sparse"] else np.array([]),
         X_val=splits.X_val if not meta["X_val"]["is_sparse"] else np.array([]),
@@ -226,10 +316,24 @@ def save_prepared_cellwise_data(
         group_labels_train=splits.group_labels_train,
         group_labels_val=splits.group_labels_val,
         group_labels_test=splits.group_labels_test,
-        X_train_raw=splits.X_train_raw if (splits.X_train_raw is not None and not meta["X_train_raw"]["is_sparse"]) else np.array([]),
-        X_val_raw=splits.X_val_raw if (splits.X_val_raw is not None and not meta["X_val_raw"]["is_sparse"]) else np.array([]),
-        X_test_raw=splits.X_test_raw if (splits.X_test_raw is not None and not meta["X_test_raw"]["is_sparse"]) else np.array([]),
-        y_train_raw=splits.y_train_raw if splits.y_train_raw is not None else np.array([]),
+        X_train_raw=(
+            splits.X_train_raw
+            if (splits.X_train_raw is not None and not meta["X_train_raw"]["is_sparse"])
+            else np.array([])
+        ),
+        X_val_raw=(
+            splits.X_val_raw
+            if (splits.X_val_raw is not None and not meta["X_val_raw"]["is_sparse"])
+            else np.array([])
+        ),
+        X_test_raw=(
+            splits.X_test_raw
+            if (splits.X_test_raw is not None and not meta["X_test_raw"]["is_sparse"])
+            else np.array([])
+        ),
+        y_train_raw=(
+            splits.y_train_raw if splits.y_train_raw is not None else np.array([])
+        ),
         y_val_raw=splits.y_val_raw if splits.y_val_raw is not None else np.array([]),
         y_test_raw=splits.y_test_raw if splits.y_test_raw is not None else np.array([]),
         _X_train_sparse=meta["X_train"]["is_sparse"],
@@ -245,28 +349,32 @@ def save_prepared_cellwise_data(
         _X_val_raw_path=meta["X_val_raw"].get("path", ""),
         _X_test_raw_path=meta["X_test_raw"].get("path", ""),
     )
-    
+
     # Save scalers as pickle (primary format)
     scaler_file = cache_dir / f"{cache_key}_cellwise_scalers.pkl"
-    with open(scaler_file, "wb") as f:
-        pickle.dump({
+    _atomic_pickle_dump(
+        scaler_file,
+        {
             "feature_scaler": prepared.feature_scaler,
             "target_scaler": prepared.target_scaler,
-        }, f)
-    
+        },
+    )
+
     _LOG.info("Saved prepared cell-wise data to %s", cache_dir)
 
 
-def load_prepared_cellwise_data(cache_dir: Path, cache_key: str) -> Optional[PreparedCellwiseData]:
+def load_prepared_cellwise_data(
+    cache_dir: Path, cache_key: str
+) -> Optional[PreparedCellwiseData]:
     """Load PreparedCellwiseData from disk.
-    
+
     Parameters
     ----------
     cache_dir : Path
         Directory containing cache files.
     cache_key : str
         Hash key for this configuration.
-    
+
     Returns
     -------
     Optional[PreparedCellwiseData]
@@ -275,23 +383,28 @@ def load_prepared_cellwise_data(cache_dir: Path, cache_key: str) -> Optional[Pre
     cache_dir = Path(cache_dir)
     split_file = cache_dir / f"{cache_key}_cellwise_splits.npz"
     scaler_file_pickle = cache_dir / f"{cache_key}_cellwise_scalers.pkl"
-    
+
     if not split_file.exists() or not scaler_file_pickle.exists():
         return None
-    
+
     try:
         # Load splits
         with np.load(split_file, allow_pickle=True) as data:
+
             def _load_matrix(name: str, *, allow_empty: bool = False):
                 sparse_flag = bool(data.get(f"_{name}_sparse", False))
                 path = data.get(f"_{name}_path", "")
                 if sparse_flag:
                     if not path:
-                        _LOG.warning("Missing sparse path for %s in %s", name, split_file)
+                        _LOG.warning(
+                            "Missing sparse path for %s in %s", name, split_file
+                        )
                         return None
                     mat_path = cache_dir / str(path)
                     if not mat_path.exists():
-                        _LOG.warning("Missing sparse matrix file %s for %s", mat_path, name)
+                        _LOG.warning(
+                            "Missing sparse matrix file %s for %s", mat_path, name
+                        )
                         return None
                     return _load_sparse_matrix(mat_path)
                 arr = data[name]
@@ -303,10 +416,19 @@ def load_prepared_cellwise_data(cache_dir: Path, cache_key: str) -> Optional[Pre
             X_val = _load_matrix("X_val")
             X_test = _load_matrix("X_test")
             if X_train is None or X_val is None or X_test is None:
-                _LOG.warning("Cached cell-wise splits incomplete; ignoring cache at %s", split_file)
+                _LOG.warning(
+                    "Cached cell-wise splits incomplete; ignoring cache at %s",
+                    split_file,
+                )
                 return None
-            if not sp.issparse(X_train) and (getattr(X_train, "ndim", 0) < 2 or getattr(X_train, "dtype", None) == object):
-                _LOG.warning("Cached cell-wise splits appear incompatible; ignoring cache at %s", split_file)
+            if not sp.issparse(X_train) and (
+                getattr(X_train, "ndim", 0) < 2
+                or getattr(X_train, "dtype", None) is object
+            ):
+                _LOG.warning(
+                    "Cached cell-wise splits appear incompatible; ignoring cache at %s",
+                    split_file,
+                )
                 return None
             splits = CellwiseSplitData(
                 X_train=X_train,
@@ -321,24 +443,40 @@ def load_prepared_cellwise_data(cache_dir: Path, cache_key: str) -> Optional[Pre
                 group_labels_train=data["group_labels_train"],
                 group_labels_val=data["group_labels_val"],
                 group_labels_test=data["group_labels_test"],
-                X_train_raw=_load_matrix("X_train_raw", allow_empty=True) if "X_train_raw" in data else None,
-                X_val_raw=_load_matrix("X_val_raw", allow_empty=True) if "X_val_raw" in data else None,
-                X_test_raw=_load_matrix("X_test_raw", allow_empty=True) if "X_test_raw" in data else None,
-                y_train_raw=data["y_train_raw"] if data["y_train_raw"].size > 0 else None,
+                X_train_raw=(
+                    _load_matrix("X_train_raw", allow_empty=True)
+                    if "X_train_raw" in data
+                    else None
+                ),
+                X_val_raw=(
+                    _load_matrix("X_val_raw", allow_empty=True)
+                    if "X_val_raw" in data
+                    else None
+                ),
+                X_test_raw=(
+                    _load_matrix("X_test_raw", allow_empty=True)
+                    if "X_test_raw" in data
+                    else None
+                ),
+                y_train_raw=(
+                    data["y_train_raw"] if data["y_train_raw"].size > 0 else None
+                ),
                 y_val_raw=data["y_val_raw"] if data["y_val_raw"].size > 0 else None,
                 y_test_raw=data["y_test_raw"] if data["y_test_raw"].size > 0 else None,
             )
-        
+
         feature_scaler, target_scaler = _load_scalers(cache_dir, cache_key, "cellwise")
-        
+
         prepared = PreparedCellwiseData(
             splits=splits,
             feature_scaler=feature_scaler,
             target_scaler=target_scaler,
         )
-        
+
         _LOG.info("Loaded prepared cell-wise data from %s", cache_dir)
         return prepared
     except Exception as exc:
-        _LOG.warning("Failed to load prepared cell-wise data from %s: %s", cache_dir, exc)
+        _LOG.warning(
+            "Failed to load prepared cell-wise data from %s: %s", cache_dir, exc
+        )
         return None

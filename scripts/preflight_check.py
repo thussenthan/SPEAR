@@ -22,12 +22,13 @@ from typing import List, Optional, Tuple
 
 class Colors:
     """ANSI color codes for terminal output."""
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BLUE = '\033[94m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
+
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    BLUE = "\033[94m"
+    BOLD = "\033[1m"
+    END = "\033[0m"
 
 
 def print_header(msg: str) -> None:
@@ -68,7 +69,6 @@ def check_required_packages() -> Tuple[bool, List[str]]:
         "psutil",
         "scipy",
         "sklearn",
-        "scanpy",
         "shap",
         "torch",
         "xgboost",
@@ -76,7 +76,7 @@ def check_required_packages() -> Tuple[bool, List[str]]:
         "seaborn",
         "joblib",
     ]
-    
+
     missing = []
     for pkg in required:
         try:
@@ -88,7 +88,14 @@ def check_required_packages() -> Tuple[bool, List[str]]:
         except ImportError:
             print_error(f"Package '{pkg}' missing")
             missing.append(pkg)
-    
+
+    # scanpy is optional: SPEAR no longer depends on it for manifest generation.
+    try:
+        importlib.import_module("scanpy")
+        print_ok("Package 'scanpy' installed (optional)")
+    except Exception as exc:
+        print_warn(f"Package 'scanpy' unavailable (optional): {exc}")
+
     return len(missing) == 0, missing
 
 
@@ -102,7 +109,7 @@ def check_optional_packages() -> None:
     """
 
     optional = {}
-    
+
     for pkg, warning in optional.items():
         try:
             importlib.import_module(pkg)
@@ -140,11 +147,11 @@ def check_directory_writable(path: Path, description: str) -> bool:
         except Exception as exc:
             print_error(f"Cannot create {description}: {path} ({exc})")
             return False
-    
+
     if not path.is_dir():
         print_error(f"{description} exists but is not a directory: {path}")
         return False
-    
+
     # Test write permission
     test_file = path / ".preflight_test"
     try:
@@ -161,19 +168,20 @@ def check_h5ad_file(path: Path, description: str) -> bool:
     """Validate AnnData h5ad file."""
     if not check_file_exists(path, description):
         return False
-    
+
     try:
         import anndata as ad
+
         adata = ad.read_h5ad(path.as_posix())
         n_obs, n_vars = adata.shape
         print_ok(f"  {description} loaded: {n_obs:,} cells × {n_vars:,} features")
-        
+
         # Check for common issues
         if n_obs == 0:
             print_warn(f"  {description} has 0 observations")
         if n_vars == 0:
             print_warn(f"  {description} has 0 variables")
-        
+
         return True
     except Exception as exc:
         print_error(f"  Failed to load {description}: {exc}")
@@ -184,7 +192,7 @@ def check_gtf_file(path: Path) -> bool:
     """Validate GTF file structure."""
     if not check_file_exists(path, "GTF annotation file"):
         return False
-    
+
     try:
         opener = gzip.open if path.suffix == ".gz" else open
         gene_count = 0
@@ -199,7 +207,7 @@ def check_gtf_file(path: Path) -> bool:
                     gene_count += 1
                 if gene_count >= 10:  # Sample first 10 genes
                     break
-        
+
         if gene_count > 0:
             print_ok(f"  GTF file parseable (sampled {gene_count} genes)")
             return True
@@ -216,20 +224,22 @@ def check_gene_manifest(path: Optional[Path]) -> bool:
     if path is None:
         print_warn("No gene manifest specified (will use all genes)")
         return True
-    
+
     if not check_file_exists(path, "Gene manifest"):
         return False
-    
+
     try:
         lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
         # Skip header if present
-        if lines and any(keyword in lines[0].lower() for keyword in ["gene", "symbol", "name"]):
+        if lines and any(
+            keyword in lines[0].lower() for keyword in ["gene", "symbol", "name"]
+        ):
             lines = lines[1:]
-        
+
         if len(lines) == 0:
             print_error("  Gene manifest is empty")
             return False
-        
+
         print_ok(f"  Gene manifest contains {len(lines)} genes")
         if len(lines) > 0:
             print_ok(f"  First gene: {lines[0]}")
@@ -242,8 +252,9 @@ def check_gene_manifest(path: Optional[Path]) -> bool:
 def check_pipeline_package() -> bool:
     """Verify spear package is importable."""
     try:
-        import spear
-        from spear import config, data, models, training, evaluation
+        import spear  # noqa: F401
+        from spear import config, data, evaluation, models, training  # noqa: F401
+
         print_ok("Pipeline package 'spear' importable")
         print_ok("  Core modules: config, data, models, training, evaluation")
         return True
@@ -289,15 +300,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Skip AnnData file validation (faster)",
     )
-    
+
     args = parser.parse_args(argv)
     base_dir = args.base_dir.expanduser().resolve()
-    
+
     print_header("SPEAR Pipeline Pre-flight Check")
     print(f"Base directory: {base_dir}\n")
-    
+
     results = []
-    
+
     # 1. Environment checks
     print_header("1. Environment Validation")
     results.append(check_python_version())
@@ -306,19 +317,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     check_optional_packages()
     results.append(check_pipeline_package())
-    
+
     # 2. Directory structure
     print_header("2. Directory Structure")
     output_dir = base_dir / "output"
     results_dir = output_dir / "results"
     logs_dir = output_dir / "logs"
-    
+
     results.append(check_directory_writable(results_dir, "Results directory"))
     results.append(check_directory_writable(logs_dir, "Logs directory"))
-    
+
     # 3. Data files
     print_header("3. Data Files")
-    
+
     # Auto-detect data paths
     if args.atac_path:
         atac_path = args.atac_path.expanduser().resolve()
@@ -326,36 +337,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Try common locations
         candidates = [
             base_dir / "data" / "embryonic" / "processed" / "combined_ATAC_qc.h5ad",
-            base_dir / "data" / "endothelial" / "processed" / "combined_ATAC_qc_under15%mito.h5ad",
+            base_dir
+            / "data"
+            / "endothelial"
+            / "processed"
+            / "combined_ATAC_qc_under15%mito.h5ad",
             base_dir / "combined_ATAC_qc.h5ad",
         ]
         atac_path = next((p for p in candidates if p.exists()), candidates[0])
-    
+
     if args.rna_path:
         rna_path = args.rna_path.expanduser().resolve()
     else:
         candidates = [
             base_dir / "data" / "embryonic" / "processed" / "combined_RNA_qc.h5ad",
-            base_dir / "data" / "endothelial" / "processed" / "combined_RNA_qc_under15%mito.h5ad",
+            base_dir
+            / "data"
+            / "endothelial"
+            / "processed"
+            / "combined_RNA_qc_under15%mito.h5ad",
             base_dir / "combined_RNA_qc.h5ad",
         ]
         rna_path = next((p for p in candidates if p.exists()), candidates[0])
-    
+
     if args.gtf_path:
         gtf_path = args.gtf_path.expanduser().resolve()
     else:
         gtf_path = base_dir / "data" / "references" / "GCF_000001635.27_genomic.gtf"
-    
+
     if not args.skip_data_checks:
         results.append(check_h5ad_file(atac_path, "ATAC AnnData"))
         results.append(check_h5ad_file(rna_path, "RNA AnnData"))
     else:
         results.append(check_file_exists(atac_path, "ATAC AnnData"))
         results.append(check_file_exists(rna_path, "RNA AnnData"))
-    
+
     results.append(check_gtf_file(gtf_path))
     results.append(check_gene_manifest(args.gene_manifest))
-    
+
     # 4. SLURM scripts (optional)
     print_header("4. SLURM Job Scripts (Optional)")
     cpu_script = base_dir / "jobs" / "slurm_spear_cellwise_chunked.sbatch"
@@ -368,25 +387,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         results.append(check_file_exists(gpu_script, "GPU SLURM script"))
     else:
         print_warn(f"GPU SLURM script not found (optional): {gpu_script}")
-    
+
     # Summary
     print_header("Summary")
     passed = sum(results)
     total = len(results)
-    
+
     if passed == total:
-        print(f"\n{Colors.GREEN}{Colors.BOLD}✓ All checks passed ({passed}/{total}){Colors.END}")
+        print(
+            f"\n{Colors.GREEN}{Colors.BOLD}✓ All checks passed ({passed}/{total}){Colors.END}"
+        )
         print(f"{Colors.GREEN}Pipeline is ready for production runs.{Colors.END}\n")
         return 0
     else:
         failed = total - passed
-        print(f"\n{Colors.YELLOW}{Colors.BOLD}⚠ {failed} check(s) failed ({passed}/{total} passed){Colors.END}")
-        print(f"{Colors.YELLOW}Please address the issues above before launching HPC jobs.{Colors.END}\n")
-        
+        print(
+            f"\n{Colors.YELLOW}{Colors.BOLD}⚠ {failed} check(s) failed ({passed}/{total} passed){Colors.END}"
+        )
+        print(
+            f"{Colors.YELLOW}Please address the issues above before launching HPC jobs.{Colors.END}\n"
+        )
+
         if not pkg_ok and missing:
             print(f"{Colors.YELLOW}Install missing packages:{Colors.END}")
             print(f"  pip install {' '.join(missing)}\n")
-        
+
         return 1
 
 

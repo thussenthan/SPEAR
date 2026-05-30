@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SPEAR Run Inventory Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "question_id",
+    "dataset_role",
+    "dataset",
+    "sample",
+    "gene_manifest",
+    "gene_set",
+    "gene_count",
+    "model",
+    "model_mode",
+    "feature_basis",
+    "window_bp",
+    "bin_size_bp",
+    "smoothing_label",
+    "split_strategy",
+    "run_type",
+    "strict_ranking_eligible",
+    "status"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "description": "Stable run identifier used across W&B, output folders, figures, and manuscript tables."
+    },
+    "question_id": {
+      "type": "string",
+      "description": "Reviewer or experiment question label, for example Q0, Q1, REV_SCARLINK, or TRANSFER_E85."
+    },
+    "dataset_role": {
+      "type": "string",
+      "enum": [
+        "primary_replicate",
+        "primary_condition",
+        "external_public",
+        "optional_supplement",
+        "tiny_smoke"
+      ]
+    },
+    "dataset": {
+      "type": "string",
+      "description": "Dataset family, for example embryonic, endothelial, or pbmc_10x_multiome."
+    },
+    "sample": {
+      "type": "string",
+      "description": "Sample or condition label, for example E8.5_rep2 or S3N_normoxia."
+    },
+    "train_sample": {
+      "type": ["string", "null"],
+      "description": "Training sample for transfer runs; null for within-sample runs."
+    },
+    "test_sample": {
+      "type": ["string", "null"],
+      "description": "Held-out sample for transfer runs; null for within-sample runs."
+    },
+    "condition": {
+      "type": ["string", "null"],
+      "description": "Condition label when applicable, for example hypoxia or normoxia."
+    },
+    "gene_manifest": {
+      "type": "string",
+      "description": "Manifest path relative to repository root."
+    },
+    "gene_set": {
+      "type": "string",
+      "enum": ["random", "hvg", "low_noisy", "shared_scarlink", "custom", "tiny"]
+    },
+    "gene_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "common_manifest_label": {
+      "type": ["string", "null"],
+      "description": "Shared manifest label used for strict comparable rankings."
+    },
+    "model": {
+      "type": "string",
+      "description": "SPEAR model identifier, for example transformer, ridge, or xgboost."
+    },
+    "model_mode": {
+      "type": "string",
+      "enum": ["per_gene", "multi_output", "external_method", "gene_activity_baseline"]
+    },
+    "feature_basis": {
+      "type": "string",
+      "enum": ["bin", "peak", "tile", "gene_activity", "mixed", "not_applicable"]
+    },
+    "window_bp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "bin_size_bp": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "global_atac_components": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "smoothing_label": {
+      "type": "string",
+      "enum": [
+        "raw",
+        "none",
+        "train_only_x",
+        "train_only_x_y",
+        "within_split_x",
+        "within_split_x_y",
+        "external_method"
+      ]
+    },
+    "smoothing_k": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "pseudobulk_group_size": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "pseudobulk_pca_components": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "group_purity_summary_path": {
+      "type": ["string", "null"]
+    },
+    "split_strategy": {
+      "type": "string",
+      "enum": [
+        "random_cells",
+        "grouped_cells",
+        "held_out_replicate",
+        "held_out_condition",
+        "scarlink_matched",
+        "external_method"
+      ]
+    },
+    "run_type": {
+      "type": "string",
+      "enum": ["smoke", "strict_benchmark", "ablation", "transfer", "external_comparator", "fallback", "supplement"]
+    },
+    "strict_ranking_eligible": {
+      "type": "boolean",
+      "description": "True only when genes, cells, splits, preprocessing, and metrics match the comparison set."
+    },
+    "fallback_reason": {
+      "type": ["string", "null"],
+      "description": "Required when strict_ranking_eligible is false because of reduced genes, fast mode, failed model, or altered preprocessing."
+    },
+    "fast_classical_mode": {
+      "type": "boolean",
+      "default": false
+    },
+    "wandb_project": {
+      "type": ["string", "null"]
+    },
+    "wandb_group": {
+      "type": ["string", "null"]
+    },
+    "wandb_run_id": {
+      "type": ["string", "null"]
+    },
+    "wandb_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "output_dir": {
+      "type": ["string", "null"]
+    },
+    "metrics_path": {
+      "type": ["string", "null"]
+    },
+    "per_gene_metrics_path": {
+      "type": ["string", "null"]
+    },
+    "shap_path": {
+      "type": ["string", "null"]
+    },
+    "feature_importance_path": {
+      "type": ["string", "null"]
+    },
+    "runtime_seconds": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "peak_memory_gb": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "status": {
+      "type": "string",
+      "enum": ["planned", "submitted", "running", "completed", "failed", "excluded", "deferred"]
+    },
+    "failure_mode": {
+      "type": ["string", "null"]
+    },
+    "spear_version": {
+      "type": ["string", "null"]
+    },
+    "scarlink_version": {
+      "type": ["string", "null"]
+    },
+    "source_table_version": {
+      "type": ["string", "null"],
+      "description": "Frozen table or artifact version used for figure generation."
+    },
+    "notes": {
+      "type": ["string", "null"]
+    }
+  }
+}

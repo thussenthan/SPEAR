@@ -1,5 +1,4 @@
-
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 from scipy.stats import pearsonr, spearmanr

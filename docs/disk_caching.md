@@ -9,7 +9,7 @@ When training multiple models with the same preprocessing configuration, expensi
 - Computes preprocessing once per unique configuration
 - Persists splits and scalers to disk in `data/.spear_cache/`
 - Reuses cached data for subsequent model training (30–100x preprocessing speedup)
-- Operates in cell-wise mode by default (multi-target regression for gene expression prediction)
+- Supports both per-gene and cell-wise preprocessing caches; the default training mode is per-gene, while multi-output remains available when explicitly enabled.
 
 ## Inputs
 
@@ -37,6 +37,7 @@ When training multiple models with the same preprocessing configuration, expensi
 - Embryonic dataset: 1000 genes from manifest (`data/embryonic/manifests/1000_random_genes.csv`), 54,301 cells after QC (see `docs/mouse_esc_dataset.md`).
 - Endothelial dataset: 1000 randomly selected genes, 4,735 cells after QC (see `docs/endothelial_dataset.md`).
 - Cached splits and scalers: `data/.spear_cache/<config_hash>_cellwise_splits.npz` and `*_cellwise_scalers.pkl` (JSON fallback supported).
+- CLI cache scope: `--cache-dir` defaults to `--cache-scope auto`, which caches cell-wise/multi-output preprocessing only. Per-gene disk caching writes one split file per gene and must be enabled explicitly with `--cache-scope gene` or `--cache-scope all`.
 
 ### How Caching Works
 
@@ -55,6 +56,7 @@ cache_key = SHA1(json.dumps({
     "target_scaler": "standard",
     "enable_smoothing": False,
     "smoothing_k": 1,
+    "global_atac_components": 0,
     "pseudobulk_group_size": 1,
     # ...other config params
 }, sort_keys=True))
@@ -99,40 +101,25 @@ data/.spear_cache/
 
 ### Setup and Practical Steps
 
-#### Step 1 – Prepare Datasets
+#### Step 1 – Build Processed Inputs
 
 ```bash
 cd /path/to/SPEAR
-python scripts/prepare_datasets.py
+python scripts/download_geo_raw_data.py --datasets embryonic endothelial
+python scripts/preprocess_geo_raw_to_spear.py --datasets embryonic
+python scripts/preprocess_geo_raw_to_spear.py --datasets endothelial
+python scripts/generate_all_sample_manifests.py --base-dir data --gene-count 1000 --random-state 42
 ```
 
-This script:
+These scripts:
 
-- Loads embryonic RNA and ATAC from `data/embryonic/processed/` and subsets to 1000 genes from manifest.
-- Loads endothelial RNA and ATAC from `data/endothelial/processed/` and randomly selects 1000 genes.
-- Performs cell-wise preprocessing: train/val/test split (60%/20%/20%), StandardScaler on features and targets.
-- Saves all preprocessed splits and scalers to `data/.spear_cache/`.
+- download raw GEO inputs and shared references into `data/`
+- preprocess each sample into paired RNA/ATAC `.h5ad` files under `data/*/processed/per_sample/`
+- generate per-sample gene manifests under `data/*/manifests/`
 
-**Expected output (counts reflect 60/20/20 random split logic and current dataset sizes; group-aware splits can vary):**
+The actual cached cell-wise preprocessing happens automatically at training time when `--cache-dir` is enabled. In per-gene mode, the same `--cache-dir` does not write per-gene disk caches unless `--cache-scope gene` or `--cache-scope all` is provided.
 
-```text
-================================================================================
-PREPARING EMBRYONIC DATASET
-================================================================================
-Loading gene manifest from data/embryonic/manifests/1000_random_genes.csv
-Loaded 1000 genes from manifest
-Loading RNA data from data/embryonic/processed/combined_RNA_qc.h5ad
-...
-✓ Embryonic dataset prepared and cached
-  Train: 32580 | Val: 10860 | Test: 10861 | Features: 100000 | Targets: 1000
-
-================================================================================
-PREPARING ENDOTHELIAL DATASET
-================================================================================
-...
-✓ Endothelial dataset prepared and cached
-  Train: 2841 | Val: 947 | Test: 947 | Features: 150000 | Targets: 1000
-```
+**Expected output:** processed per-sample `.h5ad` files, manifests, and then cell-wise cache files appearing under `data/.spear_cache/` after the first multi-output training run with `--cache-dir`.
 
 #### Step 2 – Train Models
 
@@ -146,6 +133,14 @@ python -m spear.cli train --dataset embryonic --models ridge --cache-dir data/.s
 python -m spear.cli train --dataset embryonic --models elasticnet --cache-dir data/.spear_cache
 python -m spear.cli train --dataset endothelial --models ridge --cache-dir data/.spear_cache
 ```
+
+To deliberately persist per-gene preprocessing across separate jobs or reruns:
+
+```bash
+python -m spear.cli --models ridge --gene-manifest data/embryonic/manifests/1000_random_genes.csv --cache-dir data/.spear_cache --cache-scope gene
+```
+
+Use this sparingly: per-gene disk caching can produce one large `*_gene_splits.npz` per gene and preprocessing configuration.
 
 ### API Usage
 
@@ -170,7 +165,7 @@ prepared = prepare_cellwise_data(dataset, config, cache_dir=cache_dir)
 
 #### Configuration
 
-Modify preprocessing parameters in `scripts/prepare_datasets.py`:
+Modify preprocessing parameters in the CLI config or the underlying training configuration:
 
 ```python
 config = TrainingConfig(
@@ -243,8 +238,8 @@ To clear and rebuild cache:
 # Remove old cache
 rm -rf data/.spear_cache
 
-# Regenerate with fresh preprocessing
-python scripts/prepare_datasets.py
+# Regenerate with fresh preprocessing on the next training run
+python -m spear.cli --cache-dir data/.spear_cache ...
 ```
 
 #### Multiple Configurations
@@ -288,7 +283,7 @@ For extremely large datasets:
 
 ```bash
 rm -rf data/.spear_cache
-python scripts/prepare_datasets.py
+python -m spear.cli --cache-dir data/.spear_cache ...
 ```
 
 #### Out of Memory During Preprocessing
@@ -311,8 +306,8 @@ If densifying sparse matrices fails:
 # Remove pickle files (NPZ arrays will still load)
 rm data/.spear_cache/*.pkl
 
-# Rerun preparation to recompute scalers
-python scripts/prepare_datasets.py
+# Rerun training to recompute scalers
+python -m spear.cli --cache-dir data/.spear_cache ...
 ```
 
 ## References
@@ -330,8 +325,6 @@ spear/
 ├── src/spear/
 │   ├── cache.py                    # Serialization/deserialization functions
 │   └── training.py                 # Modified for caching support
-├── scripts/
-│   └── prepare_datasets.py         # Dataset preparation pipeline
 └── docs/
     └── disk_caching.md             # This documentation
 ```
@@ -366,6 +359,7 @@ Hash includes these configuration parameters:
     "enable_smoothing": bool,
     "smoothing_k": int,
     "smoothing_pca_components": int,
+    "global_atac_components": int,
     "pseudobulk_group_size": int,
     "pseudobulk_pca_components": int,
     "scaler": "standard" | "minmax" | None,

@@ -11,9 +11,8 @@ import anndata as ad
 import numpy as np
 import scipy.sparse as sp
 
-from spear.config import PathsConfig, TrainingConfig
+from spear.config import TrainingConfig
 from spear.data import GeneInfo, parse_gtf, select_genes
-
 
 DATASET_DEFAULTS = {
     "embryonic": {
@@ -93,7 +92,9 @@ def compute_expression_fraction(
         counts = np.asarray((matrix >= min_expression).sum(axis=0)).ravel()
     fractions = counts / float(rna.n_obs)
     gene_names = np.asarray(rna.var_names).astype(str)
-    return {name: float(frac) for name, frac in zip(gene_names, fractions, strict=False)}
+    return {
+        name: float(frac) for name, frac in zip(gene_names, fractions, strict=False)
+    }
 
 
 def rank_genes(
@@ -108,7 +109,9 @@ def rank_genes(
         if frac is None:
             continue
         ranked.append((gene, float(frac)))
-    ranked.sort(key=lambda item: (-item[1], item[0].gene_name.lower(), item[0].gene_id.lower()))
+    ranked.sort(
+        key=lambda item: (-item[1], item[0].gene_name.lower(), item[0].gene_id.lower())
+    )
     return ranked
 
 
@@ -136,7 +139,11 @@ def main() -> None:
     training = TrainingConfig()
     training.validate()
 
-    min_expression = args.min_expression if args.min_expression is not None else training.min_expression
+    min_expression = (
+        args.min_expression
+        if args.min_expression is not None
+        else training.min_expression
+    )
 
     rna = load_rna_matrix(rna_path)
     fractions = compute_expression_fraction(rna, min_expression=min_expression)
@@ -149,7 +156,9 @@ def main() -> None:
     if not ranked:
         raise SystemExit("No matching genes found between GTF and RNA matrix.")
 
-    output_path = args.output or (manifest_dir / f"top_{args.gene_count}_expression_fraction.csv")
+    output_path = args.output or (
+        manifest_dir / f"top_{args.gene_count}_expression_fraction.csv"
+    )
     write_manifest(ranked, output_path, limit=args.gene_count)
 
     print(f"Wrote {min(args.gene_count, len(ranked))} genes to {output_path}")

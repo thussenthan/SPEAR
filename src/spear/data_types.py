@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
@@ -29,6 +29,7 @@ class SplitData:
     y_train_raw: Optional[np.ndarray] = field(default=None, repr=False)
     y_val_raw: Optional[np.ndarray] = field(default=None, repr=False)
     y_test_raw: Optional[np.ndarray] = field(default=None, repr=False)
+    metadata: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass

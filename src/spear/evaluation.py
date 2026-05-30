@@ -1,6 +1,4 @@
-
 import json
-import logging
 import math
 import os
 import re
@@ -9,7 +7,7 @@ import time
 import traceback
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager, nullcontext
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -25,10 +23,10 @@ import torch
 
 from .config import PipelineConfig, TrainingConfig
 from .data import (
+    CellwiseDataset,
     GeneInfo,
     PeakIndexer,
     build_cellwise_dataset,
-    build_cellwise_features_only,
     build_gene_dataset,
     filter_atac_by_genes,
     load_datasets,
@@ -37,26 +35,37 @@ from .data import (
     select_genes,
 )
 from .logging_utils import ResourceUsageTracker, get_logger
-from .training import CellwiseModelResult, ModelResult, train_model_for_gene, train_multi_output_model, get_resource_summary
-from . import predict
+from .training import (
+    CellwiseModelResult,
+    GlobalSplitKNN,
+    ModelResult,
+    precompute_global_split_knn,
+    train_model_for_gene,
+    train_multi_output_model,
+    get_resource_summary,
+)
 from .wandb_utils import (
     apply_sweep_overrides,
+    check_duplicate_run,
+    compute_run_fingerprint,
     infer_dataset_name,
+    log_feature_summary_charts_from_csv,
     log_images_from_globs,
     log_metric_distribution_charts_from_csv,
     log_prediction_charts_from_csv,
+    log_resource_usage_charts_from_csv,
     log_training_history_charts_from_csv,
     log_run_artifacts,
     log_tables_from_csv,
     maybe_init_wandb,
+    run_has_fallbacks,
     wandb_finish,
+    wandb_log_metrics,
     wandb_update_config,
     wandb_update_summary,
 )
 from .visualization import (
     plot_feature_importance,
-    plot_correlation_boxplot,
-    plot_correlation_violin,
     plot_predictions_vs_actual,
     plot_residual_barplot_by_split,
     plot_residual_histogram_by_split,
@@ -75,11 +84,72 @@ _FEATURE_BIN_PATTERN = re.compile(r"bin_(-?\d+)_to_(-?\d+)", re.IGNORECASE)
 # Regex to parse genomic interval notation: chr<name>:<start>-<end>
 # Expected format examples: 'chr1:1000-2000', 'chrX:500000-600000', 'chrMT:100-200'
 # Captures: (1) chromosome name, (2) start position, (3) end position
-_FEATURE_INTERVAL_PATTERN = re.compile(r"^(chr[A-Za-z0-9_]+):(\d+)-(\d+)$", re.IGNORECASE)
+_FEATURE_INTERVAL_PATTERN = re.compile(
+    r"^(chr[A-Za-z0-9_]+):(\d+)-(\d+)$", re.IGNORECASE
+)
 _METRIC_ORDER = ("pearson", "r2", "spearman", "rmse", "mse", "mae")
+_METRIC_DISPLAY_NAMES = {
+    "pearson": "Pearson",
+    "r2": "R2",
+    "spearman": "Spearman",
+    "rmse": "RMSE",
+    "mse": "MSE",
+    "mae": "MAE",
+}
+_METRIC_AXIS_LABELS = {
+    "pearson": "Pearson correlation coefficient",
+    "spearman": "Spearman correlation coefficient",
+    "r2": "R2",
+    "rmse": "RMSE",
+    "mse": "MSE",
+    "mae": "MAE",
+}
 
 
-def _compute_model_metric_summary(output_dir: Path) -> Dict[str, Dict[str, float | int]]:
+def _resolve_per_gene_cell_filter_mode(config: PipelineConfig) -> tuple[str, str]:
+    mode = getattr(config.training, "per_gene_cell_filter_mode", "auto")
+    if mode in {"on", "off"}:
+        reason = "explicit_on" if mode == "on" else "explicit_off"
+        return mode, reason
+    manifest_path = str(config.gene_manifest_path or "")
+    if manifest_path and "low_noisy" in manifest_path.lower():
+        return "off", "auto_low_noisy_manifest"
+    return "off", "auto_default_off_for_data_parity"
+
+
+def _metric_display_name(metric: str) -> str:
+    return _METRIC_DISPLAY_NAMES.get(metric, metric.upper())
+
+
+def _progress_bar(current: int, total: int, *, width: int = 20) -> str:
+    if total <= 0:
+        return "[unknown]"
+    bounded_current = min(max(current, 0), total)
+    filled = int(round((bounded_current / total) * width))
+    filled = min(width, max(0, filled))
+    return f"[{'#' * filled}{'-' * (width - filled)}]"
+
+
+def _should_log_progress(current: int, total: int, *, updates: int = 10) -> bool:
+    if total <= 0:
+        return False
+    if current in {1, total}:
+        return True
+    interval = max(1, total // updates)
+    return current % interval == 0
+
+
+def _finite_median(values: Sequence[object]) -> Optional[float]:
+    series = pd.to_numeric(pd.Series(list(values)), errors="coerce")
+    series = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if series.empty:
+        return None
+    return float(series.median())
+
+
+def _compute_model_metric_summary(
+    output_dir: Path,
+) -> Dict[str, Dict[str, float | int]]:
     metrics = ("pearson", "r2", "spearman", "rmse", "mse", "mae")
     values_by_metric: Dict[str, List[float]] = {metric: [] for metric in metrics}
 
@@ -93,7 +163,11 @@ def _compute_model_metric_summary(output_dir: Path) -> Dict[str, Dict[str, float
             for metric in metrics:
                 if metric not in df.columns:
                     continue
-                series = pd.to_numeric(df[metric], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+                series = (
+                    pd.to_numeric(df[metric], errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                    .dropna()
+                )
                 if not series.empty:
                     values_by_metric[metric].extend(float(v) for v in series.to_numpy())
         elif metrics_by_gene_path.exists():
@@ -103,19 +177,31 @@ def _compute_model_metric_summary(output_dir: Path) -> Dict[str, Dict[str, float
                 for col in cols:
                     if col not in df.columns:
                         continue
-                    series = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+                    series = (
+                        pd.to_numeric(df[col], errors="coerce")
+                        .replace([np.inf, -np.inf], np.nan)
+                        .dropna()
+                    )
                     if not series.empty:
-                        values_by_metric[metric].extend(float(v) for v in series.to_numpy())
+                        values_by_metric[metric].extend(
+                            float(v) for v in series.to_numpy()
+                        )
         elif metrics_aggregate_path.exists():
             df = pd.read_csv(metrics_aggregate_path)
             for metric in metrics:
                 if metric not in df.columns:
                     continue
-                series = pd.to_numeric(df[metric], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+                series = (
+                    pd.to_numeric(df[metric], errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                    .dropna()
+                )
                 if not series.empty:
                     values_by_metric[metric].extend(float(v) for v in series.to_numpy())
     except Exception:
-        _LOG.debug("Failed to compute model metric summary from %s", output_dir, exc_info=True)
+        _LOG.debug(
+            "Failed to compute model metric summary from %s", output_dir, exc_info=True
+        )
         return {}
 
     summary: Dict[str, Dict[str, float | int]] = {}
@@ -131,87 +217,92 @@ def _compute_model_metric_summary(output_dir: Path) -> Dict[str, Dict[str, float
     return summary
 
 
-def _flatten_numeric_metrics(payload: Dict[str, Any], *, prefix: str) -> Dict[str, float]:
-    flattened: Dict[str, float] = {}
-
-    def _visit(value: Any, key_prefix: str) -> None:
-        if isinstance(value, dict):
-            for k, v in value.items():
-                _visit(v, f"{key_prefix}/{k}" if key_prefix else str(k))
-            return
-        if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
-            flattened[key_prefix] = float(value)
-
-    _visit(payload, prefix)
-    return flattened
-
-
 def _compact_shap_metric_payload(shap_summary: Dict[str, Any]) -> Dict[str, float]:
     """Build short SHAP metric keys for W&B summary (e.g., ``shap.mse_mean``)."""
 
     payload: Dict[str, float] = {}
     num_features = shap_summary.get("num_features")
-    if isinstance(num_features, (int, float, np.integer, np.floating)) and np.isfinite(float(num_features)):
+    if isinstance(num_features, (int, float, np.integer, np.floating)) and np.isfinite(
+        float(num_features)
+    ):
         payload["shap.num_features"] = float(num_features)
 
     mean_abs_sum = shap_summary.get("shap_mean_abs_sum")
-    if isinstance(mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_abs_sum)):
+    if isinstance(mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(
+        float(mean_abs_sum)
+    ):
         payload["shap.mean_abs_sum"] = float(mean_abs_sum)
 
-    mean_sum = shap_summary.get("shap_mean_sum")
-    if isinstance(mean_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_sum)):
-        payload["shap.mean_sum"] = float(mean_sum)
-
     mean_abs_top1 = shap_summary.get("shap_mean_abs_top1")
-    if isinstance(mean_abs_top1, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_abs_top1)):
+    if isinstance(mean_abs_top1, (int, float, np.integer, np.floating)) and np.isfinite(
+        float(mean_abs_top1)
+    ):
         payload["shap.mean_abs_top1"] = float(mean_abs_top1)
 
-    mean_top1 = shap_summary.get("shap_mean_top1")
-    if isinstance(mean_top1, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_top1)):
-        payload["shap.mean_top1"] = float(mean_top1)
-
     mean_signed_sum = shap_summary.get("shap_mean_signed_sum")
-    if isinstance(mean_signed_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_signed_sum)):
+    if isinstance(
+        mean_signed_sum, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(mean_signed_sum)):
         payload["shap.mean_signed_sum"] = float(mean_signed_sum)
 
     mean_signed_top_positive = shap_summary.get("shap_mean_signed_top_positive")
-    if isinstance(mean_signed_top_positive, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_signed_top_positive)):
+    if isinstance(
+        mean_signed_top_positive, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(mean_signed_top_positive)):
         payload["shap.mean_signed_top_positive"] = float(mean_signed_top_positive)
 
     mean_signed_top_negative = shap_summary.get("shap_mean_signed_top_negative")
-    if isinstance(mean_signed_top_negative, (int, float, np.integer, np.floating)) and np.isfinite(float(mean_signed_top_negative)):
+    if isinstance(
+        mean_signed_top_negative, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(mean_signed_top_negative)):
         payload["shap.mean_signed_top_negative"] = float(mean_signed_top_negative)
 
     per_gene_count = shap_summary.get("per_gene_count")
-    if isinstance(per_gene_count, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_count)):
+    if isinstance(
+        per_gene_count, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(per_gene_count)):
         payload["shap.per_gene_count"] = float(per_gene_count)
 
     per_gene_mean_abs_sum = shap_summary.get("per_gene_mean_abs_sum")
-    if isinstance(per_gene_mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_mean_abs_sum)):
+    if isinstance(
+        per_gene_mean_abs_sum, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(per_gene_mean_abs_sum)):
         payload["shap.per_gene_mean_abs_sum"] = float(per_gene_mean_abs_sum)
 
     per_gene_mean_sum = shap_summary.get("per_gene_mean_signed_sum")
-    if isinstance(per_gene_mean_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_mean_sum)):
-        payload["shap.per_gene_mean_sum"] = float(per_gene_mean_sum)
+    if isinstance(
+        per_gene_mean_sum, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(per_gene_mean_sum)):
+        payload["shap.per_gene_mean_signed_sum"] = float(per_gene_mean_sum)
 
     top10_weight_share = shap_summary.get("top10_weight_share")
-    if isinstance(top10_weight_share, (int, float, np.integer, np.floating)) and np.isfinite(float(top10_weight_share)):
+    if isinstance(
+        top10_weight_share, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(top10_weight_share)):
         payload["shap.top10_weight_share"] = float(top10_weight_share)
 
     tss_near_2kb_share = shap_summary.get("tss_near_2kb_share")
-    if isinstance(tss_near_2kb_share, (int, float, np.integer, np.floating)) and np.isfinite(float(tss_near_2kb_share)):
+    if isinstance(
+        tss_near_2kb_share, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(tss_near_2kb_share)):
         payload["shap.tss_near_2kb_share"] = float(tss_near_2kb_share)
 
     tss_corr = shap_summary.get("tss_correlation")
     if isinstance(tss_corr, dict):
         corr_pearson = tss_corr.get("pearson")
-        if isinstance(corr_pearson, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_pearson)):
+        if isinstance(
+            corr_pearson, (int, float, np.integer, np.floating)
+        ) and np.isfinite(float(corr_pearson)):
             payload["shap.tss_corr_pearson"] = float(corr_pearson)
         corr_spearman = tss_corr.get("spearman")
-        if isinstance(corr_spearman, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_spearman)):
+        if isinstance(
+            corr_spearman, (int, float, np.integer, np.floating)
+        ) and np.isfinite(float(corr_spearman)):
             payload["shap.tss_corr_spearman"] = float(corr_spearman)
         corr_count = tss_corr.get("count")
-        if isinstance(corr_count, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_count)):
+        if isinstance(
+            corr_count, (int, float, np.integer, np.floating)
+        ) and np.isfinite(float(corr_count)):
             payload["shap.tss_corr_count"] = float(corr_count)
 
     model_metrics = shap_summary.get("model_metrics")
@@ -226,77 +317,109 @@ def _compact_shap_metric_payload(shap_summary: Dict[str, Any]) -> Dict[str, floa
             continue
         for stat_name in ("mean", "std", "count"):
             value = metric_stats.get(stat_name)
-            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(
+                float(value)
+            ):
                 payload[f"shap.{metric_token}_{stat_name}"] = float(value)
     return payload
 
 
-def _compact_feature_importance_metric_payload(fi_summary: Dict[str, Any]) -> Dict[str, float]:
+def _compact_feature_importance_metric_payload(
+    fi_summary: Dict[str, Any],
+) -> Dict[str, float]:
     """Build short FI metric keys (e.g., ``fi.pearson_mean``)."""
 
     payload: Dict[str, float] = {}
     num_features = fi_summary.get("num_features")
-    if isinstance(num_features, (int, float, np.integer, np.floating)) and np.isfinite(float(num_features)):
+    if isinstance(num_features, (int, float, np.integer, np.floating)) and np.isfinite(
+        float(num_features)
+    ):
         payload["fi.num_features"] = float(num_features)
 
-    importance_mean_sum = fi_summary.get("importance_mean_sum")
-    if isinstance(importance_mean_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_sum)):
-        payload["fi.mean_sum"] = float(importance_mean_sum)
-
     importance_mean_abs_sum = fi_summary.get("importance_mean_abs_sum")
-    if isinstance(importance_mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_abs_sum)):
+    if isinstance(
+        importance_mean_abs_sum, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(importance_mean_abs_sum)):
         payload["fi.mean_abs_sum"] = float(importance_mean_abs_sum)
 
-    importance_mean_top1 = fi_summary.get("importance_mean_top1")
-    if isinstance(importance_mean_top1, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_top1)):
-        payload["fi.mean_top1"] = float(importance_mean_top1)
-
     importance_mean_abs_top1 = fi_summary.get("importance_mean_abs_top1")
-    if isinstance(importance_mean_abs_top1, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_abs_top1)):
+    if isinstance(
+        importance_mean_abs_top1, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(importance_mean_abs_top1)):
         payload["fi.mean_abs_top1"] = float(importance_mean_abs_top1)
 
     importance_mean_signed_sum = fi_summary.get("importance_mean_signed_sum")
-    if isinstance(importance_mean_signed_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_signed_sum)):
+    if isinstance(
+        importance_mean_signed_sum, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(importance_mean_signed_sum)):
         payload["fi.mean_signed_sum"] = float(importance_mean_signed_sum)
 
-    importance_mean_signed_top_positive = fi_summary.get("importance_mean_signed_top_positive")
-    if isinstance(importance_mean_signed_top_positive, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_signed_top_positive)):
-        payload["fi.mean_signed_top_positive"] = float(importance_mean_signed_top_positive)
+    importance_mean_signed_top_positive = fi_summary.get(
+        "importance_mean_signed_top_positive"
+    )
+    if isinstance(
+        importance_mean_signed_top_positive, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(importance_mean_signed_top_positive)):
+        payload["fi.mean_signed_top_positive"] = float(
+            importance_mean_signed_top_positive
+        )
 
-    importance_mean_signed_top_negative = fi_summary.get("importance_mean_signed_top_negative")
-    if isinstance(importance_mean_signed_top_negative, (int, float, np.integer, np.floating)) and np.isfinite(float(importance_mean_signed_top_negative)):
-        payload["fi.mean_signed_top_negative"] = float(importance_mean_signed_top_negative)
+    importance_mean_signed_top_negative = fi_summary.get(
+        "importance_mean_signed_top_negative"
+    )
+    if isinstance(
+        importance_mean_signed_top_negative, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(importance_mean_signed_top_negative)):
+        payload["fi.mean_signed_top_negative"] = float(
+            importance_mean_signed_top_negative
+        )
 
     per_gene_count = fi_summary.get("per_gene_count")
-    if isinstance(per_gene_count, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_count)):
+    if isinstance(
+        per_gene_count, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(per_gene_count)):
         payload["fi.per_gene_count"] = float(per_gene_count)
 
     per_gene_mean_importance_sum = fi_summary.get("per_gene_mean_importance_sum")
-    if isinstance(per_gene_mean_importance_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_mean_importance_sum)):
-        payload["fi.per_gene_mean_sum"] = float(per_gene_mean_importance_sum)
+    if isinstance(
+        per_gene_mean_importance_sum, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(per_gene_mean_importance_sum)):
+        payload["fi.per_gene_mean_signed_sum"] = float(per_gene_mean_importance_sum)
 
     per_gene_mean_abs_sum = fi_summary.get("per_gene_mean_abs_sum")
-    if isinstance(per_gene_mean_abs_sum, (int, float, np.integer, np.floating)) and np.isfinite(float(per_gene_mean_abs_sum)):
+    if isinstance(
+        per_gene_mean_abs_sum, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(per_gene_mean_abs_sum)):
         payload["fi.per_gene_mean_abs_sum"] = float(per_gene_mean_abs_sum)
 
     top10_weight_share = fi_summary.get("top10_weight_share")
-    if isinstance(top10_weight_share, (int, float, np.integer, np.floating)) and np.isfinite(float(top10_weight_share)):
+    if isinstance(
+        top10_weight_share, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(top10_weight_share)):
         payload["fi.top10_weight_share"] = float(top10_weight_share)
 
     tss_near_2kb_share = fi_summary.get("tss_near_2kb_share")
-    if isinstance(tss_near_2kb_share, (int, float, np.integer, np.floating)) and np.isfinite(float(tss_near_2kb_share)):
+    if isinstance(
+        tss_near_2kb_share, (int, float, np.integer, np.floating)
+    ) and np.isfinite(float(tss_near_2kb_share)):
         payload["fi.tss_near_2kb_share"] = float(tss_near_2kb_share)
 
     tss_corr = fi_summary.get("tss_correlation")
     if isinstance(tss_corr, dict):
         corr_pearson = tss_corr.get("pearson")
-        if isinstance(corr_pearson, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_pearson)):
+        if isinstance(
+            corr_pearson, (int, float, np.integer, np.floating)
+        ) and np.isfinite(float(corr_pearson)):
             payload["fi.tss_corr_pearson"] = float(corr_pearson)
         corr_spearman = tss_corr.get("spearman")
-        if isinstance(corr_spearman, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_spearman)):
+        if isinstance(
+            corr_spearman, (int, float, np.integer, np.floating)
+        ) and np.isfinite(float(corr_spearman)):
             payload["fi.tss_corr_spearman"] = float(corr_spearman)
         corr_count = tss_corr.get("count")
-        if isinstance(corr_count, (int, float, np.integer, np.floating)) and np.isfinite(float(corr_count)):
+        if isinstance(
+            corr_count, (int, float, np.integer, np.floating)
+        ) and np.isfinite(float(corr_count)):
             payload["fi.tss_corr_count"] = float(corr_count)
 
     model_metrics = fi_summary.get("model_metrics")
@@ -311,7 +434,9 @@ def _compact_feature_importance_metric_payload(fi_summary: Dict[str, Any]) -> Di
             continue
         for stat_name in ("mean", "std", "count"):
             value = metric_stats.get(stat_name)
-            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(
+                float(value)
+            ):
                 payload[f"fi.{metric_token}_{stat_name}"] = float(value)
     return payload
 
@@ -396,7 +521,12 @@ def _infer_signed_distance_from_blocks(
     feature_block_indices: Optional[Sequence[Sequence[int]]],
     gene_infos: Optional[Sequence[GeneInfo]],
 ) -> Optional[np.ndarray]:
-    if not feature_names or not gene_names or not feature_block_indices or not gene_infos:
+    if (
+        not feature_names
+        or not gene_names
+        or not feature_block_indices
+        or not gene_infos
+    ):
         return None
 
     feature_count = len(feature_names)
@@ -470,7 +600,10 @@ def _export_feature_importance_artifacts(
     fi = np.asarray(importances, dtype=np.float64)
     feature_count = int(fi.size if fi.ndim == 1 else fi.shape[-1])
     if feature_count == 0:
-        _LOG.info("Feature importance export skipped | model=%s | reason=no features", model_name)
+        _LOG.info(
+            "Feature importance export skipped | model=%s | reason=no features",
+            model_name,
+        )
         return {}
 
     start_wall = time.perf_counter()
@@ -525,13 +658,18 @@ def _export_feature_importance_artifacts(
     )
     fi_signed: Optional[np.ndarray] = None
     if feature_importance_mean_signed is not None:
-        signed_candidate = np.asarray(feature_importance_mean_signed, dtype=np.float64).reshape(-1)
+        signed_candidate = np.asarray(
+            feature_importance_mean_signed, dtype=np.float64
+        ).reshape(-1)
         if signed_candidate.shape[0] == fi_mean.shape[0]:
             fi_signed = signed_candidate
             aggregate_df["importance_mean_signed"] = signed_candidate
     if metadata_df is not None and not metadata_df.empty:
         aggregate_df = pd.concat([aggregate_df, metadata_df], axis=1)
-    if "signed_distance_to_tss_kb" not in aggregate_df.columns or not aggregate_df["signed_distance_to_tss_kb"].notna().any():
+    if (
+        "signed_distance_to_tss_kb" not in aggregate_df.columns
+        or not aggregate_df["signed_distance_to_tss_kb"].notna().any()
+    ):
         inferred_dist = _infer_signed_distance_from_blocks(
             feature_names,
             gene_names,
@@ -552,10 +690,14 @@ def _export_feature_importance_artifacts(
     if "feature_class" in aggregate_df.columns:
         class_counts = aggregate_df["feature_class"].value_counts(dropna=False).head(5)
         if not class_counts.empty:
-            breakdown = ", ".join(f"{str(cls)}:{int(cnt)}" for cls, cnt in class_counts.items())
+            breakdown = ", ".join(
+                f"{str(cls)}:{int(cnt)}" for cls, cnt in class_counts.items()
+            )
             _LOG.info("Feature class breakdown | %s | %s", model_name, breakdown)
 
-    top_feature_rows = aggregate_df.sort_values("importance_mean", ascending=False).head(5)
+    top_feature_rows = aggregate_df.sort_values(
+        "importance_mean", ascending=False
+    ).head(5)
     if not top_feature_rows.empty:
         top_summary = ", ".join(
             f"{row.feature}={row.importance_mean:.4f}"
@@ -571,17 +713,34 @@ def _export_feature_importance_artifacts(
                 "importance_mean_signed": fi_signed,
             }
         )
-        signed_df = signed_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["importance_mean_signed"])
+        signed_df = signed_df.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=["importance_mean_signed"]
+        )
         if not signed_df.empty:
-            top_pos = signed_df.sort_values("importance_mean_signed", ascending=False).head(10)
-            top_neg = signed_df.sort_values("importance_mean_signed", ascending=True).head(10)
-            signed_top = pd.concat([top_neg, top_pos], axis=0).drop_duplicates(subset=["feature"], keep="first")
+            top_pos = signed_df.sort_values(
+                "importance_mean_signed", ascending=False
+            ).head(10)
+            top_neg = signed_df.sort_values(
+                "importance_mean_signed", ascending=True
+            ).head(10)
+            signed_top = pd.concat([top_neg, top_pos], axis=0).drop_duplicates(
+                subset=["feature"], keep="first"
+            )
             if not signed_top.empty:
                 fi_signed_plot_path = output_dir / "feature_importance_mean_signed.png"
-                signed_top = signed_top.sort_values("importance_mean_signed", ascending=True)
+                signed_top = signed_top.sort_values(
+                    "importance_mean_signed", ascending=True
+                )
                 fig, ax = plt.subplots(figsize=(9.0, 6.0))
-                bar_colors = ["#1f77b4" if v < 0 else "#d62728" for v in signed_top["importance_mean_signed"]]
-                ax.barh(signed_top["feature"], signed_top["importance_mean_signed"], color=bar_colors)
+                bar_colors = [
+                    "#1f77b4" if v < 0 else "#d62728"
+                    for v in signed_top["importance_mean_signed"]
+                ]
+                ax.barh(
+                    signed_top["feature"],
+                    signed_top["importance_mean_signed"],
+                    color=bar_colors,
+                )
                 ax.axvline(0.0, color="#666666", linestyle="--", linewidth=1)
                 ax.set_xlabel("Mean signed feature importance")
                 ax.set_ylabel("Feature")
@@ -589,7 +748,9 @@ def _export_feature_importance_artifacts(
                 plt.tight_layout()
                 fig.savefig(fi_signed_plot_path, dpi=300)
                 plt.close(fig)
-                _LOG.info("Saved signed feature importance plot to %s", fi_signed_plot_path)
+                _LOG.info(
+                    "Saved signed feature importance plot to %s", fi_signed_plot_path
+                )
 
     per_gene_summary_path: Optional[Path] = None
     fi_per_gene_count: Optional[int] = None
@@ -626,22 +787,39 @@ def _export_feature_importance_artifacts(
                 continue
             gene_label = gene_names[idx]
             gene_block_indices[gene_label] = indices
-            gene_info = gene_infos[idx] if gene_infos is not None and idx < len(gene_infos) else None
+            gene_info = (
+                gene_infos[idx]
+                if gene_infos is not None and idx < len(gene_infos)
+                else None
+            )
             record = {
                 "gene": gene_label,
                 "feature_count": int(block.shape[0]),
                 "importance_mean_sum": float(block["importance_mean"].sum()),
-                "importance_mean_abs_sum": float(np.abs(block["importance_mean"]).sum()),
+                "importance_mean_abs_sum": float(
+                    np.abs(block["importance_mean"]).sum()
+                ),
                 "importance_mean_avg": float(block["importance_mean"].mean()),
-                "top_feature": str(block.loc[block["importance_mean"].idxmax(), "feature"]),
+                "top_feature": str(
+                    block.loc[block["importance_mean"].idxmax(), "feature"]
+                ),
                 "top_feature_importance": float(block["importance_mean"].max()),
             }
             if "importance_mean_signed" in block.columns:
-                record["importance_mean_signed_sum"] = float(block["importance_mean_signed"].sum())
-                record["importance_mean_signed_avg"] = float(block["importance_mean_signed"].mean())
+                record["importance_mean_signed_sum"] = float(
+                    block["importance_mean_signed"].sum()
+                )
+                record["importance_mean_signed_avg"] = float(
+                    block["importance_mean_signed"].mean()
+                )
             distances = None
-            if "signed_distance_to_tss_kb" in block.columns and block["signed_distance_to_tss_kb"].notna().any():
-                distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
+            if (
+                "signed_distance_to_tss_kb" in block.columns
+                and block["signed_distance_to_tss_kb"].notna().any()
+            ):
+                distances = pd.to_numeric(
+                    block["signed_distance_to_tss_kb"], errors="coerce"
+                )
             elif gene_info is not None:
                 rel_centers = np.full(block.shape[0], np.nan, dtype=float)
                 for row_idx, feature in enumerate(block["feature"].astype(str)):
@@ -665,22 +843,32 @@ def _export_feature_importance_artifacts(
                     imp = block.loc[mask, "importance_mean"]
                     dist = distances[mask]
                     if imp.nunique() > 1 and dist.nunique() > 1:
-                        record["pearson_distance_corr"] = float(imp.corr(dist, method="pearson"))
-                        record["spearman_distance_corr"] = float(imp.corr(dist, method="spearman"))
+                        record["pearson_distance_corr"] = float(
+                            imp.corr(dist, method="pearson")
+                        )
+                        record["spearman_distance_corr"] = float(
+                            imp.corr(dist, method="spearman")
+                        )
                     top_idx = block.loc[mask, "importance_mean"].idxmax()
                     record["top_feature_distance_kb"] = float(distances.loc[top_idx])
             per_gene_records.append(record)
         if per_gene_records:
             per_gene_df = pd.DataFrame(per_gene_records)
-            per_gene_summary_path = output_dir / "feature_importance_per_gene_summary.csv"
+            per_gene_summary_path = (
+                output_dir / "feature_importance_per_gene_summary.csv"
+            )
             per_gene_df.to_csv(per_gene_summary_path, index=False)
             fi_per_gene_count = int(per_gene_df.shape[0])
             fi_per_gene_mean_importance_sum = float(
-                pd.to_numeric(per_gene_df["importance_mean_sum"], errors="coerce").mean(skipna=True)
+                pd.to_numeric(per_gene_df["importance_mean_sum"], errors="coerce").mean(
+                    skipna=True
+                )
             )
             if "importance_mean_abs_sum" in per_gene_df.columns:
                 fi_per_gene_mean_abs_sum = float(
-                    pd.to_numeric(per_gene_df["importance_mean_abs_sum"], errors="coerce").mean(skipna=True)
+                    pd.to_numeric(
+                        per_gene_df["importance_mean_abs_sum"], errors="coerce"
+                    ).mean(skipna=True)
                 )
             _LOG.info(
                 "Saved per-gene feature importance summary (%d genes) to %s",
@@ -690,9 +878,15 @@ def _export_feature_importance_artifacts(
 
             if export_per_gene_panels:
                 panel_dir = output_dir / "per_gene_panels"
-                panel_candidates = per_gene_df.sort_values("importance_mean_sum", ascending=False).head(12)
+                panel_candidates = per_gene_df.sort_values(
+                    "importance_mean_sum", ascending=False
+                ).head(12)
                 generated = 0
-                gene_info_map = {g.gene_name: g for g in gene_infos} if gene_infos is not None else {}
+                gene_info_map = (
+                    {g.gene_name: g for g in gene_infos}
+                    if gene_infos is not None
+                    else {}
+                )
                 for gene_value in panel_candidates["gene"]:
                     block_indices = gene_block_indices.get(gene_value)
                     if block_indices is None or block_indices.size == 0:
@@ -704,7 +898,9 @@ def _export_feature_importance_artifacts(
                     if gene_info is not None:
                         # Compute relative centers only for features on the same chromosome
                         rel_centers = np.full(block_slice.shape[0], np.nan, dtype=float)
-                        for row_idx, feature in enumerate(block_slice["feature"].astype(str)):
+                        for row_idx, feature in enumerate(
+                            block_slice["feature"].astype(str)
+                        ):
                             parsed = _parse_genomic_interval(feature)
                             if not parsed:
                                 continue
@@ -722,7 +918,11 @@ def _export_feature_importance_artifacts(
                     plot_per_gene_feature_panel(block_slice, gene_value, panel_path)
                     generated += 1
                 if generated:
-                    _LOG.info("Generated %d per-gene feature panels in %s", generated, panel_dir)
+                    _LOG.info(
+                        "Generated %d per-gene feature panels in %s",
+                        generated,
+                        panel_dir,
+                    )
     elif feature_block_slices and gene_names:
         per_gene_records = []
         gene_block_ranges: Dict[str, Tuple[int, int]] = {}
@@ -742,37 +942,57 @@ def _export_feature_importance_artifacts(
                 "gene": gene_label,
                 "feature_count": int(block.shape[0]),
                 "importance_mean_sum": float(block["importance_mean"].sum()),
-                "importance_mean_abs_sum": float(np.abs(block["importance_mean"]).sum()),
+                "importance_mean_abs_sum": float(
+                    np.abs(block["importance_mean"]).sum()
+                ),
                 "importance_mean_avg": float(block["importance_mean"].mean()),
-                "top_feature": str(block.loc[block["importance_mean"].idxmax(), "feature"]),
+                "top_feature": str(
+                    block.loc[block["importance_mean"].idxmax(), "feature"]
+                ),
                 "top_feature_importance": float(block["importance_mean"].max()),
             }
             if "importance_mean_signed" in block.columns:
-                record["importance_mean_signed_sum"] = float(block["importance_mean_signed"].sum())
-                record["importance_mean_signed_avg"] = float(block["importance_mean_signed"].mean())
+                record["importance_mean_signed_sum"] = float(
+                    block["importance_mean_signed"].sum()
+                )
+                record["importance_mean_signed_avg"] = float(
+                    block["importance_mean_signed"].mean()
+                )
             if "signed_distance_to_tss_kb" in block.columns:
-                distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
+                distances = pd.to_numeric(
+                    block["signed_distance_to_tss_kb"], errors="coerce"
+                )
                 mask = np.isfinite(distances) & np.isfinite(block["importance_mean"])
                 if mask.any():
                     imp = block.loc[mask, "importance_mean"]
                     dist = distances[mask]
                     if imp.nunique() > 1 and dist.nunique() > 1:
-                        record["pearson_distance_corr"] = float(imp.corr(dist, method="pearson"))
-                        record["spearman_distance_corr"] = float(imp.corr(dist, method="spearman"))
+                        record["pearson_distance_corr"] = float(
+                            imp.corr(dist, method="pearson")
+                        )
+                        record["spearman_distance_corr"] = float(
+                            imp.corr(dist, method="spearman")
+                        )
                     top_idx = block.loc[mask, "importance_mean"].idxmax()
                     record["top_feature_distance_kb"] = float(distances.loc[top_idx])
             per_gene_records.append(record)
         if per_gene_records:
             per_gene_df = pd.DataFrame(per_gene_records)
-            per_gene_summary_path = output_dir / "feature_importance_per_gene_summary.csv"
+            per_gene_summary_path = (
+                output_dir / "feature_importance_per_gene_summary.csv"
+            )
             per_gene_df.to_csv(per_gene_summary_path, index=False)
             fi_per_gene_count = int(per_gene_df.shape[0])
             fi_per_gene_mean_importance_sum = float(
-                pd.to_numeric(per_gene_df["importance_mean_sum"], errors="coerce").mean(skipna=True)
+                pd.to_numeric(per_gene_df["importance_mean_sum"], errors="coerce").mean(
+                    skipna=True
+                )
             )
             if "importance_mean_abs_sum" in per_gene_df.columns:
                 fi_per_gene_mean_abs_sum = float(
-                    pd.to_numeric(per_gene_df["importance_mean_abs_sum"], errors="coerce").mean(skipna=True)
+                    pd.to_numeric(
+                        per_gene_df["importance_mean_abs_sum"], errors="coerce"
+                    ).mean(skipna=True)
                 )
             _LOG.info(
                 "Saved per-gene feature importance summary (%d genes) to %s",
@@ -782,7 +1002,9 @@ def _export_feature_importance_artifacts(
 
             if export_per_gene_panels:
                 panel_dir = output_dir / "per_gene_panels"
-                panel_candidates = per_gene_df.sort_values("importance_mean_sum", ascending=False).head(12)
+                panel_candidates = per_gene_df.sort_values(
+                    "importance_mean_sum", ascending=False
+                ).head(12)
                 generated = 0
                 for gene_value in panel_candidates["gene"]:
                     block_range = gene_block_ranges.get(gene_value)
@@ -797,26 +1019,44 @@ def _export_feature_importance_artifacts(
                     plot_per_gene_feature_panel(block_slice, gene_value, panel_path)
                     generated += 1
                 if generated:
-                    _LOG.info("Generated %d per-gene feature panels in %s", generated, panel_dir)
+                    _LOG.info(
+                        "Generated %d per-gene feature panels in %s",
+                        generated,
+                        panel_dir,
+                    )
 
     fi_mean_finite = fi_mean[np.isfinite(fi_mean)]
     summary_payload: Dict[str, object] = {
         "method": method or "unknown",
         "num_features": int(fi_mean.size),
-        "importance_mean_sum": float(fi_mean_finite.sum()) if fi_mean_finite.size else 0.0,
-        "importance_mean_top1": float(fi_mean_finite.max()) if fi_mean_finite.size else 0.0,
+        "importance_mean_sum": (
+            float(fi_mean_finite.sum()) if fi_mean_finite.size else 0.0
+        ),
+        "importance_mean_top1": (
+            float(fi_mean_finite.max()) if fi_mean_finite.size else 0.0
+        ),
         "raw_importances_file": raw_path.name,
         "aggregate_file": aggregate_path.name,
     }
     fi_abs = np.abs(fi_mean_finite)
-    summary_payload["importance_mean_abs_sum"] = float(fi_abs.sum()) if fi_abs.size else 0.0
-    summary_payload["importance_mean_abs_top1"] = float(fi_abs.max()) if fi_abs.size else 0.0
+    summary_payload["importance_mean_abs_sum"] = (
+        float(fi_abs.sum()) if fi_abs.size else 0.0
+    )
+    summary_payload["importance_mean_abs_top1"] = (
+        float(fi_abs.max()) if fi_abs.size else 0.0
+    )
     if fi_signed is not None:
         fi_signed_finite = fi_signed[np.isfinite(fi_signed)]
         if fi_signed_finite.size:
-            summary_payload["importance_mean_signed_sum"] = float(fi_signed_finite.sum())
-            summary_payload["importance_mean_signed_top_positive"] = float(fi_signed_finite.max())
-            summary_payload["importance_mean_signed_top_negative"] = float(fi_signed_finite.min())
+            summary_payload["importance_mean_signed_sum"] = float(
+                fi_signed_finite.sum()
+            )
+            summary_payload["importance_mean_signed_top_positive"] = float(
+                fi_signed_finite.max()
+            )
+            summary_payload["importance_mean_signed_top_negative"] = float(
+                fi_signed_finite.min()
+            )
     fi_weights = np.abs(fi_mean_finite)
     fi_weight_total = float(fi_weights.sum()) if fi_weights.size else 0.0
     if fi_weight_total > 0.0:
@@ -828,8 +1068,12 @@ def _export_feature_importance_artifacts(
         summary_payload["per_gene_summary_file"] = per_gene_summary_path.name
     if fi_per_gene_count is not None:
         summary_payload["per_gene_count"] = fi_per_gene_count
-    if fi_per_gene_mean_importance_sum is not None and np.isfinite(fi_per_gene_mean_importance_sum):
-        summary_payload["per_gene_mean_importance_sum"] = fi_per_gene_mean_importance_sum
+    if fi_per_gene_mean_importance_sum is not None and np.isfinite(
+        fi_per_gene_mean_importance_sum
+    ):
+        summary_payload["per_gene_mean_importance_sum"] = (
+            fi_per_gene_mean_importance_sum
+        )
     if fi_per_gene_mean_abs_sum is not None and np.isfinite(fi_per_gene_mean_abs_sum):
         summary_payload["per_gene_mean_abs_sum"] = fi_per_gene_mean_abs_sum
 
@@ -837,7 +1081,9 @@ def _export_feature_importance_artifacts(
     fi_overview_path = output_dir / "feature_importance_distance_overview.png"
     fi_distance_created = False
     if "signed_distance_to_tss_kb" in aggregate_df.columns:
-        distances = pd.to_numeric(aggregate_df["signed_distance_to_tss_kb"], errors="coerce")
+        distances = pd.to_numeric(
+            aggregate_df["signed_distance_to_tss_kb"], errors="coerce"
+        )
         mask = np.isfinite(distances) & np.isfinite(fi_mean)
         if mask.any():
             fi_weights_with_distance = np.abs(fi_mean[mask])
@@ -845,7 +1091,9 @@ def _export_feature_importance_artifacts(
             if fi_weights_with_distance_total > 0.0:
                 near_mask = np.abs(distances[mask].to_numpy(dtype=float)) <= 2.0
                 near_sum = float(fi_weights_with_distance[near_mask].sum())
-                summary_payload["tss_near_2kb_share"] = near_sum / fi_weights_with_distance_total
+                summary_payload["tss_near_2kb_share"] = (
+                    near_sum / fi_weights_with_distance_total
+                )
         if mask.any():
             imp = pd.Series(fi_mean[mask])
             dist = distances[mask]
@@ -953,7 +1201,9 @@ def _export_shap_importance_artifacts(
     )
     signed_shap_values: Optional[np.ndarray] = None
     if shap_value_mean_signed is not None:
-        signed_candidate = np.asarray(shap_value_mean_signed, dtype=np.float64).reshape(-1)
+        signed_candidate = np.asarray(shap_value_mean_signed, dtype=np.float64).reshape(
+            -1
+        )
         if signed_candidate.shape[0] == shap_values.shape[0]:
             signed_shap_values = signed_candidate
             shap_df["shap_mean_signed"] = signed_candidate
@@ -961,7 +1211,10 @@ def _export_shap_importance_artifacts(
     # Add metadata columns (TSS distance, gene name, etc.) if available.
     if metadata_df is not None and not metadata_df.empty:
         shap_df = pd.concat([shap_df, metadata_df], axis=1)
-    if "signed_distance_to_tss_kb" not in shap_df.columns or not shap_df["signed_distance_to_tss_kb"].notna().any():
+    if (
+        "signed_distance_to_tss_kb" not in shap_df.columns
+        or not shap_df["signed_distance_to_tss_kb"].notna().any()
+    ):
         inferred_dist = _infer_signed_distance_from_blocks(
             feature_names,
             gene_names,
@@ -972,7 +1225,9 @@ def _export_shap_importance_artifacts(
             shap_df["signed_distance_to_tss_kb"] = inferred_dist
     shap_path = output_dir / "shapley_values_mean.csv"
     shap_df.to_csv(shap_path, index=False)
-    _LOG.info("Saved SHAP mean importances (%d rows) to %s", shap_df.shape[0], shap_path)
+    _LOG.info(
+        "Saved SHAP mean importances (%d rows) to %s", shap_df.shape[0], shap_path
+    )
 
     signed_plot_path: Optional[Path] = None
     if signed_shap_values is not None:
@@ -982,9 +1237,13 @@ def _export_shap_importance_artifacts(
                 "shap_mean_signed": signed_shap_values,
             }
         )
-        signed_df = signed_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["shap_mean_signed"])
+        signed_df = signed_df.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=["shap_mean_signed"]
+        )
         if not signed_df.empty:
-            top_pos = signed_df.sort_values("shap_mean_signed", ascending=False).head(10)
+            top_pos = signed_df.sort_values("shap_mean_signed", ascending=False).head(
+                10
+            )
             top_neg = signed_df.sort_values("shap_mean_signed", ascending=True).head(10)
             signed_top = pd.concat([top_neg, top_pos], axis=0)
             signed_top = signed_top.drop_duplicates(subset=["feature"], keep="first")
@@ -992,8 +1251,15 @@ def _export_shap_importance_artifacts(
                 signed_plot_path = output_dir / "shapley_values_mean_signed.png"
                 signed_top = signed_top.sort_values("shap_mean_signed", ascending=True)
                 fig, ax = plt.subplots(figsize=(9.0, 6.0))
-                bar_colors = ["#1f77b4" if v < 0 else "#d62728" for v in signed_top["shap_mean_signed"]]
-                ax.barh(signed_top["feature"], signed_top["shap_mean_signed"], color=bar_colors)
+                bar_colors = [
+                    "#1f77b4" if v < 0 else "#d62728"
+                    for v in signed_top["shap_mean_signed"]
+                ]
+                ax.barh(
+                    signed_top["feature"],
+                    signed_top["shap_mean_signed"],
+                    color=bar_colors,
+                )
                 ax.axvline(0.0, color="#666666", linestyle="--", linewidth=1)
                 ax.set_xlabel("Mean signed SHAP value")
                 ax.set_ylabel("Feature")
@@ -1027,36 +1293,50 @@ def _export_shap_importance_artifacts(
                 "feature_count": int(block.shape[0]),
                 "shap_mean_abs_sum": float(block["shap_mean_abs"].sum()),
                 "shap_mean_abs_avg": float(block["shap_mean_abs"].mean()),
-                "top_feature": str(block.loc[block["shap_mean_abs"].idxmax(), "feature"]),
+                "top_feature": str(
+                    block.loc[block["shap_mean_abs"].idxmax(), "feature"]
+                ),
                 "top_feature_shap_mean_abs": float(block["shap_mean_abs"].max()),
             }
             if "shap_mean_signed" in block.columns:
                 record["shap_mean_signed_sum"] = float(block["shap_mean_signed"].sum())
                 record["shap_mean_signed_avg"] = float(block["shap_mean_signed"].mean())
             if "signed_distance_to_tss_kb" in block.columns:
-                distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
+                distances = pd.to_numeric(
+                    block["signed_distance_to_tss_kb"], errors="coerce"
+                )
                 mask = np.isfinite(distances) & np.isfinite(block["shap_mean_abs"])
                 if mask.any():
                     shap_vals = block.loc[mask, "shap_mean_abs"]
                     dist = distances[mask]
                     if shap_vals.nunique() > 1 and dist.nunique() > 1:
-                        record["pearson_distance_corr"] = float(shap_vals.corr(dist, method="pearson"))
-                        record["spearman_distance_corr"] = float(shap_vals.corr(dist, method="spearman"))
+                        record["pearson_distance_corr"] = float(
+                            shap_vals.corr(dist, method="pearson")
+                        )
+                        record["spearman_distance_corr"] = float(
+                            shap_vals.corr(dist, method="spearman")
+                        )
                     top_idx = block.loc[mask, "shap_mean_abs"].idxmax()
                     record["top_feature_distance_kb"] = float(distances.loc[top_idx])
             per_gene_records.append(record)
 
         if per_gene_records:
             per_gene_df = pd.DataFrame(per_gene_records)
-            shap_per_gene_summary_path = output_dir / "shapley_values_per_gene_summary.csv"
+            shap_per_gene_summary_path = (
+                output_dir / "shapley_values_per_gene_summary.csv"
+            )
             per_gene_df.to_csv(shap_per_gene_summary_path, index=False)
             shap_per_gene_count = int(per_gene_df.shape[0])
             shap_per_gene_mean_abs_sum = float(
-                pd.to_numeric(per_gene_df["shap_mean_abs_sum"], errors="coerce").mean(skipna=True)
+                pd.to_numeric(per_gene_df["shap_mean_abs_sum"], errors="coerce").mean(
+                    skipna=True
+                )
             )
             if "shap_mean_signed_sum" in per_gene_df.columns:
                 shap_per_gene_mean_signed_sum = float(
-                    pd.to_numeric(per_gene_df["shap_mean_signed_sum"], errors="coerce").mean(skipna=True)
+                    pd.to_numeric(
+                        per_gene_df["shap_mean_signed_sum"], errors="coerce"
+                    ).mean(skipna=True)
                 )
             _LOG.info(
                 "Saved per-gene SHAP summary (%d genes) to %s",
@@ -1081,35 +1361,49 @@ def _export_shap_importance_artifacts(
                 "feature_count": int(block.shape[0]),
                 "shap_mean_abs_sum": float(block["shap_mean_abs"].sum()),
                 "shap_mean_abs_avg": float(block["shap_mean_abs"].mean()),
-                "top_feature": str(block.loc[block["shap_mean_abs"].idxmax(), "feature"]),
+                "top_feature": str(
+                    block.loc[block["shap_mean_abs"].idxmax(), "feature"]
+                ),
                 "top_feature_shap_mean_abs": float(block["shap_mean_abs"].max()),
             }
             if "shap_mean_signed" in block.columns:
                 record["shap_mean_signed_sum"] = float(block["shap_mean_signed"].sum())
                 record["shap_mean_signed_avg"] = float(block["shap_mean_signed"].mean())
             if "signed_distance_to_tss_kb" in block.columns:
-                distances = pd.to_numeric(block["signed_distance_to_tss_kb"], errors="coerce")
+                distances = pd.to_numeric(
+                    block["signed_distance_to_tss_kb"], errors="coerce"
+                )
                 mask = np.isfinite(distances) & np.isfinite(block["shap_mean_abs"])
                 if mask.any():
                     shap_vals = block.loc[mask, "shap_mean_abs"]
                     dist = distances[mask]
                     if shap_vals.nunique() > 1 and dist.nunique() > 1:
-                        record["pearson_distance_corr"] = float(shap_vals.corr(dist, method="pearson"))
-                        record["spearman_distance_corr"] = float(shap_vals.corr(dist, method="spearman"))
+                        record["pearson_distance_corr"] = float(
+                            shap_vals.corr(dist, method="pearson")
+                        )
+                        record["spearman_distance_corr"] = float(
+                            shap_vals.corr(dist, method="spearman")
+                        )
                     top_idx = block.loc[mask, "shap_mean_abs"].idxmax()
                     record["top_feature_distance_kb"] = float(distances.loc[top_idx])
             per_gene_records.append(record)
         if per_gene_records:
             per_gene_df = pd.DataFrame(per_gene_records)
-            shap_per_gene_summary_path = output_dir / "shapley_values_per_gene_summary.csv"
+            shap_per_gene_summary_path = (
+                output_dir / "shapley_values_per_gene_summary.csv"
+            )
             per_gene_df.to_csv(shap_per_gene_summary_path, index=False)
             shap_per_gene_count = int(per_gene_df.shape[0])
             shap_per_gene_mean_abs_sum = float(
-                pd.to_numeric(per_gene_df["shap_mean_abs_sum"], errors="coerce").mean(skipna=True)
+                pd.to_numeric(per_gene_df["shap_mean_abs_sum"], errors="coerce").mean(
+                    skipna=True
+                )
             )
             if "shap_mean_signed_sum" in per_gene_df.columns:
                 shap_per_gene_mean_signed_sum = float(
-                    pd.to_numeric(per_gene_df["shap_mean_signed_sum"], errors="coerce").mean(skipna=True)
+                    pd.to_numeric(
+                        per_gene_df["shap_mean_signed_sum"], errors="coerce"
+                    ).mean(skipna=True)
                 )
             _LOG.info(
                 "Saved per-gene SHAP summary (%d genes) to %s",
@@ -1117,7 +1411,9 @@ def _export_shap_importance_artifacts(
                 shap_per_gene_summary_path,
             )
 
-    def _extract_distance_kb(table: pd.DataFrame) -> tuple[Optional[pd.Series], Optional[str], bool]:
+    def _extract_distance_kb(
+        table: pd.DataFrame,
+    ) -> tuple[Optional[pd.Series], Optional[str], bool]:
         preferred_cols = [
             "signed_distance_to_tss_kb",
             "delta_to_tss_kb",
@@ -1234,12 +1530,18 @@ def _export_shap_importance_artifacts(
             _LOG.info("Saved SHAP vs TSS plot to %s", distance_plot_path)
         else:
             distance_plot_path = None
-        zoom_df = pd.DataFrame(
-            {
-                "distance_kb": distance_kb,
-                "shap_value": pd.to_numeric(shap_df["shap_mean_abs"], errors="coerce"),
-            }
-        ).replace([np.inf, -np.inf], np.nan).dropna()
+        zoom_df = (
+            pd.DataFrame(
+                {
+                    "distance_kb": distance_kb,
+                    "shap_value": pd.to_numeric(
+                        shap_df["shap_mean_abs"], errors="coerce"
+                    ),
+                }
+            )
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
         zoom_df = zoom_df[zoom_df["distance_kb"].abs() <= 5.0]
         if zoom_df.empty:
             zoom_y_limits = None
@@ -1249,7 +1551,9 @@ def _export_shap_importance_artifacts(
                 .quantile(0.9)
                 .max()
             )
-            zoom_y_limits = (0.0, float(zoom_max) * 1.15) if pd.notna(zoom_max) else None
+            zoom_y_limits = (
+                (0.0, float(zoom_max) * 1.15) if pd.notna(zoom_max) else None
+            )
         zoomed = _plot_shap_vs_tss_distance(
             shap_df,
             distance_kb,
@@ -1317,9 +1621,13 @@ def _export_shap_importance_artifacts(
         summary["per_gene_summary_file"] = shap_per_gene_summary_path.name
     if shap_per_gene_count is not None:
         summary["per_gene_count"] = shap_per_gene_count
-    if shap_per_gene_mean_abs_sum is not None and np.isfinite(shap_per_gene_mean_abs_sum):
+    if shap_per_gene_mean_abs_sum is not None and np.isfinite(
+        shap_per_gene_mean_abs_sum
+    ):
         summary["per_gene_mean_abs_sum"] = shap_per_gene_mean_abs_sum
-    if shap_per_gene_mean_signed_sum is not None and np.isfinite(shap_per_gene_mean_signed_sum):
+    if shap_per_gene_mean_signed_sum is not None and np.isfinite(
+        shap_per_gene_mean_signed_sum
+    ):
         summary["per_gene_mean_signed_sum"] = shap_per_gene_mean_signed_sum
 
     if distance_kb is not None:
@@ -1331,7 +1639,9 @@ def _export_shap_importance_artifacts(
             if shap_weights_with_distance_total > 0.0:
                 near_mask = np.abs(distance_arr[corr_mask]) <= 2.0
                 near_sum = float(shap_weights_with_distance[near_mask].sum())
-                summary["tss_near_2kb_share"] = near_sum / shap_weights_with_distance_total
+                summary["tss_near_2kb_share"] = (
+                    near_sum / shap_weights_with_distance_total
+                )
         if corr_mask.any():
             corr_x = pd.Series(shap_values[corr_mask])
             corr_y = pd.Series(distance_arr[corr_mask])
@@ -1351,13 +1661,29 @@ def _export_shap_importance_artifacts(
     _LOG.info("Wrote SHAP summary manifest to %s", summary_path)
     return summary
 
+
 try:
     import torch.nn as _torch_nn
 except ImportError:  # pragma: no cover - torch optional during some tests
     _torch_nn = None
 
+
 def run_pipeline(config: PipelineConfig) -> Path:
     config.ensure_directories()
+
+    # Warn if an identical run has already been completed or is currently running.
+    # This catches accidental SLURM re-submissions. Only checked when W&B is enabled
+    # so the API query doesn't add latency to local runs.
+    if config.wandb.enabled and not config.wandb.sweep_overrides:
+        _fingerprint = compute_run_fingerprint(config)
+        _dup_url = check_duplicate_run(config, _fingerprint)
+        if _dup_url:
+            _LOG.warning(
+                "Duplicate run detected (fingerprint=%s). An identical run already exists: %s. "
+                "Proceeding anyway — cancel this job if intentional duplication is not desired.",
+                _fingerprint[:12],
+                _dup_url,
+            )
 
     wandb_run = maybe_init_wandb(config)
     run_status = "failed"
@@ -1391,18 +1717,59 @@ def run_pipeline(config: PipelineConfig) -> Path:
         except Exception:  # pragma: no cover - best-effort cleanup
             _LOG.debug("Failed to register signal handler for %s", sig, exc_info=True)
     try:
-        apply_sweep_overrides(config, wandb_run)
+        sweep_overrides_applied = apply_sweep_overrides(config, wandb_run)
+        if sweep_overrides_applied and wandb_run is not None:
+            models_after_override = config.all_models()
+            if len(models_after_override) != 1:
+                raise ValueError(
+                    "W&B sweep overrides must resolve to exactly one model per run; "
+                    f"got {models_after_override}"
+                )
+            model_label = models_after_override[0]
+            gene_count = len(config.genes) if config.genes else config.max_genes
+            gene_label = (
+                f"{gene_count}genes" if gene_count not in (None, 0) else "allgenes"
+            )
+            dataset_label = infer_dataset_name(config)
+            group_label = config.wandb.group or "sweep"
+            basis_label = config.training.per_gene_feature_basis
+            svd_label = f"svd{config.training.global_atac_components}"
+            window_kb = int(config.training.window_bp / 1000)
+            smoothing_label = (
+                "smooth"
+                if config.training.enable_smoothing
+                and config.training.smoothing_target != "none"
+                else "nosmooth"
+            )
+            refreshed_name = (
+                f"{group_label}_{dataset_label}_{gene_label}_{basis_label}_"
+                f"{svd_label}_{model_label}_{window_kb}kb_{smoothing_label}"
+            )
+            try:
+                wandb_run.name = refreshed_name
+                config.wandb.run_name = refreshed_name
+            except Exception:
+                _LOG.debug("Failed to refresh W&B run name after sweep override")
+            wandb_update_config(
+                wandb_run,
+                {
+                    "model": model_label,
+                    "models": asdict(config.models),
+                    "training": asdict(config.training),
+                    "num_requested_genes": gene_count,
+                },
+            )
 
         atac, rna = load_datasets(config.paths)
         atac, rna = preprocess_modalities(atac, rna, config.training)
-    
+
         target_chromosomes = config.chromosomes
         if target_chromosomes and len(target_chromosomes) == 1:
             token = target_chromosomes[0].strip().lower()
             if token in {"all", "genome-wide", "genome"}:
                 target_chromosomes = None
                 _LOG.info("Chromosome filter explicitly set to all/genome-wide")
-    
+
         genes_all = parse_gtf(
             config.paths.gtf_path,
             chromosomes=target_chromosomes,
@@ -1413,9 +1780,11 @@ def run_pipeline(config: PipelineConfig) -> Path:
             max_genes_for_selection = None
         elif config.max_genes and not config.genes:
             max_genes_for_selection = None
-    
-        genes = select_genes(genes_all, requested_genes=config.genes, max_genes=max_genes_for_selection)
-    
+
+        genes = select_genes(
+            genes_all, requested_genes=config.genes, max_genes=max_genes_for_selection
+        )
+
         candidate_count = len(genes)
         if (
             not config.multi_output
@@ -1424,7 +1793,9 @@ def run_pipeline(config: PipelineConfig) -> Path:
             and candidate_count > config.max_genes
         ):
             rng = np.random.default_rng(config.training.random_state)
-            sample_indices = np.asarray(rng.choice(len(genes), size=config.max_genes, replace=False))
+            sample_indices = np.asarray(
+                rng.choice(len(genes), size=config.max_genes, replace=False)
+            )
             sample_indices.sort()
             genes = [genes[int(idx)] for idx in sample_indices]
             _LOG.info(
@@ -1432,18 +1803,30 @@ def run_pipeline(config: PipelineConfig) -> Path:
                 config.max_genes,
                 candidate_count,
             )
-    
+
         if config.genes:
             found_names = {gene.gene_name for gene in genes}
             found_ids = {gene.gene_id for gene in genes}
-            missing = [name for name in config.genes if name not in found_names and name not in found_ids]
+            missing = [
+                name
+                for name in config.genes
+                if name not in found_names and name not in found_ids
+            ]
             if missing:
                 raise RuntimeError(
                     "The following requested genes were not found in annotations: "
                     + ", ".join(missing[:10])
                     + (" ..." if len(missing) > 10 else "")
                 )
-    
+            if len(genes) != len(config.genes):
+                _LOG.warning(
+                    "Gene count mismatch: manifest requested %d genes but annotation resolved %d "
+                    "(likely duplicate gene names mapping to multiple loci). "
+                    "Inspect the manifest for paralogous/pseudoautosomal gene names.",
+                    len(config.genes),
+                    len(genes),
+                )
+
         selected_gene_fractions: Dict[str, float] = {}
         manifest_mode = bool(config.genes)
         if config.multi_output:
@@ -1454,30 +1837,34 @@ def run_pipeline(config: PipelineConfig) -> Path:
                 min_expression=config.training.min_expression,
                 min_fraction=config.training.min_expression_fraction,
             )
-    
+
             if manifest_mode:
-                missing = [
+                # Manifests are expected to be pre-filtered by generate_all_sample_manifests.py,
+                # which enforces both min_expression_fraction and min_cells_per_gene.
+                # Reject runs where the manifest contains genes that violate the threshold so
+                # that stale/unfiltered manifests are caught early rather than silently included.
+                below_threshold = [
                     gene
                     for gene in genes
-                    if fraction_map.get(gene.gene_name, 0.0) < config.training.min_expression_fraction
+                    if fraction_map.get(gene.gene_name, 0.0)
+                    < config.training.min_expression_fraction
                 ]
-                if missing:
-                    names = ", ".join(g.gene_name for g in missing[:10])
-                    _LOG.error(
-                        "Manifest supplied %d genes below expression fraction threshold: %s%s",
-                        len(missing),
-                        names,
-                        " ..." if len(missing) > 10 else "",
-                    )
+                if below_threshold:
+                    names = ", ".join(g.gene_name for g in below_threshold[:10])
                     raise RuntimeError(
-                        "Gene manifest contains entries below the minimum expression fraction threshold"
+                        f"Manifest contains {len(below_threshold)} gene(s) below the "
+                        f"{config.training.min_expression_fraction * 100.0:.1f}% expression fraction "
+                        f"threshold. Regenerate the manifest with generate_all_sample_manifests.py "
+                        f"to enforce both min_expression_fraction and min_cells_per_gene filters. "
+                        f"Affected genes: {names}"
+                        + (" ..." if len(below_threshold) > 10 else "")
                     )
                 selected_gene_fractions = {
                     gene.gene_name: fraction_map.get(gene.gene_name, float("nan"))
                     for gene in genes
                 }
                 _LOG.info(
-                    "Using %d genes from manifest with >=%.1f%% expressing cells",
+                    "Using %d genes from explicit manifest (all meet >=%.1f%% expression fraction)",
                     len(genes),
                     config.training.min_expression_fraction * 100.0,
                 )
@@ -1502,22 +1889,26 @@ def run_pipeline(config: PipelineConfig) -> Path:
                 else:
                     requested_gene_count = config.max_genes
                     if requested_gene_count <= 0:
-                        raise RuntimeError("Configured max_genes must be >= 1 for multi-output mode")
-    
+                        raise RuntimeError(
+                            "Configured max_genes must be >= 1 for multi-output mode"
+                        )
+
                     if available_gene_count < requested_gene_count:
                         _LOG.warning(
                             "Only %d genes meet the expression threshold (requested %d); proceeding with available genes",
                             available_gene_count,
                             requested_gene_count,
                         )
-    
-                    selected_gene_count = min(requested_gene_count, available_gene_count)
+
+                    selected_gene_count = min(
+                        requested_gene_count, available_gene_count
+                    )
                     if selected_gene_count == 0:
                         raise RuntimeError(
                             "No genes met the minimum expression fraction (>=%.2f of cells)"
                             % config.training.min_expression_fraction
                         )
-    
+
                     genes = _choose_random_genes(
                         expressed_candidates,
                         selected_gene_count,
@@ -1532,15 +1923,29 @@ def run_pipeline(config: PipelineConfig) -> Path:
                         len(genes),
                         config.training.min_expression_fraction * 100.0,
                     )
-                    _LOG.debug("Selected genes: %s", ", ".join(g.gene_name for g in genes))
-    
+                    _LOG.debug(
+                        "Selected genes: %s", ", ".join(g.gene_name for g in genes)
+                    )
+
         if config.multi_output and not genes:
-            raise RuntimeError("No genes matched the provided filters for multi-output training")
-    
+            raise RuntimeError(
+                "No genes matched the provided filters for multi-output training"
+            )
+
         total_genes = len(genes)
         chunk_total = max(1, int(config.chunk_total))
         chunk_index = int(config.chunk_index)
         applied_chunking = False
+        mode_label = "multi_output" if config.multi_output else "per_gene"
+        _LOG.info(
+            "Pipeline mode resolved | mode=%s | requested_genes=%s | selected_genes=%d | max_genes=%s | chunk_index=%d | chunk_total=%d",
+            mode_label,
+            len(config.genes) if config.genes else "all",
+            total_genes,
+            config.max_genes if config.max_genes is not None else "none",
+            chunk_index,
+            chunk_total,
+        )
         if chunk_index < 0:
             chunk_index = 0
         if chunk_index >= chunk_total:
@@ -1560,13 +1965,13 @@ def run_pipeline(config: PipelineConfig) -> Path:
             )
             genes = genes[start:end]
             applied_chunking = True
-    
+
         if not genes:
             peak_indexer = PeakIndexer(atac, layer=config.training.atac_layer)
         else:
             atac = filter_atac_by_genes(atac, genes, config.training.window_bp)
             peak_indexer = PeakIndexer(atac, layer=config.training.atac_layer)
-    
+
         if config.multi_output:
             if applied_chunking:
                 _LOG.info(
@@ -1581,7 +1986,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
                     chunk_total,
                     chunk_index,
                 )
-            run_dir = _run_cellwise_pipeline(
+            run_dir, had_fallbacks = _run_cellwise_pipeline(
                 config,
                 genes,
                 atac,
@@ -1592,11 +1997,10 @@ def run_pipeline(config: PipelineConfig) -> Path:
                 gene_expression_fraction=selected_gene_fractions,
                 wandb_run=wandb_run,
             )
-            run_status = "succeeded"
+            run_status = "failed" if had_fallbacks else "succeeded"
             return run_dir
-    
 
-        run_dir = _run_per_gene_pipeline(
+        run_dir, had_fallbacks = _run_per_gene_pipeline(
             config,
             genes,
             atac,
@@ -1606,7 +2010,7 @@ def run_pipeline(config: PipelineConfig) -> Path:
             chunk_total=chunk_total,
             wandb_run=wandb_run,
         )
-        run_status = "succeeded"
+        run_status = "failed" if had_fallbacks else "succeeded"
         return run_dir
     except BaseException as exc:
         run_status = "failed"
@@ -1621,7 +2025,9 @@ def run_pipeline(config: PipelineConfig) -> Path:
             try:
                 signal.signal(sig, handler)
             except Exception:  # pragma: no cover - best-effort cleanup
-                _LOG.debug("Failed to restore signal handler for %s", sig, exc_info=True)
+                _LOG.debug(
+                    "Failed to restore signal handler for %s", sig, exc_info=True
+                )
         _safe_wandb_finish(run_status)
 
 
@@ -1635,21 +2041,35 @@ def _run_per_gene_pipeline(
     chunk_index: int = 0,
     chunk_total: int = 1,
     wandb_run: Optional[Any] = None,
-) -> Path:
+) -> tuple[Path, bool]:
     """Execute per-gene training pipeline, processing each gene independently across all models."""
-    
+
     base_dir = config.paths.output_dir
     run_dir = base_dir / config.run_name if config.run_name else base_dir
-    
+
     if not genes:
         _LOG.warning(
             "No genes assigned to this chunk (chunk_index=%d, chunk_total=%d). Nothing to process.",
             chunk_index,
             chunk_total,
         )
-        return run_dir
-    
+        return run_dir, False
+
     _ensure_directory(run_dir)
+    effective_cell_filter_mode, cell_filter_reason = _resolve_per_gene_cell_filter_mode(
+        config
+    )
+    runtime_training = replace(
+        config.training,
+        per_gene_cell_filter_mode=effective_cell_filter_mode,
+        per_gene_cell_filter_reason=cell_filter_reason,
+    )
+    _LOG.info(
+        "Per-gene cell filtering resolved | mode=%s | reason=%s | manifest=%s",
+        effective_cell_filter_mode,
+        cell_filter_reason,
+        str(config.gene_manifest_path) if config.gene_manifest_path else "none",
+    )
     wandb_update_config(
         wandb_run,
         {
@@ -1657,6 +2077,8 @@ def _run_per_gene_pipeline(
             "total_models": len(config.all_models()),
             "requested_genes": len(genes),
             "num_genes": len(genes),
+            "per_gene_cell_filter_mode_effective": effective_cell_filter_mode,
+            "per_gene_cell_filter_reason": cell_filter_reason,
             **(
                 {"chunk_index": chunk_index, "chunk_total": chunk_total}
                 if chunk_total > 1 or chunk_index > 0
@@ -1664,38 +2086,106 @@ def _run_per_gene_pipeline(
             ),
         },
     )
-    
+
+    # Precompute a single kNN graph from the full filtered ATAC matrix before the per-gene loop.
+    # This replaces the previous approach of computing kNN from each gene's 40-bin local window,
+    # giving every gene access to a richer, genome-wide neighbourhood representation.
+    global_knn: Optional[GlobalSplitKNN] = None
+    if (
+        runtime_training.enable_smoothing
+        and runtime_training.smoothing_k > 1
+        and getattr(runtime_training, "smoothing_target", "all_splits") != "none"
+    ):
+        _LOG.info(
+            "Precomputing global split+kNN from full filtered ATAC matrix for per-gene smoothing"
+        )
+        _all_cell_ids = np.asarray(rna.obs_names).astype(str)
+        if runtime_training.group_key and runtime_training.group_key in rna.obs.columns:
+            _all_groups = rna.obs[runtime_training.group_key].astype(str).to_numpy()
+        else:
+            _all_groups = _all_cell_ids
+        try:
+            global_knn = precompute_global_split_knn(
+                peak_indexer.matrix,
+                _all_cell_ids,
+                _all_groups,
+                runtime_training,
+            )
+        except Exception as _knn_exc:
+            _LOG.warning(
+                "Global kNN precomputation failed (%s); per-gene smoothing will use local 40-bin PCA fallback",
+                _knn_exc,
+            )
+
     summary_records: List[Dict[str, object]] = []
-    model_store: Dict[str, Dict[str, object]] = defaultdict(lambda: {
-        "predictions": [],
-        "metrics": [],
-        "feature_importances": [],
-        "feature_importances_genes": [],
-        "feature_names": None,
-        "histories": [],
-    })
+    model_store: Dict[str, Dict[str, object]] = defaultdict(
+        lambda: {
+            "predictions": [],
+            "metrics": [],
+            "feature_importances": [],
+            "feature_importances_genes": [],
+            "feature_importances_feature_names": [],
+            "feature_names": None,
+            "histories": [],
+        }
+    )
     model_export_meta: Dict[str, Dict[str, Any]] = {
-        name: {"successful_genes": [], "failures": []} for name in config.all_models()
+        name: {"successful_genes": [], "failures": [], "fallbacks": []}
+        for name in config.all_models()
     }
     model_config_snapshots: Dict[str, Dict[str, Any]] = {}
     failures: List[str] = []
-    
-    for gene in genes:
-        _LOG.info("Processing gene %s", gene.gene_name)
+    materialized_genes: List[str] = []
+    skipped_low_cell_genes: List[Dict[str, Any]] = []
+    per_gene_counts_by_gene: Dict[str, Dict[str, Any]] = {}
+
+    total_genes = len(genes)
+    total_models = len(config.all_models())
+
+    for gene_idx, gene in enumerate(genes, start=1):
+        progress_pct = (100.0 * gene_idx / total_genes) if total_genes else float("nan")
+        progress_label = (
+            f"{_progress_bar(gene_idx, total_genes)} "
+            f"{gene_idx}/{total_genes} ({progress_pct:.1f}%)"
+        )
+        if _should_log_progress(gene_idx, total_genes):
+            _LOG.debug(
+                "Per-gene progress %s %d/%d (%.1f%%) | gene=%s | models=%d",
+                _progress_bar(gene_idx, total_genes),
+                gene_idx,
+                total_genes,
+                progress_pct,
+                gene.gene_name,
+                total_models,
+            )
         try:
             dataset = build_gene_dataset(
                 gene,
                 atac,
                 rna,
                 peak_indexer,
-                config.training,
+                runtime_training,
             )
         except ValueError as exc:
             _LOG.warning("Skipping gene %s: %s", gene.gene_name, exc)
+            skipped_low_cell_genes.append({"gene": gene.gene_name, "error": str(exc)})
             continue
-    
-        for model_name in config.all_models():
-            _LOG.info("Training %s for gene %s", model_name, gene.gene_name)
+        materialized_genes.append(gene.gene_name)
+        per_gene_counts_by_gene[gene.gene_name] = {
+            "gene": gene.gene_name,
+            **dict(getattr(dataset, "metadata", {}) or {}),
+        }
+
+        for model_idx, model_name in enumerate(config.all_models(), start=1):
+            _LOG.debug(
+                "Model progress %d/%d | model=%s | gene=%s | gene_progress=%d/%d",
+                model_idx,
+                total_models,
+                model_name,
+                gene.gene_name,
+                gene_idx,
+                total_genes,
+            )
             try:
                 artifacts_dir = None
                 if model_name == "catboost":
@@ -1703,9 +2193,12 @@ def _run_per_gene_pipeline(
                 result = train_model_for_gene(
                     dataset,
                     model_name,
-                    config.training,
+                    runtime_training,
                     artifacts_dir=artifacts_dir,
-                    cache_dir=config.cache_dir,
+                    cache_dir=config.cache_dir_for_scope("gene"),
+                    wandb_run=wandb_run,
+                    global_knn=global_knn,
+                    progress_label=progress_label,
                 )
             except Exception as exc:
                 _LOG.error(
@@ -1716,19 +2209,22 @@ def _run_per_gene_pipeline(
                     traceback.format_exc(),
                 )
                 failures.append(f"{model_name}|{gene.gene_name}: {exc}")
-                model_export_meta.setdefault(model_name, {"successful_genes": [], "failures": []})
+                model_export_meta.setdefault(
+                    model_name, {"successful_genes": [], "failures": []}
+                )
                 model_export_meta[model_name]["failures"].append(
                     {"gene": gene.gene_name, "error": str(exc)}
                 )
                 continue
             preds_df = pd.DataFrame(result.predictions)
             preds_df["gene"] = gene.gene_name
-    
+
             store = model_store[model_name]
             store["predictions"].append(preds_df)
             store["metrics"].append(
                 {
                     "gene": gene.gene_name,
+                    **(result.data_counts or {}),
                     **{f"train_{k}": v for k, v in result.train_metrics.items()},
                     **{f"val_{k}": v for k, v in result.val_metrics.items()},
                     **{f"test_{k}": v for k, v in result.test_metrics.items()},
@@ -1738,48 +2234,104 @@ def _run_per_gene_pipeline(
             if feature_importances is not None:
                 store["feature_importances"].append(feature_importances)
                 store["feature_importances_genes"].append(gene.gene_name)
+                store["feature_importances_feature_names"].append(
+                    list(dataset.feature_names)
+                )
                 if store["feature_names"] is None:
                     store["feature_names"] = list(dataset.feature_names)
             if result.history:
                 store["histories"].append((gene.gene_name, result.history))
-    
-            model_export_meta.setdefault(model_name, {"successful_genes": [], "failures": []})
+
+            model_export_meta.setdefault(
+                model_name, {"successful_genes": [], "failures": [], "fallbacks": []}
+            )
             model_export_meta[model_name]["successful_genes"].append(gene.gene_name)
-            if model_name not in model_config_snapshots and result.fitted_model is not None:
-                model_config_snapshots[model_name] = _capture_model_configuration(result.fitted_model)
-    
+            if getattr(result, "used_fallback", False):
+                reasons = getattr(result, "fallback_reasons", []) or []
+                fallback_entry = gene.gene_name
+                if reasons:
+                    fallback_entry = f"{gene.gene_name}: " + " | ".join(reasons)
+                model_export_meta[model_name]["fallbacks"].append(fallback_entry)
+            if (
+                model_name not in model_config_snapshots
+                and result.fitted_model is not None
+            ):
+                model_config_snapshots[model_name] = _capture_model_configuration(
+                    result.fitted_model
+                )
+            if result.data_counts:
+                per_gene_counts_by_gene[gene.gene_name] = {
+                    "gene": gene.gene_name,
+                    **result.data_counts,
+                }
+
             summary_records.append(
                 {
                     "gene": gene.gene_name,
                     "model": model_name,
-                    **{f"cv_fold_{m.fold}_{k}": v for m in result.cv_metrics for k, v in m.metrics.items()},
+                    **(result.data_counts or {}),
+                    **{
+                        f"cv_fold_{m.fold}_{k}": v
+                        for m in result.cv_metrics
+                        for k, v in m.metrics.items()
+                    },
                     **{f"train_{k}": v for k, v in result.train_metrics.items()},
                     **{f"val_{k}": v for k, v in result.val_metrics.items()},
                     **{f"test_{k}": v for k, v in result.test_metrics.items()},
                 }
             )
-    
+
     if summary_records:
         summary_df = pd.DataFrame(summary_records)
         summary_df = _reorder_metric_columns(summary_df)
         summary_path = run_dir / "summary_metrics_per_gene.csv"
         summary_df.to_csv(summary_path, index=False)
         _LOG.info("Run summary metrics saved to %s", summary_path)
-    
+    per_gene_count_records = list(per_gene_counts_by_gene.values())
+    if per_gene_count_records:
+        counts_path = run_dir / "per_gene_counts.csv"
+        pd.DataFrame(per_gene_count_records).to_csv(counts_path, index=False)
+        _LOG.info("Per-gene count summary saved to %s", counts_path)
+
     models_dir = run_dir / "models"
     models_dir.mkdir(exist_ok=True)
-    
-    model_order = {name: idx for idx, name in enumerate(config.all_models(), start=1)}
+
     summary_aggregate_rows: List[Dict[str, Any]] = []
+    model_nan_metric_genes: Dict[str, list[str]] = {}
     for model_name, store in model_store.items():
         model_dir = models_dir / model_name
         model_dir.mkdir(exist_ok=True)
-    
+
+        metrics_records = store["metrics"]
+        annotation_metrics_by_split: Dict[str, Dict[str, float]] = {}
+        if metrics_records:
+            metrics_for_annotation = pd.DataFrame(metrics_records)
+            for split in ("train", "val", "test"):
+                split_metrics: Dict[str, float] = {}
+                for metric in _METRIC_ORDER:
+                    col = f"{split}_{metric}"
+                    if col not in metrics_for_annotation.columns:
+                        continue
+                    series = pd.to_numeric(
+                        metrics_for_annotation[col], errors="coerce"
+                    ).replace([np.inf, -np.inf], np.nan)
+                    value = series.mean(skipna=True)
+                    if pd.notna(value) and np.isfinite(float(value)):
+                        split_metrics[metric] = float(value)
+                if split_metrics:
+                    annotation_metrics_by_split[split] = split_metrics
+
         predictions = store["predictions"]
         if predictions:
             preds_df = pd.concat(predictions, ignore_index=True)
-            preds_path = model_dir / "predictions_raw.csv"
-            preds_df.to_csv(preds_path, index=False)
+            if config.training.export_raw_predictions:
+                preds_path = model_dir / "predictions_raw.csv"
+                preds_df.to_csv(preds_path, index=False)
+            else:
+                _LOG.info(
+                    "Skipping raw predictions export | model=%s | reason=export_raw_predictions=False",
+                    model_name,
+                )
 
             residuals_by_split: Dict[str, np.ndarray] = {}
             for split in ["train", "val", "test"]:
@@ -1790,9 +2342,12 @@ def _run_per_gene_pipeline(
                     subset["y_true"].to_numpy(),
                     subset["y_pred"].to_numpy(),
                     model_dir / f"scatter_{split}.png",
-                    f"{model_name.upper()} | {split}",
+                    f"{model_name.upper()} | {split} | points=cells, metrics=mean per-gene",
+                    annotation_metrics=annotation_metrics_by_split.get(split),
                 )
-                residuals_by_split[split] = (subset["y_pred"].to_numpy() - subset["y_true"].to_numpy()).astype(np.float64)
+                residuals_by_split[split] = (
+                    subset["y_pred"].to_numpy() - subset["y_true"].to_numpy()
+                ).astype(np.float64)
 
             if residuals_by_split:
                 plot_residual_histogram_by_split(
@@ -1800,26 +2355,45 @@ def _run_per_gene_pipeline(
                     model_dir / "residuals.png",
                     f"Residuals | {model_name.upper()}",
                 )
-    
-        metrics_records = store["metrics"]
+
         if metrics_records:
             metrics_df = pd.DataFrame(metrics_records)
+            metric_cols = [
+                col
+                for col in metrics_df.columns
+                if col.startswith(("train_", "val_", "test_"))
+            ]
+            nan_gene_names: list[str] = []
+            if metric_cols and "gene" in metrics_df.columns:
+                numeric_metrics = metrics_df[metric_cols].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                non_finite_mask = ~np.isfinite(numeric_metrics.to_numpy(dtype=float))
+                row_has_non_finite = non_finite_mask.any(axis=1)
+                nan_gene_names = (
+                    metrics_df.loc[row_has_non_finite, "gene"]
+                    .astype(str)
+                    .drop_duplicates()
+                    .sort_values()
+                    .tolist()
+                )
+            model_nan_metric_genes[model_name] = nan_gene_names
             for metric in _METRIC_ORDER:
-                split_cols = [f"{split}_{metric}" for split in ("train", "val", "test") if f"{split}_{metric}" in metrics_df.columns]
+                split_cols = [
+                    f"{split}_{metric}"
+                    for split in ("train", "val", "test")
+                    if f"{split}_{metric}" in metrics_df.columns
+                ]
                 if split_cols:
-                    metrics_df[f"{metric}_mean"] = metrics_df[split_cols].mean(axis=1, skipna=True)
-                    metrics_df[f"{metric}_std"] = metrics_df[split_cols].std(axis=1, ddof=0, skipna=True)
+                    metrics_df[f"{metric}_mean"] = metrics_df[split_cols].mean(
+                        axis=1, skipna=True
+                    )
+                    metrics_df[f"{metric}_std"] = metrics_df[split_cols].std(
+                        axis=1, ddof=0, skipna=True
+                    )
             metrics_df = _reorder_metric_columns(metrics_df)
             metrics_df.to_csv(model_dir / "metrics_by_gene.csv", index=False)
 
-            metric_labels = {
-                "pearson": "Pearson correlation coefficient",
-                "spearman": "Spearman correlation coefficient",
-                "r2": "R^2",
-                "rmse": "RMSE",
-                "mse": "MSE",
-                "mae": "MAE",
-            }
             for metric in _METRIC_ORDER:
                 combined_records = []
                 for split in ("train", "val", "test"):
@@ -1849,12 +2423,15 @@ def _run_per_gene_pipeline(
                     plot_box_violin_half_split(
                         values_by_group,
                         model_dir / f"by_split_{metric}.png",
-                        f"{model_name.upper()} | {metric.upper()}",
-                        metric_labels.get(metric, metric.upper()),
+                        f"{model_name.upper()} | {_metric_display_name(metric)}",
+                        _METRIC_AXIS_LABELS.get(metric, metric.upper()),
                         order=["Train", "Val", "Test"],
                     )
 
-            if "train_pearson" in metrics_df.columns and "test_pearson" in metrics_df.columns:
+            if (
+                "train_pearson" in metrics_df.columns
+                and "test_pearson" in metrics_df.columns
+            ):
                 train_vals = pd.to_numeric(metrics_df["train_pearson"], errors="coerce")
                 test_vals = pd.to_numeric(metrics_df["test_pearson"], errors="coerce")
                 mask = np.isfinite(train_vals) & np.isfinite(test_vals)
@@ -1875,6 +2452,8 @@ def _run_per_gene_pipeline(
                 for key, value in metrics_mean.items():
                     if "_" in key:
                         split, metric = key.split("_", 1)
+                        if metric in {"mae", "mse"}:
+                            continue
                         summary_payload[f"{split}_{metric}"] = value
                     else:
                         summary_payload[key] = value
@@ -1884,6 +2463,7 @@ def _run_per_gene_pipeline(
                 "model_display": model_name,
                 "dataset": infer_dataset_name(config),
                 "model_id": model_name,
+                "nan_metric_genes": len(nan_gene_names),
             }
             metrics = _METRIC_ORDER
             for split in ("train", "val", "test"):
@@ -1900,11 +2480,13 @@ def _run_per_gene_pipeline(
                     col = f"test_{metric}"
                     if col in metrics_df.columns:
                         try:
-                            summary_payload[f"test_median_{metric}"] = float(
-                                metrics_df[col].median(skipna=True)
-                            )
+                            median_value = _finite_median(metrics_df[col].tolist())
+                            if median_value is not None:
+                                summary_payload[f"test_{metric}_median"] = median_value
                         except Exception:
-                            _LOG.debug("Failed to compute median for %s", col, exc_info=True)
+                            _LOG.debug(
+                                "Failed to compute median for %s", col, exc_info=True
+                            )
                 if "test_r2" in metrics_df.columns and "gene" in metrics_df.columns:
                     try:
                         best_idx = metrics_df["test_r2"].astype(float).idxmax()
@@ -1913,23 +2495,66 @@ def _run_per_gene_pipeline(
                         if "test_r2" in best_row:
                             summary_payload["best_gene_r2"] = float(best_row["test_r2"])
                         if "test_pearson" in best_row:
-                            summary_payload["best_gene_pearson"] = float(best_row["test_pearson"])
+                            summary_payload["best_gene_pearson"] = float(
+                                best_row["test_pearson"]
+                            )
                         if "test_spearman" in best_row:
-                            summary_payload["best_gene_spearman"] = float(best_row["test_spearman"])
+                            summary_payload["best_gene_spearman"] = float(
+                                best_row["test_spearman"]
+                            )
                     except Exception:
                         _LOG.debug("Failed to compute best gene summary", exc_info=True)
                 if summary_payload:
                     wandb_update_summary(wandb_run, summary_payload)
-    
+
+        histories = store["histories"]
+        if histories:
+            history_dir = model_dir / "histories"
+            history_dir.mkdir(exist_ok=True)
+            for gene_name, history_records in histories:
+                history_df = _order_training_history_columns(
+                    pd.DataFrame(history_records)
+                )
+                history_csv = history_dir / f"{gene_name}.csv"
+                history_df.to_csv(history_csv, index=False)
+                for metric in ("loss", "pearson", "r2", "spearman"):
+                    plot_training_history_curves(
+                        history_df,
+                        metric,
+                        history_dir / f"{gene_name}_{metric}.png",
+                        title=f"{model_name.upper()} | {gene_name} | {metric.title()}",
+                    )
+
+            aggregate_history_df = _aggregate_per_gene_histories(
+                histories, per_gene_counts_by_gene
+            )
+            if not aggregate_history_df.empty:
+                aggregate_history_df = _order_training_history_columns(
+                    aggregate_history_df
+                )
+                aggregate_history_csv = model_dir / "training_history.csv"
+                aggregate_history_df.to_csv(aggregate_history_csv, index=False)
+                for metric in ("loss", "pearson", "r2", "spearman"):
+                    plot_training_history_curves(
+                        aggregate_history_df,
+                        metric,
+                        model_dir / f"training_history_{metric}.png",
+                        title=f"{model_name.upper()} | Aggregate {metric.title()}",
+                    )
+                _stream_training_history_to_wandb(wandb_run, aggregate_history_df)
+
         feature_importances = store["feature_importances"]
         feature_importance_genes = store.get("feature_importances_genes", [])
+        feature_importance_names_by_gene = store.get(
+            "feature_importances_feature_names", []
+        )
         feature_names = store["feature_names"]
         if feature_importances and feature_names:
             try:
                 fi_stack = np.vstack(feature_importances)
             except ValueError as exc:
                 _LOG.warning(
-                    "Skipping feature importance aggregation for %s due to shape mismatch: %s",
+                    "Feature importance vectors for %s have variable lengths; aggregating by feature name instead of dense stack: %s",
                     model_name,
                     exc,
                 )
@@ -1942,13 +2567,17 @@ def _run_per_gene_pipeline(
                     model_dir / "feature_importance_mean.png",
                     f"Feature importance | {model_name.upper()}",
                 )
-    
+
                 fi_std = fi_stack.std(axis=0, ddof=0)
                 fi_median = np.median(fi_stack, axis=0)
-    
-                metadata_records = [_feature_name_metadata(name) for name in feature_names]
-                metadata_df = pd.DataFrame(metadata_records) if metadata_records else None
-    
+
+                metadata_records = [
+                    _feature_name_metadata(name) for name in feature_names
+                ]
+                metadata_df = (
+                    pd.DataFrame(metadata_records) if metadata_records else None
+                )
+
                 aggregate_df = pd.DataFrame(
                     {
                         "feature": feature_names,
@@ -1959,16 +2588,23 @@ def _run_per_gene_pipeline(
                 )
                 if metadata_df is not None and not metadata_df.empty:
                     aggregate_df = pd.concat([aggregate_df, metadata_df], axis=1)
-                aggregate_df.to_csv(model_dir / "feature_importances_mean.csv", index=False)
-    
+                aggregate_df.to_csv(
+                    model_dir / "feature_importances_mean.csv", index=False
+                )
+
                 if feature_importance_genes:
                     long_records: List[Dict[str, object]] = []
                     metadata_lookup = (
-                        {feature_names[idx]: metadata_records[idx] for idx in range(len(feature_names))}
+                        {
+                            feature_names[idx]: metadata_records[idx]
+                            for idx in range(len(feature_names))
+                        }
                         if metadata_records
                         else {}
                     )
-                    for gene_name, vector in zip(feature_importance_genes, feature_importances):
+                    for gene_name, vector in zip(
+                        feature_importance_genes, feature_importances
+                    ):
                         for idx, value in enumerate(vector):
                             entry: Dict[str, object] = {
                                 "gene": gene_name,
@@ -1976,7 +2612,9 @@ def _run_per_gene_pipeline(
                                 "importance": float(value),
                             }
                             if metadata_lookup:
-                                entry.update(metadata_lookup.get(feature_names[idx], {}))
+                                entry.update(
+                                    metadata_lookup.get(feature_names[idx], {})
+                                )
                             long_records.append(entry)
                     if long_records:
                         per_gene_df = pd.DataFrame(long_records)
@@ -1984,6 +2622,63 @@ def _run_per_gene_pipeline(
                             model_dir / "feature_importances_per_gene.csv",
                             index=False,
                         )
+            elif feature_importance_genes and feature_importance_names_by_gene:
+                long_records: List[Dict[str, object]] = []
+                for gene_name, names, vector in zip(
+                    feature_importance_genes,
+                    feature_importance_names_by_gene,
+                    feature_importances,
+                ):
+                    local_names = list(names)
+                    local_values = np.asarray(vector, dtype=np.float64).ravel()
+                    limit = min(len(local_names), local_values.size)
+                    if limit == 0:
+                        continue
+                    for idx in range(limit):
+                        feature = local_names[idx]
+                        entry: Dict[str, object] = {
+                            "gene": gene_name,
+                            "feature": feature,
+                            "importance": float(local_values[idx]),
+                        }
+                        entry.update(_feature_name_metadata(feature))
+                        long_records.append(entry)
+                if long_records:
+                    per_gene_df = pd.DataFrame(long_records)
+                    per_gene_df.to_csv(
+                        model_dir / "feature_importances_per_gene.csv",
+                        index=False,
+                    )
+                    aggregate_df = (
+                        per_gene_df.groupby("feature", as_index=False)
+                        .agg(
+                            importance_mean=("importance", "mean"),
+                            importance_std=("importance", "std"),
+                            importance_median=("importance", "median"),
+                            gene_count=("gene", "nunique"),
+                        )
+                        .fillna({"importance_std": 0.0})
+                    )
+                    metadata_df = pd.DataFrame(
+                        [
+                            _feature_name_metadata(name)
+                            for name in aggregate_df["feature"]
+                        ]
+                    )
+                    if not metadata_df.empty:
+                        aggregate_df = pd.concat([aggregate_df, metadata_df], axis=1)
+                    aggregate_df = aggregate_df.sort_values(
+                        "importance_mean", ascending=False
+                    )
+                    aggregate_df.to_csv(
+                        model_dir / "feature_importances_mean.csv", index=False
+                    )
+                    plot_feature_importance(
+                        aggregate_df["importance_mean"].to_numpy(dtype=np.float64),
+                        aggregate_df["feature"].astype(str).tolist(),
+                        model_dir / "feature_importance_mean.png",
+                        f"Feature importance | {model_name.upper()}",
+                    )
 
     if summary_aggregate_rows:
         summary_agg_df = pd.DataFrame(summary_aggregate_rows)
@@ -1991,29 +2686,16 @@ def _run_per_gene_pipeline(
         summary_path = run_dir / "summary_metrics.csv"
         summary_agg_df.to_csv(summary_path, index=False)
         _LOG.info("Aggregate summary metrics saved to %s", summary_path)
-        histories = store["histories"]
-        if histories:
-            history_dir = model_dir / "histories"
-            history_dir.mkdir(exist_ok=True)
-            for gene_name, history_records in histories:
-                history_df = _order_training_history_columns(pd.DataFrame(history_records))
-                history_csv = history_dir / f"{gene_name}.csv"
-                history_df.to_csv(history_csv, index=False)
-                for metric in ("loss", "pearson", "r2", "spearman"):
-                    plot_training_history_curves(
-                        history_df,
-                        metric,
-                        history_dir / f"{gene_name}_{metric}.png",
-                        title=f"{model_name.upper()} | {gene_name} | {metric.title()}",
-                    )
-    
+
     model_run_details: Dict[str, Any] = {}
+    per_model_success_counts: Dict[str, int] = {}
     for name, meta in model_export_meta.items():
         successes = sorted(set(meta.get("successful_genes", [])))
         failure_records = meta.get("failures", [])
-        if successes:
+        fallback_records = meta.get("fallbacks", [])
+        if successes and not failure_records and not fallback_records:
             status = "succeeded"
-        elif failure_records:
+        elif failure_records or fallback_records:
             status = "failed"
         else:
             status = "skipped"
@@ -2022,20 +2704,80 @@ def _run_per_gene_pipeline(
             entry["successful_genes"] = successes
         if failure_records:
             entry["failures"] = failure_records
+        if fallback_records:
+            entry["used_fallback"] = True
+            entry["fallbacks"] = fallback_records
+        nan_metric_genes = sorted(set(model_nan_metric_genes.get(name, [])))
+        entry["nan_metric_genes"] = nan_metric_genes
         if name in model_config_snapshots:
             entry["estimator"] = model_config_snapshots[name]
         model_run_details[name] = entry
-    
-    processed_genes = sorted({row["gene"] for row in summary_records}) if summary_records else []
+        per_model_success_counts[name] = len(successes)
+        _LOG.info(
+            "Per-gene model summary | model=%s | successful_genes=%d | failed_genes=%d | nan_metric_genes=%d | status=%s",
+            name,
+            len(successes),
+            len(failure_records),
+            len(nan_metric_genes),
+            status,
+        )
+        if nan_metric_genes:
+            _LOG.info(
+                "Per-gene non-finite metric genes | model=%s | genes=%s",
+                name,
+                ",".join(nan_metric_genes),
+            )
+
+    processed_genes = (
+        sorted({row["gene"] for row in summary_records}) if summary_records else []
+    )
+    _LOG.info(
+        "Per-gene run counts | requested=%d | materialized=%d | skipped=%d | processed=%d | filter_mode=%s | reason=%s",
+        len(genes),
+        len(materialized_genes),
+        len(skipped_low_cell_genes),
+        len(processed_genes),
+        effective_cell_filter_mode,
+        cell_filter_reason,
+    )
     extra_context = {
         "mode": "per_gene",
         "requested_genes": sorted({gene.gene_name for gene in genes}) if genes else [],
         "processed_genes": processed_genes,
+        "materialized_genes": sorted(set(materialized_genes)),
+        "skipped_low_cell_genes": skipped_low_cell_genes,
+        "per_gene_cell_filter_mode_effective": effective_cell_filter_mode,
+        "per_gene_cell_filter_reason": cell_filter_reason,
         "chunk_index": chunk_index,
         "chunk_total": chunk_total,
         "total_models": len(config.all_models()),
+        "used_fallback": run_has_fallbacks(model_run_details),
     }
     _export_run_configuration(config, run_dir, model_run_details, extra_context)
+
+    if wandb_run is not None:
+        summary_payload: Dict[str, Any] = {
+            "requested_genes": len(genes),
+            "materialized_genes": len(materialized_genes),
+            "skipped_low_cell_genes": len(skipped_low_cell_genes),
+            "processed_genes": len(processed_genes),
+            "per_gene_cell_filter_mode_effective": effective_cell_filter_mode,
+        }
+        if per_gene_count_records:
+            counts_df = pd.DataFrame(per_gene_count_records)
+            for col in (
+                "cells_raw",
+                "cells_eligible",
+                "cells_filtered_out",
+                "train_cells_effective",
+            ):
+                if col in counts_df.columns:
+                    summary_payload[f"{col}_mean"] = float(
+                        pd.to_numeric(counts_df[col], errors="coerce").mean()
+                    )
+        for model_name, success_count in per_model_success_counts.items():
+            summary_payload[f"{model_name}_successful_genes"] = success_count
+        wandb_update_summary(wandb_run, summary_payload)
 
     if failures:
         raise RuntimeError(
@@ -2043,18 +2785,18 @@ def _run_per_gene_pipeline(
         )
 
     if wandb_run is not None and config.wandb.log_tables:
-        table_max = config.wandb.table_max_rows
+        full_table_rows = 0
         log_tables_from_csv(
             wandb_run,
             "Tables/summary_metrics",
             run_dir / "summary_metrics.csv",
-            max_rows=table_max,
+            max_rows=full_table_rows,
         )
         log_tables_from_csv(
             wandb_run,
             "Tables/summary_metrics_per_gene",
             run_dir / "summary_metrics_per_gene.csv",
-            max_rows=table_max,
+            max_rows=full_table_rows,
         )
         for model_name in config.all_models():
             model_dir = run_dir / "models" / model_name
@@ -2062,41 +2804,54 @@ def _run_per_gene_pipeline(
                 wandb_run,
                 "Tables/metrics_by_gene",
                 model_dir / "metrics_by_gene.csv",
-                max_rows=table_max,
+                max_rows=full_table_rows,
             )
             log_tables_from_csv(
                 wandb_run,
                 "Tables/fi_per_gene_summary",
                 model_dir / "feature_importance_per_gene_summary.csv",
-                max_rows=table_max,
+                max_rows=full_table_rows,
+            )
+            log_tables_from_csv(
+                wandb_run,
+                "Tables/feature_importance_mean",
+                model_dir / "feature_importances_mean.csv",
+                max_rows=full_table_rows,
             )
             log_tables_from_csv(
                 wandb_run,
                 "Tables/shap_per_gene_summary",
                 model_dir / "shapley_values_per_gene_summary.csv",
-                max_rows=table_max,
+                max_rows=full_table_rows,
             )
-            if config.wandb.log_predictions_table:
-                log_tables_from_csv(
-                    wandb_run,
-                    "Tables/predictions",
-                    model_dir / "predictions_raw.csv",
-                    max_rows=table_max,
-                )
 
     if wandb_run is not None and config.wandb.log_media:
         for model_name in config.all_models():
             model_dir = run_dir / "models" / model_name
-            chart_prefix = f"Per_Gene/{model_name.upper()}"
-            log_prediction_charts_from_csv(
+            log_training_history_charts_from_csv(
                 wandb_run,
-                model_dir / "predictions_raw.csv",
-                prefix=chart_prefix,
+                model_dir / "training_history.csv",
+                prefix="Training_History",
             )
             log_metric_distribution_charts_from_csv(
                 wandb_run,
                 model_dir / "metrics_by_gene.csv",
-                prefix=chart_prefix,
+                prefix=model_name.upper(),
+            )
+            log_feature_summary_charts_from_csv(
+                wandb_run,
+                model_dir / "feature_importances_mean.csv",
+                prefix="FI",
+                value_col="importance_mean",
+                title_prefix=f"{model_name.upper()} | Feature Importance",
+            )
+            log_feature_summary_charts_from_csv(
+                wandb_run,
+                model_dir / "shapley_values_mean.csv",
+                prefix="SHAP",
+                value_col="shap_mean_abs",
+                title_prefix=f"{model_name.upper()} | SHAP",
+                signed_col="shap_mean_signed",
             )
 
         max_media = config.wandb.media_max_items
@@ -2110,16 +2865,16 @@ def _run_per_gene_pipeline(
         log_images_from_globs(
             wandb_run,
             run_dir,
-            patterns=["models/*/feature_importance_vs_tss_distance.png"],
+            patterns=["models/*/feature_importance_mean_signed.png"],
             max_items=max_media,
-            group_key="Plots/FI/TSS_Distance",
+            group_key="Plots/FI/Signed",
         )
         log_images_from_globs(
             wandb_run,
             run_dir,
-            patterns=["models/*/feature_importance_mean_signed.png"],
+            patterns=["models/*/feature_importance_vs_tss_distance.png"],
             max_items=max_media,
-            group_key="Plots/FI/Signed",
+            group_key="Plots/FI/TSS_Distance",
         )
         log_images_from_globs(
             wandb_run,
@@ -2128,10 +2883,100 @@ def _run_per_gene_pipeline(
             max_items=max_media,
             group_key="Plots/FI/Cumulative_Overview",
         )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/by_split_pearson.png"],
+            max_items=max_media,
+            group_key="Plots/Pearson",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/by_split_r2.png"],
+            max_items=max_media,
+            group_key="Plots/R2",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/by_split_spearman.png"],
+            max_items=max_media,
+            group_key="Plots/Spearman",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/by_split_rmse.png"],
+            max_items=max_media,
+            group_key="Plots/RMSE",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/by_split_mse.png"],
+            max_items=max_media,
+            group_key="Plots/MSE",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/by_split_mae.png"],
+            max_items=max_media,
+            group_key="Plots/MAE",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/scatter_train.png"],
+            max_items=max_media,
+            group_key="Plots/Scatter/Train",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/scatter_val.png"],
+            max_items=max_media,
+            group_key="Plots/Scatter/Val",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/scatter_test.png"],
+            max_items=max_media,
+            group_key="Plots/Scatter/Test",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/residuals.png"],
+            max_items=max_media,
+            group_key="Plots/Residuals",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/generalization_gap_pearson_train_test.png"],
+            max_items=max_media,
+            group_key="Plots/Generalization_Gap",
+        )
+        log_images_from_globs(
+            wandb_run,
+            run_dir,
+            patterns=["models/*/per_gene_panels/*.png"],
+            max_items=max_media,
+            group_key="Plots/Panels/Per_Gene",
+        )
     if wandb_run is not None and config.wandb.log_artifacts:
         log_run_artifacts(wandb_run, run_dir)
 
-    return run_dir
+    had_fallbacks = run_has_fallbacks(model_run_details)
+    if had_fallbacks:
+        _LOG.warning(
+            "One or more gene-level model trainings used fallbacks; marking run failed in W&B"
+        )
+    return run_dir, had_fallbacks
+
 
 def _run_cellwise_pipeline(
     config: PipelineConfig,
@@ -2144,13 +2989,14 @@ def _run_cellwise_pipeline(
     chunk_total: int = 1,
     gene_expression_fraction: Optional[Dict[str, float]] = None,
     wandb_run: Optional[Any] = None,
-) -> Path:
+) -> tuple[Path, bool]:
     base_dir = config.paths.output_dir
     run_dir = base_dir / config.run_name if config.run_name else base_dir
     catboost_tmp_root = run_dir / "catboost_tmp"
 
     model_export_meta: Dict[str, Dict[str, Any]] = {
-        name: {"status": "pending", "failures": []} for name in config.all_models()
+        name: {"status": "pending", "failures": [], "fallbacks": []}
+        for name in config.all_models()
     }
     model_config_snapshots: Dict[str, Dict[str, Any]] = {}
     overall_status = "failed"
@@ -2194,6 +3040,7 @@ def _run_cellwise_pipeline(
 
         summary_records: List[Dict[str, object]] = []
         failures: List[str] = []
+        importance_collection: Dict[str, np.ndarray] = {}
 
         def export_run_configuration_snapshot() -> None:
             model_run_details: Dict[str, Any] = {}
@@ -2204,6 +3051,10 @@ def _run_cellwise_pipeline(
                 failures_meta = meta.get("failures", [])
                 if failures_meta:
                     entry["failures"] = failures_meta
+                fallbacks_meta = meta.get("fallbacks", [])
+                if fallbacks_meta:
+                    entry["used_fallback"] = True
+                    entry["fallbacks"] = fallbacks_meta
                 if name in model_config_snapshots:
                     entry["estimator"] = model_config_snapshots[name]
                 model_run_details[name] = entry
@@ -2237,7 +3088,9 @@ def _run_cellwise_pipeline(
             tracker = ResourceUsageTracker(
                 name=f"{model_name}_cellwise",
                 output_dir=model_dir,
-                interval_seconds=getattr(config.training, "resource_sample_seconds", 60.0),
+                interval_seconds=getattr(
+                    config.training, "resource_sample_seconds", 60.0
+                ),
             )
             artifacts_dir = None
             if model_name == "catboost":
@@ -2257,7 +3110,8 @@ def _run_cellwise_pipeline(
                             model_name,
                             config.training,
                             artifacts_dir=artifacts_dir,
-                            cache_dir=config.cache_dir,
+                            cache_dir=config.cache_dir_for_scope("cellwise"),
+                            wandb_run=wandb_run,
                         )
             except Exception as exc:  # pragma: no cover - defensive logging
                 _LOG.error("Model %s failed in multi-output mode: %s", model_name, exc)
@@ -2284,7 +3138,9 @@ def _run_cellwise_pipeline(
                 )
                 _persist_cellwise_model(model_dir, result, config.training)
                 if result.history:
-                    history_df = _order_training_history_columns(pd.DataFrame(result.history))
+                    history_df = _order_training_history_columns(
+                        pd.DataFrame(result.history)
+                    )
                     history_csv = model_dir / "training_history.csv"
                     history_df.to_csv(history_csv, index=False)
                     for metric in ("loss", "pearson", "r2", "spearman"):
@@ -2295,30 +3151,45 @@ def _run_cellwise_pipeline(
                             title=f"{model_name.upper()} | {metric.title()}",
                         )
 
-                if getattr(result, "feature_importances", None) is not None and getattr(result, "feature_names", None) is not None:
+                if (
+                    getattr(result, "feature_importances", None) is not None
+                    and getattr(result, "feature_names", None) is not None
+                ):
                     fi_summary = _export_feature_importance_artifacts(
                         model_dir,
                         model_name,
                         np.asarray(result.feature_importances, dtype=np.float64),
                         list(result.feature_names),
                         feature_importance_mean_signed=(
-                            np.asarray(result.feature_importance_mean_signed, dtype=np.float64)
-                            if getattr(result, "feature_importance_mean_signed", None) is not None
+                            np.asarray(
+                                result.feature_importance_mean_signed, dtype=np.float64
+                            )
+                            if getattr(result, "feature_importance_mean_signed", None)
+                            is not None
                             else None
                         ),
                         method=getattr(result, "feature_importance_method", None),
                         export_per_gene_panels=config.training.enable_per_gene_panels,
                         gene_names=result.gene_names,
-                        feature_block_slices=getattr(result, "feature_block_slices", None),
-                        feature_block_indices=getattr(result, "feature_block_indices", None),
+                        feature_block_slices=getattr(
+                            result, "feature_block_slices", None
+                        ),
+                        feature_block_indices=getattr(
+                            result, "feature_block_indices", None
+                        ),
                         gene_infos=getattr(result, "gene_infos", None),
                     )
                     if wandb_run is not None and fi_summary:
-                        fi_metric_payload = _compact_feature_importance_metric_payload(fi_summary)
+                        fi_metric_payload = _compact_feature_importance_metric_payload(
+                            fi_summary
+                        )
                         if fi_metric_payload:
                             # Keep feature-importance aggregates in summary only (no time-series charts).
                             wandb_update_summary(wandb_run, fi_metric_payload)
-                if getattr(result, "shap_importance_mean", None) is not None and getattr(result, "feature_names", None) is not None:
+                if (
+                    getattr(result, "shap_importance_mean", None) is not None
+                    and getattr(result, "feature_names", None) is not None
+                ):
                     shap_summary = _export_shap_importance_artifacts(
                         model_dir,
                         model_name,
@@ -2326,13 +3197,18 @@ def _run_cellwise_pipeline(
                         list(result.feature_names),
                         shap_value_mean_signed=(
                             np.asarray(result.shap_value_mean_signed, dtype=np.float64)
-                            if getattr(result, "shap_value_mean_signed", None) is not None
+                            if getattr(result, "shap_value_mean_signed", None)
+                            is not None
                             else None
                         ),
                         method=getattr(result, "shap_importance_method", None),
                         gene_names=result.gene_names,
-                        feature_block_slices=getattr(result, "feature_block_slices", None),
-                        feature_block_indices=getattr(result, "feature_block_indices", None),
+                        feature_block_slices=getattr(
+                            result, "feature_block_slices", None
+                        ),
+                        feature_block_indices=getattr(
+                            result, "feature_block_indices", None
+                        ),
                         gene_infos=getattr(result, "gene_infos", None),
                     )
                     if wandb_run is not None and shap_summary:
@@ -2348,11 +3224,27 @@ def _run_cellwise_pipeline(
                 summary_payload: Dict[str, Any] = {}
                 for split in ("train", "val", "test"):
                     metrics = result.aggregate_metrics.get(split, {})
-                    for metric_name in ("pearson", "r2", "spearman", "rmse", "mse", "mae"):
+                    for metric_name in (
+                        "pearson",
+                        "r2",
+                        "spearman",
+                        "rmse",
+                        "mse",
+                        "mae",
+                    ):
                         key = f"{split}_{metric_name}"
                         value = metrics.get(metric_name)
                         metric_payload[key] = value
-                        summary_payload[key] = value
+                        if metric_name not in {"mse", "mae"}:
+                            summary_payload[key] = value
+                test_per_gene = result.per_gene_metrics.get("test", [])
+                test_pearson_median = _finite_median(
+                    entry.get("pearson")
+                    for entry in test_per_gene
+                    if isinstance(entry, dict)
+                )
+                if test_pearson_median is not None:
+                    summary_payload["test_pearson_median"] = test_pearson_median
                 summary_records.append(metric_payload)
                 if wandb_run is not None:
                     wandb_update_summary(wandb_run, summary_payload)
@@ -2378,17 +3270,112 @@ def _run_cellwise_pipeline(
                         ", ".join(missing),
                     )
 
-                model_export_meta[model_name]["status"] = "succeeded"
-                if model_name not in model_config_snapshots and result.fitted_model is not None:
-                    model_config_snapshots[model_name] = _capture_model_configuration(result.fitted_model)
+                if getattr(result, "used_fallback", False):
+                    reasons = getattr(result, "fallback_reasons", []) or []
+                    fallback_entry = model_name
+                    if reasons:
+                        fallback_entry = f"{model_name}: " + " | ".join(reasons)
+                    model_export_meta[model_name]["fallbacks"].append(fallback_entry)
+                    model_export_meta[model_name]["status"] = "failed"
+                else:
+                    model_export_meta[model_name]["status"] = "succeeded"
+                if (
+                    model_name not in model_config_snapshots
+                    and result.fitted_model is not None
+                ):
+                    model_config_snapshots[model_name] = _capture_model_configuration(
+                        result.fitted_model
+                    )
+                if result.feature_importances is not None:
+                    importance_collection[model_name] = np.abs(
+                        np.asarray(result.feature_importances, dtype=np.float64).ravel()
+                    )
             finally:
                 export_run_configuration_snapshot()
 
         if failures:
             raise RuntimeError(
-                "One or more models failed in multi-output mode: "
-                + "; ".join(failures)
+                "One or more models failed in multi-output mode: " + "; ".join(failures)
             )
+
+        # Feature-pruned retraining: if feature_prune_top_k is set and we collected importances,
+        # re-train all models on the top-K most important features to measure the sparsity/performance tradeoff.
+        prune_k = getattr(config.training, "feature_prune_top_k", None)
+        if prune_k and importance_collection:
+            _LOG.info(
+                "Feature-pruned retraining | top_k=%d | original_features=%d | models_with_importance=%d",
+                prune_k,
+                dataset.num_features(),
+                len(importance_collection),
+            )
+            feature_mask = _compute_top_k_feature_mask(
+                importance_collection, dataset.num_features(), prune_k
+            )
+            pruned_dataset = _prune_cellwise_dataset(dataset, feature_mask)
+            pruned_models_dir = _ensure_directory(run_dir / "models_pruned")
+            pruned_summary_records: List[Dict[str, object]] = []
+            pruned_failures: List[str] = []
+
+            np.save(run_dir / "feature_prune_mask.npy", feature_mask)
+            pd.DataFrame(
+                {
+                    "feature_name": dataset.feature_names,
+                    "selected": feature_mask.tolist(),
+                }
+            ).to_csv(run_dir / "feature_prune_mask.csv", index=False)
+            _LOG.info(
+                "Pruned mask saved | kept=%d / %d features",
+                int(feature_mask.sum()),
+                dataset.num_features(),
+            )
+
+            for model_name in config.all_models():
+                pruned_model_dir = _ensure_directory(pruned_models_dir / model_name)
+                try:
+                    pruned_result = train_multi_output_model(
+                        pruned_dataset,
+                        model_name,
+                        config.training,
+                        artifacts_dir=None,
+                        cache_dir=config.cache_dir_for_scope("cellwise"),
+                        wandb_run=None,
+                    )
+                except Exception as exc:
+                    _LOG.error("Pruned model %s failed: %s", model_name, exc)
+                    pruned_failures.append(f"{model_name}: {exc}")
+                    continue
+
+                _write_cellwise_metrics(
+                    pruned_model_dir, pruned_result, pruned_dataset.genes
+                )
+                pruned_metric_payload: Dict[str, Any] = {
+                    "model": model_name,
+                    "features": int(feature_mask.sum()),
+                    "pruned": True,
+                }
+                for split in ("train", "val", "test"):
+                    metrics = pruned_result.aggregate_metrics.get(split, {})
+                    for m in ("pearson", "r2", "spearman", "rmse"):
+                        pruned_metric_payload[f"{split}_{m}"] = metrics.get(m)
+                pruned_summary_records.append(pruned_metric_payload)
+                _LOG.info(
+                    "Pruned model complete | model=%s | test_pearson=%.4f",
+                    model_name,
+                    float(
+                        pruned_result.aggregate_metrics.get("test", {}).get(
+                            "pearson", float("nan")
+                        )
+                    ),
+                )
+
+            if pruned_summary_records:
+                pd.DataFrame(pruned_summary_records).to_csv(
+                    run_dir / "summary_metrics_pruned.csv", index=False
+                )
+            if pruned_failures:
+                _LOG.warning(
+                    "Some pruned models failed: %s", "; ".join(pruned_failures)
+                )
 
         if summary_records:
             summary_df = pd.DataFrame(summary_records)
@@ -2398,12 +3385,12 @@ def _run_cellwise_pipeline(
             export_run_configuration_snapshot()
 
             if wandb_run is not None and config.wandb.log_tables:
-                table_max = config.wandb.table_max_rows
+                full_table_rows = 0
                 log_tables_from_csv(
                     wandb_run,
                     "Tables/summary_metrics",
                     run_dir / "summary_metrics.csv",
-                    max_rows=table_max,
+                    max_rows=full_table_rows,
                 )
                 for model_name in config.all_models():
                     model_dir = run_dir / "models" / model_name
@@ -2411,59 +3398,78 @@ def _run_cellwise_pipeline(
                         wandb_run,
                         "Tables/metrics_aggregate",
                         model_dir / "metrics_aggregate.csv",
-                        max_rows=table_max,
+                        max_rows=full_table_rows,
                     )
                     log_tables_from_csv(
                         wandb_run,
                         "Tables/metrics_per_gene",
                         model_dir / "metrics_per_gene.csv",
-                        max_rows=table_max,
+                        max_rows=full_table_rows,
                     )
                     log_tables_from_csv(
                         wandb_run,
                         "Tables/fi_per_gene_summary",
                         model_dir / "feature_importance_per_gene_summary.csv",
-                        max_rows=table_max,
+                        max_rows=full_table_rows,
+                    )
+                    log_tables_from_csv(
+                        wandb_run,
+                        "Tables/feature_importance_mean",
+                        model_dir / "feature_importances_mean.csv",
+                        max_rows=full_table_rows,
                     )
                     log_tables_from_csv(
                         wandb_run,
                         "Tables/shap_per_gene_summary",
                         model_dir / "shapley_values_per_gene_summary.csv",
-                        max_rows=table_max,
+                        max_rows=full_table_rows,
                     )
-                    if config.wandb.log_predictions_table:
-                        log_tables_from_csv(
-                            wandb_run,
-                            "Tables/predictions",
-                            model_dir / "predictions_raw.csv",
-                            max_rows=table_max,
-                        )
                     log_tables_from_csv(
                         wandb_run,
-                        "Tables/training_history",
-                        model_dir / "training_history.csv",
-                        max_rows=table_max,
-                    )
-                    log_training_history_charts_from_csv(
-                        wandb_run,
-                        model_dir / "training_history.csv",
-                        prefix=f"Training_History/{model_name.upper()}",
+                        "Tables/shap_mean",
+                        model_dir / "shapley_values_mean.csv",
+                        max_rows=full_table_rows,
                     )
 
         if wandb_run is not None and config.wandb.log_media:
             for model_name in config.all_models():
                 model_dir = run_dir / "models" / model_name
-                chart_prefix = f"Multi_Output/{model_name.upper()}"
-                log_prediction_charts_from_csv(
+                log_training_history_charts_from_csv(
                     wandb_run,
-                    model_dir / "predictions_raw.csv",
-                    prefix=chart_prefix,
+                    model_dir / "training_history.csv",
+                    prefix="Training_History",
                 )
                 log_metric_distribution_charts_from_csv(
                     wandb_run,
                     model_dir / "metrics_per_gene.csv",
-                    prefix=chart_prefix,
+                    prefix=model_name.upper(),
                 )
+                log_feature_summary_charts_from_csv(
+                    wandb_run,
+                    model_dir / "feature_importances_mean.csv",
+                    prefix="FI",
+                    value_col="importance_mean",
+                    title_prefix=f"{model_name.upper()} | Feature Importance",
+                )
+                log_feature_summary_charts_from_csv(
+                    wandb_run,
+                    model_dir / "shapley_values_mean.csv",
+                    prefix="SHAP",
+                    value_col="shap_mean_abs",
+                    title_prefix=f"{model_name.upper()} | SHAP",
+                    signed_col="shap_mean_signed",
+                )
+                log_resource_usage_charts_from_csv(
+                    wandb_run,
+                    model_dir / f"{model_name}_cellwise_resource_usage.csv",
+                    prefix=f"Resources/{model_name.upper()}",
+                )
+                if config.wandb.log_predictions_table:
+                    log_prediction_charts_from_csv(
+                        wandb_run,
+                        model_dir / "predictions_raw.csv",
+                        prefix=model_name.upper(),
+                    )
 
             max_media = config.wandb.media_max_items
             log_images_from_globs(
@@ -2476,16 +3482,16 @@ def _run_cellwise_pipeline(
             log_images_from_globs(
                 wandb_run,
                 run_dir,
-                patterns=["models/*/feature_importance_vs_tss_distance.png"],
+                patterns=["models/*/feature_importance_mean_signed.png"],
                 max_items=max_media,
-                group_key="Plots/FI/TSS_Distance",
+                group_key="Plots/FI/Signed",
             )
             log_images_from_globs(
                 wandb_run,
                 run_dir,
-                patterns=["models/*/feature_importance_mean_signed.png"],
+                patterns=["models/*/feature_importance_vs_tss_distance.png"],
                 max_items=max_media,
-                group_key="Plots/FI/Signed",
+                group_key="Plots/FI/TSS_Distance",
             )
             log_images_from_globs(
                 wandb_run,
@@ -2511,38 +3517,156 @@ def _run_cellwise_pipeline(
             log_images_from_globs(
                 wandb_run,
                 run_dir,
-                patterns=[
-                    "models/*/shapley_values_vs_tss.png",
-                    "models/*/shapley_values_vs_tss_zoomed.png",
-                ],
+                patterns=["models/*/shapley_values_vs_tss.png"],
                 max_items=max_media,
                 group_key="Plots/SHAP/TSS_Distance",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/shapley_values_vs_tss_zoomed.png"],
+                max_items=max_media,
+                group_key="Plots/SHAP/TSS_Distance_Zoomed",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/by_split_pearson.png"],
+                max_items=max_media,
+                group_key="Plots/Pearson",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/by_split_r2.png"],
+                max_items=max_media,
+                group_key="Plots/R2",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/by_split_spearman.png"],
+                max_items=max_media,
+                group_key="Plots/Spearman",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/by_split_rmse.png"],
+                max_items=max_media,
+                group_key="Plots/RMSE",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/by_split_mse.png"],
+                max_items=max_media,
+                group_key="Plots/MSE",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/by_split_mae.png"],
+                max_items=max_media,
+                group_key="Plots/MAE",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/scatter_train.png"],
+                max_items=max_media,
+                group_key="Plots/Scatter/Train",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/scatter_val.png"],
+                max_items=max_media,
+                group_key="Plots/Scatter/Val",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/scatter_test.png"],
+                max_items=max_media,
+                group_key="Plots/Scatter/Test",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/residuals.png"],
+                max_items=max_media,
+                group_key="Plots/Residuals",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/residuals_bar.png"],
+                max_items=max_media,
+                group_key="Plots/Residual_Bar",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/generalization_gap_pearson_train_test.png"],
+                max_items=max_media,
+                group_key="Plots/Generalization_Gap",
+            )
+            log_images_from_globs(
+                wandb_run,
+                run_dir,
+                patterns=["models/*/per_gene_panels/*.png"],
+                max_items=max_media,
+                group_key="Plots/Panels/Per_Gene",
             )
 
         if wandb_run is not None and config.wandb.log_artifacts:
             log_run_artifacts(wandb_run, run_dir)
 
         overall_status = "succeeded"
-        return run_dir
+        if run_has_fallbacks(model_export_meta):
+            overall_status = "failed"
+            _LOG.warning(
+                "One or more multi-output model trainings used fallbacks; marking run failed in W&B"
+            )
+        return run_dir, overall_status != "succeeded"
     finally:
         # Log resource usage summary from entire run
         try:
             resource_summary = get_resource_summary()
-            if resource_summary["peak_rss_gib"] > 0 or resource_summary["peak_gpu_allocated_mb"] > 0:
+            if (
+                resource_summary["peak_rss_gib"] > 0
+                or resource_summary["peak_gpu_allocated_mb"] > 0
+            ):
                 summary_parts = []
                 if resource_summary["peak_rss_gib"] > 0:
-                    summary_parts.append(f"peak_rss={resource_summary['peak_rss_gib']:.2f} GiB")
+                    summary_parts.append(
+                        f"peak_rss={resource_summary['peak_rss_gib']:.2f} GiB"
+                    )
                 if resource_summary["peak_cpu_pct"] > 0:
-                    summary_parts.append(f"peak_cpu={resource_summary['peak_cpu_pct']:.1f}%")
+                    summary_parts.append(
+                        f"peak_cpu={resource_summary['peak_cpu_pct']:.1f}%"
+                    )
                 if resource_summary["peak_gpu_allocated_mb"] > 0:
-                    summary_parts.append(f"peak_gpu_allocated={resource_summary['peak_gpu_allocated_mb']:.0f} MB")
+                    summary_parts.append(
+                        f"peak_gpu_allocated={resource_summary['peak_gpu_allocated_mb']:.0f} MB"
+                    )
                 if resource_summary["peak_gpu_reserved_mb"] > 0:
-                    summary_parts.append(f"peak_gpu_reserved={resource_summary['peak_gpu_reserved_mb']:.0f} MB")
-                if resource_summary["peak_gpu_free_mb"] != float("inf") and resource_summary["peak_gpu_free_mb"] >= 0:
-                    summary_parts.append(f"min_gpu_free={resource_summary['peak_gpu_free_mb']:.0f} MB")
+                    summary_parts.append(
+                        f"peak_gpu_reserved={resource_summary['peak_gpu_reserved_mb']:.0f} MB"
+                    )
+                if (
+                    resource_summary["peak_gpu_free_mb"] != float("inf")
+                    and resource_summary["peak_gpu_free_mb"] >= 0
+                ):
+                    summary_parts.append(
+                        f"min_gpu_free={resource_summary['peak_gpu_free_mb']:.0f} MB"
+                    )
                 if resource_summary["max_gpu_devices"] > 0:
-                    summary_parts.append(f"gpu_devices={resource_summary['max_gpu_devices']}")
-                
+                    summary_parts.append(
+                        f"gpu_devices={resource_summary['max_gpu_devices']}"
+                    )
+
                 if summary_parts:
                     _LOG.info("═" * 80)
                     _LOG.info("RESOURCE USAGE SUMMARY (peak values across entire run)")
@@ -2553,9 +3677,10 @@ def _run_cellwise_pipeline(
                 pass
         except Exception:  # pragma: no cover
             _LOG.debug("Failed to log resource summary", exc_info=True)
-        
+
         model_status_snapshot = {
-            name: meta.get("status", "pending") for name, meta in model_export_meta.items()
+            name: meta.get("status", "pending")
+            for name, meta in model_export_meta.items()
         }
         try:
             _update_run_status_overview(
@@ -2658,6 +3783,118 @@ def _choose_random_genes(
 def _ensure_directory(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _weighted_nanmean(values: pd.Series, weights: pd.Series) -> float:
+    valid = values.notna() & weights.notna()
+    if not valid.any():
+        return float("nan")
+    vals = values.loc[valid].to_numpy(dtype=float)
+    wts = weights.loc[valid].to_numpy(dtype=float)
+    positive = np.isfinite(vals) & np.isfinite(wts) & (wts > 0)
+    if not positive.any():
+        return float(np.nanmean(vals))
+    return float(np.average(vals[positive], weights=wts[positive]))
+
+
+def _aggregate_per_gene_histories(
+    histories: List[Tuple[str, List[Dict[str, float]]]],
+    counts_by_gene: Dict[str, Dict[str, object]],
+) -> pd.DataFrame:
+    if not histories:
+        return pd.DataFrame()
+
+    history_frames: List[pd.DataFrame] = []
+    for gene_name, history_records in histories:
+        if not history_records:
+            continue
+        history_df = pd.DataFrame(history_records)
+        if history_df.empty or "epoch" not in history_df.columns:
+            continue
+        counts = counts_by_gene.get(gene_name, {})
+        history_df = history_df.copy()
+        history_df["gene"] = gene_name
+        history_df["train_weight"] = float(
+            pd.to_numeric(
+                pd.Series([counts.get("train_cells_effective")]), errors="coerce"
+            ).iloc[0]
+        )
+        history_df["val_weight"] = float(
+            pd.to_numeric(
+                pd.Series([counts.get("val_cells_raw")]), errors="coerce"
+            ).iloc[0]
+        )
+        history_frames.append(history_df)
+
+    if not history_frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(history_frames, ignore_index=True, sort=False)
+    combined["epoch"] = pd.to_numeric(combined["epoch"], errors="coerce")
+    combined = combined.dropna(subset=["epoch"])
+    if combined.empty:
+        return pd.DataFrame()
+
+    aggregate_rows: List[Dict[str, float]] = []
+    metric_cols = [
+        col
+        for col in combined.columns
+        if col not in {"gene", "train_weight", "val_weight"}
+    ]
+    for epoch_value, epoch_df in combined.groupby("epoch", sort=True):
+        row: Dict[str, float] = {"epoch": float(epoch_value)}
+        row["genes_contributing"] = float(epoch_df["gene"].nunique())
+        for col in metric_cols:
+            if col == "epoch":
+                continue
+            values = pd.to_numeric(epoch_df[col], errors="coerce")
+            if values.notna().sum() == 0:
+                continue
+            if col.startswith("train_") and col[len("train_") :] in {
+                "loss",
+                "rmse",
+                "mse",
+                "mae",
+            }:
+                row[col] = _weighted_nanmean(values, epoch_df["train_weight"])
+            elif col.startswith("val_") and col[len("val_") :] in {
+                "loss",
+                "rmse",
+                "mse",
+                "mae",
+            }:
+                row[col] = _weighted_nanmean(values, epoch_df["val_weight"])
+            else:
+                row[col] = float(np.nanmean(values.to_numpy(dtype=float)))
+            row[f"genes_contributing_{col}"] = float(values.notna().sum())
+        aggregate_rows.append(row)
+
+    if not aggregate_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(aggregate_rows).sort_values("epoch").reset_index(drop=True)
+
+
+def _stream_training_history_to_wandb(
+    wandb_run: Optional[Any],
+    history_df: pd.DataFrame,
+) -> None:
+    if wandb_run is None or history_df.empty or "epoch" not in history_df.columns:
+        return
+
+    for _, row in history_df.iterrows():
+        step = pd.to_numeric(pd.Series([row.get("epoch")]), errors="coerce").iloc[0]
+        if pd.isna(step):
+            continue
+        payload: Dict[str, float] = {}
+        for col, value in row.items():
+            if col == "epoch" or str(col).startswith("genes_contributing"):
+                continue
+            numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+            if pd.isna(numeric):
+                continue
+            payload[f"training/{col}"] = float(numeric)
+        if payload:
+            wandb_log_metrics(wandb_run, payload, step=int(step))
 
 
 def _order_training_history_columns(history_df: pd.DataFrame) -> pd.DataFrame:
@@ -2874,14 +4111,6 @@ def _plot_cellwise_diagnostics(
                 values.append(num)
         return values
 
-    metric_labels = {
-        "pearson": "Pearson correlation coefficient",
-        "spearman": "Spearman correlation coefficient",
-        "r2": "R^2",
-        "rmse": "RMSE",
-        "mse": "MSE",
-        "mae": "MAE",
-    }
     for metric in _METRIC_ORDER:
         values_by_group: Dict[str, List[float]] = {}
         for split in ("train", "val", "test"):
@@ -2895,8 +4124,8 @@ def _plot_cellwise_diagnostics(
         plot_box_violin_half_split(
             values_by_group,
             model_dir / f"by_split_{metric}.png",
-            f"{result.model_name.upper()} | {metric.upper()}",
-            metric_labels.get(metric, metric.upper()),
+            f"{result.model_name.upper()} | {_metric_display_name(metric)}",
+            _METRIC_AXIS_LABELS.get(metric, metric.upper()),
             order=["Train", "Val", "Test"],
         )
 
@@ -2947,6 +4176,7 @@ def _plot_cellwise_diagnostics(
                 "Train - Test Pearson",
             )
 
+
 def _persist_cellwise_model(
     model_dir: Path,
     result: CellwiseModelResult,
@@ -2973,7 +4203,9 @@ def _persist_cellwise_model(
     try:
         if _torch_nn is not None and isinstance(model, _torch_nn.Module):
             # Unwrap DataParallel to avoid 'module.' prefix in state dict keys
-            model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
+            model_to_save = (
+                model.module if isinstance(model, torch.nn.DataParallel) else model
+            )
             state = {
                 "state_dict": model_to_save.state_dict(),
                 "model_class": model_to_save.__class__.__name__,
@@ -2983,7 +4215,9 @@ def _persist_cellwise_model(
         else:
             joblib.dump(model, model_dir / "model.pkl")
     except Exception as exc:  # pragma: no cover - defensive
-        _LOG.warning("Failed to persist model artifact for %s: %s", result.model_name, exc)
+        _LOG.warning(
+            "Failed to persist model artifact for %s: %s", result.model_name, exc
+        )
 
     scalers = {
         "feature_scaler.pkl": result.feature_scaler,
@@ -2995,7 +4229,9 @@ def _persist_cellwise_model(
         try:
             joblib.dump(scaler, model_dir / name)
         except Exception as exc:  # pragma: no cover - defensive
-            _LOG.warning("Failed to persist %s for %s: %s", name, result.model_name, exc)
+            _LOG.warning(
+                "Failed to persist %s for %s: %s", name, result.model_name, exc
+            )
 
 
 def _serialize_value(value: Any) -> Any:
@@ -3036,7 +4272,11 @@ def _capture_model_configuration(model: object) -> Dict[str, Any]:
     if _torch_nn is not None and isinstance(model, _torch_nn.Module):
         try:
             total_params = int(sum(param.numel() for param in model.parameters()))
-            trainable_params = int(sum(param.numel() for param in model.parameters() if param.requires_grad))
+            trainable_params = int(
+                sum(
+                    param.numel() for param in model.parameters() if param.requires_grad
+                )
+            )
         except Exception:  # pragma: no cover - fallback when parameters unavailable
             total_params = trainable_params = 0
         summary.update(
@@ -3051,7 +4291,9 @@ def _capture_model_configuration(model: object) -> Dict[str, Any]:
     if hasattr(model, "get_params"):
         try:
             params = model.get_params(deep=True)
-        except Exception as exc:  # pragma: no cover - estimator without get_params support
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - estimator without get_params support
             params = {"_error": f"get_params failed: {exc}"}
         summary.update(
             {
@@ -3067,7 +4309,12 @@ def _capture_model_configuration(model: object) -> Dict[str, Any]:
 
 def _utc_timestamp() -> str:
     """Return a timezone-aware UTC timestamp with a trailing Z."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _write_dataset_manifest(config: PipelineConfig, run_dir: Path) -> None:
@@ -3092,9 +4339,12 @@ def _write_dataset_manifest(config: PipelineConfig, run_dir: Path) -> None:
                 stat = resolved.stat()
                 entry["exists"] = True
                 entry["size_bytes"] = stat.st_size
-                entry["mtime_utc"] = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).replace(
-                    microsecond=0
-                ).isoformat().replace("+00:00", "Z")
+                entry["mtime_utc"] = (
+                    datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
             else:
                 entry["exists"] = False
         except Exception as exc:  # pragma: no cover - best-effort manifest
@@ -3130,6 +4380,7 @@ def _export_run_configuration(
         "models": _serialize_value(config.models),
         "wandb": _serialize_value(config.wandb),
         "genes": _serialize_value(genes_payload),
+        "gene_manifest_path": _serialize_value(config.gene_manifest_path),
         "chromosomes": _serialize_value(config.chromosomes),
         "max_genes": config.max_genes,
         "chunk_total": config.chunk_total,
@@ -3211,3 +4462,78 @@ def _extract_feature_importance(result: ModelResult) -> np.ndarray | None:
         coef = np.asarray(model.coef_)
         return np.abs(coef.ravel())
     return None
+
+
+def _compute_top_k_feature_mask(
+    importance_collection: Dict[str, np.ndarray],
+    n_features: int,
+    top_k: int,
+) -> np.ndarray:
+    """Return a boolean mask of shape (n_features,) selecting the top_k most important features.
+
+    Importance is aggregated across models by averaging their absolute importance vectors.
+    When no importances are available, returns a mask that selects all features.
+    """
+    if not importance_collection:
+        return np.ones(n_features, dtype=bool)
+    vectors = []
+    for vec in importance_collection.values():
+        vec = np.asarray(vec, dtype=np.float64).ravel()
+        if vec.shape[0] == n_features:
+            vectors.append(np.abs(vec))
+    if not vectors:
+        return np.ones(n_features, dtype=bool)
+    mean_importance = np.mean(np.stack(vectors, axis=0), axis=0)
+    k = min(int(top_k), n_features)
+    top_indices = np.argpartition(mean_importance, -k)[-k:]
+    mask = np.zeros(n_features, dtype=bool)
+    mask[top_indices] = True
+    return mask
+
+
+def _prune_cellwise_dataset(
+    dataset: "CellwiseDataset",
+    feature_mask: np.ndarray,
+) -> "CellwiseDataset":
+    """Return a copy of `dataset` with features masked to `feature_mask` columns."""
+    from .data import CellwiseDataset
+
+    X = dataset.X
+    if sp.issparse(X):
+        X_pruned = X[:, feature_mask]
+    else:
+        X_pruned = np.asarray(X)[:, feature_mask]
+
+    pruned_feature_names = [
+        n for n, m in zip(dataset.feature_names, feature_mask.tolist()) if m
+    ]
+
+    # Rebuild feature_block_slices and feature_block_indices for the pruned mask
+    pruned_block_slices: List[Tuple[int, int]] = []
+    pruned_block_indices: List[np.ndarray] = []
+    if dataset.feature_block_indices:
+        ptr = 0
+        for block_idx_arr in dataset.feature_block_indices:
+            block_mask = feature_mask[block_idx_arr]
+            kept = block_idx_arr[block_mask]
+            # Re-index kept features to new column positions
+            new_cols = np.where(feature_mask)[0]
+            remap = {old: new for new, old in enumerate(new_cols.tolist())}
+            remapped = np.array([remap[int(c)] for c in kept.tolist()], dtype=np.int64)
+            pruned_block_slices.append((ptr, ptr + int(remapped.shape[0])))
+            pruned_block_indices.append(remapped)
+            ptr += int(remapped.shape[0])
+
+    return CellwiseDataset(
+        genes=dataset.genes,
+        X=X_pruned,
+        y=dataset.y,
+        cell_ids=dataset.cell_ids,
+        feature_names=pruned_feature_names,
+        group_labels=dataset.group_labels,
+        metadata={**dataset.metadata, "pruned_feature_count": int(feature_mask.sum())},
+        feature_block_slices=(
+            pruned_block_slices if pruned_block_slices else dataset.feature_block_slices
+        ),
+        feature_block_indices=pruned_block_indices if pruned_block_indices else [],
+    )

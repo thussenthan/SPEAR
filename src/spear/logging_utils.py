@@ -1,4 +1,3 @@
-
 import csv
 import logging
 import os
@@ -51,19 +50,24 @@ def configure_logging(
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    file_formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
+    console_formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
 
     file_handler = logging.FileHandler(log_path, mode="w")
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(file_formatter)
 
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(logging.INFO)
     stdout_handler.addFilter(_MaxLevelFilter(logging.INFO))
-    stdout_handler.setFormatter(formatter)
+    stdout_handler.setFormatter(console_formatter)
 
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setLevel(logging.WARNING)
-    stderr_handler.setFormatter(formatter)
+    stderr_handler.setFormatter(console_formatter)
 
     root = logging.getLogger()
     root.setLevel(log_level)
@@ -164,7 +168,9 @@ def _get_gpu_utilization_percent() -> float:
 class ResourceUsageTracker:
     """Best-effort background sampler that records resource usage and writes plots/csv."""
 
-    def __init__(self, name: str, output_dir: Path | str, interval_seconds: float = 60.0) -> None:
+    def __init__(
+        self, name: str, output_dir: Path | str, interval_seconds: float = 60.0
+    ) -> None:
         self._name = name
         self._safe_name = name.replace(" ", "_")
         self._output_dir = Path(output_dir).expanduser().resolve()
@@ -218,7 +224,9 @@ class ResourceUsageTracker:
             try:
                 self._sample_once()
             except Exception:  # pragma: no cover - sampling should not crash
-                self._log.debug("Resource sample failed for %s", self._name, exc_info=True)
+                self._log.debug(
+                    "Resource sample failed for %s", self._name, exc_info=True
+                )
             if self._stop_event.wait(self._interval):
                 break
 
@@ -247,8 +255,12 @@ class ResourceUsageTracker:
             try:
                 if torch.cuda.is_available():
                     for idx in range(torch.cuda.device_count()):
-                        gpu_memory += float(torch.cuda.memory_allocated(idx)) / (1024 ** 3)
-                        gpu_reserved += float(torch.cuda.memory_reserved(idx)) / (1024 ** 3)
+                        gpu_memory += float(torch.cuda.memory_allocated(idx)) / (
+                            1024**3
+                        )
+                        gpu_reserved += float(torch.cuda.memory_reserved(idx)) / (
+                            1024**3
+                        )
             except Exception:  # pragma: no cover - defensive GPU handling
                 pass
         gpu_util_percent = _get_gpu_utilization_percent()
@@ -256,7 +268,11 @@ class ResourceUsageTracker:
         self._records.append(
             _ResourceSample(
                 time_sec=float(rel),
-                rss_gib=float(rss_bytes) / (1024 ** 3) if rss_bytes == rss_bytes else float("nan"),
+                rss_gib=(
+                    float(rss_bytes) / (1024**3)
+                    if rss_bytes == rss_bytes
+                    else float("nan")
+                ),
                 cpu_percent=float(cpu_percent),
                 thread_count=int(thread_count),
                 gpu_memory_gib=float(gpu_memory),
@@ -297,13 +313,18 @@ class ResourceUsageTracker:
                     )
             self._log.info("Wrote resource usage CSV to %s", path)
         except Exception:  # pragma: no cover - IO errors shouldn't crash pipeline
-            self._log.warning("Failed to write resource usage CSV to %s", path, exc_info=True)
+            self._log.warning(
+                "Failed to write resource usage CSV to %s", path, exc_info=True
+            )
 
     def _write_plot(self) -> None:
         try:
             import matplotlib.pyplot as plt  # type: ignore
         except Exception:  # pragma: no cover - matplotlib optional
-            self._log.debug("Skipping resource usage plot for %s (matplotlib unavailable)", self._name)
+            self._log.debug(
+                "Skipping resource usage plot for %s (matplotlib unavailable)",
+                self._name,
+            )
             return
 
         times = [sample.time_sec for sample in self._records]
@@ -329,7 +350,9 @@ class ResourceUsageTracker:
         if any(value > 0.0 for value in gpu):
             series_to_plot.append(("GPU mem (GiB)", gpu, "GPU mem (GiB)", "#2ca02c"))
         if any(value > 0.0 for value in gpu_reserved):
-            series_to_plot.append(("GPU reserved (GiB)", gpu_reserved, "GPU reserved (GiB)", "#17becf"))
+            series_to_plot.append(
+                ("GPU reserved (GiB)", gpu_reserved, "GPU reserved (GiB)", "#17becf")
+            )
         if any(value == value for value in gpu_util):
             series_to_plot.append(("GPU %", gpu_util, "GPU %", "#9467bd"))
         if any(value > 0 for value in threads):
@@ -340,7 +363,9 @@ class ResourceUsageTracker:
 
         cols = 2
         rows = int(np.ceil(len(series_to_plot) / cols))
-        fig, axes = plt.subplots(rows, cols, figsize=(8 * cols, 3.8 * rows), sharex=True)
+        fig, axes = plt.subplots(
+            rows, cols, figsize=(8 * cols, 3.8 * rows), sharex=True
+        )
         axes = np.atleast_1d(axes).ravel()
 
         for ax, (label, values, ylabel, color) in zip(axes, series_to_plot):
@@ -349,7 +374,7 @@ class ResourceUsageTracker:
             ax.set_ylabel(ylabel)
             ax.set_xlim(time_min, time_max)
             ax.grid(True, alpha=0.3)
-        for ax in axes[len(series_to_plot):]:
+        for ax in axes[len(series_to_plot) :]:
             ax.axis("off")
 
         for ax in axes:
@@ -362,6 +387,8 @@ class ResourceUsageTracker:
             fig.savefig(path, dpi=300)
             self._log.info("Wrote resource usage plot to %s", path)
         except Exception:  # pragma: no cover - IO errors shouldn't crash pipeline
-            self._log.warning("Failed to write resource usage plot to %s", path, exc_info=True)
+            self._log.warning(
+                "Failed to write resource usage plot to %s", path, exc_info=True
+            )
         finally:
             plt.close(fig)

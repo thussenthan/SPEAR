@@ -1,9 +1,5 @@
-
 #!/usr/bin/env python3
 """Utility for visualizing feature importance outputs from cell-wise runs."""
-ROLLING_WINDOW_SIZE = 51
-ROLLING_MIN_PERIODS = 10
-
 
 import argparse
 from pathlib import Path
@@ -13,6 +9,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+ROLLING_WINDOW_SIZE = 51
+ROLLING_MIN_PERIODS = 10
 
 sns.set_style("whitegrid")
 
@@ -28,7 +27,9 @@ def _load_feature_table(model_dir: Path) -> pd.DataFrame:
     required = {"feature", "importance_mean"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"The feature importance table is missing required columns: {sorted(missing)}")
+        raise ValueError(
+            f"The feature importance table is missing required columns: {sorted(missing)}"
+        )
     return df
 
 
@@ -63,8 +64,12 @@ def _plot_distance_scatter(ax: plt.Axes, table: pd.DataFrame) -> None:
         ax.set_axis_off()
         return
     plot_df = plot_df.sort_values("distance_to_tss_kb")
-    pearson = plot_df["importance_mean"].corr(plot_df["distance_to_tss_kb"], method="pearson")
-    spearman = plot_df["importance_mean"].corr(plot_df["distance_to_tss_kb"], method="spearman")
+    pearson = plot_df["importance_mean"].corr(
+        plot_df["distance_to_tss_kb"], method="pearson"
+    )
+    spearman = plot_df["importance_mean"].corr(
+        plot_df["distance_to_tss_kb"], method="spearman"
+    )
     sns.scatterplot(
         data=plot_df,
         x="distance_to_tss_kb",
@@ -76,7 +81,9 @@ def _plot_distance_scatter(ax: plt.Axes, table: pd.DataFrame) -> None:
     )
     sns.lineplot(
         x=plot_df["distance_to_tss_kb"],
-        y=plot_df["importance_mean"].rolling(window=ROLLING_WINDOW_SIZE, min_periods=ROLLING_MIN_PERIODS).mean(),
+        y=plot_df["importance_mean"]
+        .rolling(window=ROLLING_WINDOW_SIZE, min_periods=ROLLING_MIN_PERIODS)
+        .mean(),
         color="#D62728",
         linewidth=1.5,
         ax=ax,
@@ -113,8 +120,12 @@ def _plot_bin_summary(ax: plt.Axes, table: pd.DataFrame) -> None:
         .reset_index()
         .sort_values("distance_to_tss_kb")
     )
-    ax.plot(grouped["distance_to_tss_kb"], grouped["mean"], label="Mean", color="#1f77b4")
-    ax.plot(grouped["distance_to_tss_kb"], grouped["p90"], label="90th pct", color="#d62728")
+    ax.plot(
+        grouped["distance_to_tss_kb"], grouped["mean"], label="Mean", color="#1f77b4"
+    )
+    ax.plot(
+        grouped["distance_to_tss_kb"], grouped["p90"], label="90th pct", color="#d62728"
+    )
     ax.fill_between(
         grouped["distance_to_tss_kb"],
         grouped["median"],
@@ -202,7 +213,9 @@ def _plot_bin_violin(ax: plt.Axes, table: pd.DataFrame) -> None:
     ax.set_ylim(bottom=0)
 
 
-def _plot_thresholded_scatter(ax: plt.Axes, table: pd.DataFrame, threshold: float = 0.0) -> None:
+def _plot_thresholded_scatter(
+    ax: plt.Axes, table: pd.DataFrame, threshold: float = 0.0
+) -> None:
     if "distance_to_tss_kb" not in table.columns:
         ax.text(0.5, 0.5, "No TSS distance metadata", ha="center", va="center")
         ax.set_axis_off()
@@ -211,7 +224,9 @@ def _plot_thresholded_scatter(ax: plt.Axes, table: pd.DataFrame, threshold: floa
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
     df = df[df["importance_mean"] > threshold]
     if df.empty:
-        ax.text(0.5, 0.5, f"No points above threshold {threshold}", ha="center", va="center")
+        ax.text(
+            0.5, 0.5, f"No points above threshold {threshold}", ha="center", va="center"
+        )
         ax.set_axis_off()
         return
     sns.scatterplot(
@@ -223,7 +238,9 @@ def _plot_thresholded_scatter(ax: plt.Axes, table: pd.DataFrame, threshold: floa
         edgecolor="none",
         ax=ax,
     )
-    sns.rugplot(data=df, x="distance_to_tss_kb", height=0.05, ax=ax, color="#444", alpha=0.6)
+    sns.rugplot(
+        data=df, x="distance_to_tss_kb", height=0.05, ax=ax, color="#444", alpha=0.6
+    )
     ax.axvline(0.0, linestyle="--", color="#444", linewidth=1.0, alpha=0.7)
     ax.set_xlim(-10, 10)
     ax.set_xlabel("Distance to TSS (kb)")
@@ -231,7 +248,9 @@ def _plot_thresholded_scatter(ax: plt.Axes, table: pd.DataFrame, threshold: floa
     ax.set_title(f"Scatter for importance > {threshold:g}")
 
 
-def _plot_per_gene_panels(table: pd.DataFrame, output_path: Path, top_genes: int = 4) -> None:
+def _plot_per_gene_panels(
+    table: pd.DataFrame, output_path: Path, top_genes: int = 4
+) -> None:
     if "gene_name" not in table.columns or "distance_to_tss_kb" not in table.columns:
         return
     df = table[["gene_name", "distance_to_tss_kb", "importance_mean"]].copy()
@@ -276,7 +295,7 @@ def _plot_per_gene_panels(table: pd.DataFrame, output_path: Path, top_genes: int
         ax.set_title(gene)
         ax.set_xlabel("Distance to TSS (kb)")
         ax.set_ylabel("Importance")
-    for ax in axes[len(top):]:
+    for ax in axes[len(top) :]:
         ax.axis("off")
     fig.suptitle("Per-gene panels (top by total importance)", y=0.99)
     fig.tight_layout()
@@ -307,7 +326,9 @@ def _plot_gene_correlation(ax: plt.Axes, summary: pd.DataFrame) -> None:
         return
     data = pd.concat(melted, ignore_index=True)
     sns.boxplot(data=data, x="metric", y="value", ax=ax, color="#86BBD8")
-    sns.stripplot(data=data, x="metric", y="value", ax=ax, color="#1F77B4", alpha=0.6, jitter=0.2)
+    sns.stripplot(
+        data=data, x="metric", y="value", ax=ax, color="#1F77B4", alpha=0.6, jitter=0.2
+    )
     ax.set_ylabel("Correlation")
     ax.set_xlabel("Metric")
     ax.set_title("Per-gene TSS correlations")
@@ -315,7 +336,9 @@ def _plot_gene_correlation(ax: plt.Axes, summary: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot feature importance diagnostics for a model run")
+    parser = argparse.ArgumentParser(
+        description="Plot feature importance diagnostics for a model run"
+    )
     parser.add_argument("run_dir", type=Path, help="Path to a SPEAR run directory")
     parser.add_argument(
         "--model",
@@ -357,7 +380,9 @@ def main() -> None:
 
     # Main diagnostics grid
     panel_count = 3 if gene_summary is not None else 2
-    fig, axes = plt.subplots(1, panel_count, figsize=(6 * panel_count, 5), squeeze=False)
+    fig, axes = plt.subplots(
+        1, panel_count, figsize=(6 * panel_count, 5), squeeze=False
+    )
     axes_flat = axes.flatten()
     _plot_top_features(axes_flat[0], feature_table, args.top_n)
     _plot_distance_scatter(axes_flat[1], feature_table)
